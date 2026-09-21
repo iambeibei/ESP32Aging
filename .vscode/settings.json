@@ -1,0 +1,12 @@
+{
+  "idf.currentSetup": "D:\\.espressif\\v5.5.4\\esp-idf",
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32s3"
+  },
+  "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-19.1.2_20250312\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=d:\\Desktop\\Light_Gateway_XiangMu2222\\Light_Gateway_sqlite_fixed_v4-main\\build"
+  ]
+}

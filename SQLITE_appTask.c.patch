@@ -1,0 +1,138 @@
+--- lgw_v2_inspect/Light_Gateway_modified_v2/main/Task/appTask.c	2026-09-09 03:21:08.000000000 +0000
++++ Light_Gateway_sqlite_fixed/main/Task/appTask.c	2026-09-09 06:37:09.200741510 +0000
+@@ -5230,37 +5230,56 @@
+         return;
+     }
+ 
+-    bool upload_success = Network_Flag &&
+-                          (app_mqtt_publish("device/%s/data/aging",
+-                                            publish_string,
+-                                            DEVICE_ID) > 0);
+-
+     /*
+-     * 无论实时 MQTT 是否成功都保存：
+-     *   pushed=1 -> 已提交 MQTT；
+-     *   pushed=0 -> 待网络恢复后补发。
++     * 掉电可靠性策略：先落SQLite，再发MQTT。
++     *
++     * 1) 先以 pushed=0 提交数据库；
++     * 2) 再尝试 MQTT；
++     * 3) MQTT publish 被客户端接受后更新 pushed=1。
++     *
++     * 如果步骤2/3之间突然断电，SQLite仍保留 pushed=0，重启后最多重复补发一次，
++     * 不会出现“MQTT刚发出但SQLite还没来得及保存”的本地数据丢失窗口。
+      */
+     int db_ret = InsertStructuredRecord(idnum,
+                                         packet->sn,
+                                         packet->current_step,
+                                         packet->timestamp,
+-                                        upload_success,
++                                        false,
+                                         packet->value_json);
++
+     if (db_ret != 0)
+     {
+-        aging_error_log("Save aging data to SQLite failed, id=%d, step=%d, sn=%s",
++        aging_error_log("Persist aging data to SQLite failed before MQTT, id=%d, step=%d, sn=%s",
+                         idnum,
+                         packet->current_step,
+                         packet->sn);
+     }
+     else
+     {
+-        ESP_LOGI(TAG, "Aging data cached, id=%d, pushed=%d, value_count=%u",
++        ESP_LOGI(TAG, "Aging data persisted before MQTT, id=%d, pushed=0, value_count=%u",
+                  idnum,
+-                 upload_success ? 1 : 0,
+                  (unsigned)packet->value_count);
+     }
+ 
++    bool upload_success = Network_Flag &&
++                          (app_mqtt_publish("device/%s/data/aging",
++                                            publish_string,
++                                            DEVICE_ID) > 0);
++
++    if (upload_success && db_ret == 0)
++    {
++        if (UpdateRecordPushStateBySNAndID(packet->sn, idnum, true) != 0)
++        {
++            /*
++             * MQTT已提交但状态更新失败时保持 pushed=0 更安全。
++             * 后续可能重复补发，但不会静默丢数据。
++             */
++            aging_error_log("MQTT submitted but SQLite pushed-state update failed, id=%d, sn=%s",
++                            idnum,
++                            packet->sn);
++        }
++    }
++
+     aging_data_upload_result(upload_success, idnum);
+     free(publish_string);
+ }
+@@ -5269,31 +5288,54 @@
+ void app_AgingData_Upload_handle(void *arg)
+ {
+     int idnum = 0;
+-    bool once = true;
++    char active_sn[AGING_UPLOAD_SN_MAX_LEN] = {0};
+ 
+     while (1)
+     {
+         AgingUploadPacket *packet = NULL;
+-        if (xQueueReceive(Upload_data_queue, &packet, portMAX_DELAY) == pdTRUE && packet != NULL)
++        if (xQueueReceive(Upload_data_queue, &packet, portMAX_DELAY) != pdTRUE || packet == NULL)
++        {
++            continue;
++        }
++
++        /*
++         * 每个SN独立维护IDNUM。
++         * 掉电恢复时，第一包数据到来后从SQLite查询该SN最后一个IDNUM并继续 +1。
++         * 正常新SN则从0开始。
++         */
++        if (strncmp(active_sn, packet->sn, sizeof(active_sn)) != 0)
+         {
+-            if (agingResumeState.aging_valid == 1 && once)
++            snprintf(active_sn, sizeof(active_sn), "%s", packet->sn);
++            idnum = 0;
++
++            if (agingResumeState.aging_valid == 1)
+             {
+-                query_db1_latest_by_sn_to_global(packet->sn);
+-                if (g_db1_result.json_data[0] != '\0')
++                QueryResult resume_record = {0};
++                if (QueryStructuredRecordLatestBySN(packet->sn, &resume_record) == 0)
+                 {
+-                    idnum = g_db1_result.IDNUM + 1;
++                    idnum = resume_record.seq_no + 1;
++                    ESP_LOGI(TAG,
++                             "Resume aging upload from SQLite: SN=%s, last_id=%d, next_id=%d",
++                             packet->sn,
++                             resume_record.seq_no,
++                             idnum);
+                 }
+                 else
+                 {
+-                    ESP_LOGW(TAG, "No previous SQLite record found for resumed SN=%s", packet->sn);
++                    ESP_LOGW(TAG,
++                             "No SQLite history found for resumed SN=%s; IDNUM starts from 0",
++                             packet->sn);
+                 }
+-                once = false;
+             }
+-
+-            app_DataUpload_Functiong(packet, idnum);
+-            idnum++;
+-            AgingUploadPacket_Free(packet);
++            else
++            {
++                ESP_LOGI(TAG, "New aging upload session: SN=%s, IDNUM starts from 0", packet->sn);
++            }
+         }
++
++        app_DataUpload_Functiong(packet, idnum);
++        idnum++;
++        AgingUploadPacket_Free(packet);
+     }
+ }
+ 
