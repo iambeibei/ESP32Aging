@@ -1718,7 +1718,7 @@ static void app_uart_data_handle(void *arg)
             DeviceNumber = Modbus_ExtractU64((uint8_t *)uart_buf);
             SelfRecovery_Write_uint64(NVS_KEY_DEVICE_NUMBER, DeviceNumber);
             char newDeId[32];
-            snprintf(newDeId, sizeof(newDeId), "%lld",DeviceNumber);
+            snprintf(newDeId, sizeof(newDeId), "%lld", DeviceNumber);
             Onely_Set_DeviceId(newDeId); // 将标定的PN写入配置json中去
 
             if (IsReset == 1)
@@ -4203,18 +4203,17 @@ static bool aging_command_json_parse(const char *packet_copy)
     }
 
     AgingErr err = aging_config_parse(packet_copy, &agingcfg);
-
-    int64_t protoid = 0;
-    get_json_int64(packet_copy, "ProtoID", &protoid);
-
-    agingcfg.devices[0].ProtoID = protoid;
-
     if (err != AGING_OK)
     {
         ESP_LOGE(TAG, "aging_config_parse failed, err=%d", err);
         aging_error_log("Aging configuration parse failed, error=%d", err);
         goto start_failed;
     }
+
+    int64_t protoid = 0;
+    get_json_int64(packet_copy, "ProtoID", &protoid);
+
+    agingcfg.devices[0].ProtoID = protoid;
 
     if (agingcfg.device_count <= 0 || agingcfg.devices == NULL)
     {
@@ -4622,15 +4621,22 @@ void Aging_Test_Task(void *arg)
                 }
 
                 if (Aging_device[0].steps == NULL ||
-                    Aging_device[0].step_count == 0 ||
-                    Aging_device[0].steps[0].sample_data_count == 0)
+                    Aging_device[0].step_count == 0)
                 {
                     aging_error_log("Bluetooth aging device has no sample item for communication check");
                     break;
                 }
 
+                int itest = 0;
+                for (; itest < Aging_device[0].step_count; itest++)
+                {
+                    if (Aging_device[0].steps[itest].sample_data_count != 0)
+                    {
+                        break;
+                    }
+                }
                 double data = 0;
-                const char *parameter = Aging_device[0].steps[0].sample_data[0].Value;
+                const char *parameter = Aging_device[0].steps[itest].sample_data[0].Value;
                 if (Data_Get_Method(&Aging_device[0], parameter, 1, &data, 0))
                 {
                     aging_runtime_log("Bluetooth aging-device communication check passed, parameter=%s",
@@ -5107,7 +5113,7 @@ static int ProcessAgingStepData(AgingUploadPacket *packet)
 
     memset(packet, 0, sizeof(*packet));
     snprintf(packet->sn, sizeof(packet->sn), "%s", PN_Code);
-    packet->current_step = CurrentAgingStep + 1;
+    packet->current_step = CurrentAgingStep;
     packet->timestamp = (int)time(NULL);
 
     AgingStep *aging_step = &agingcfg.steps[packet->current_step];
@@ -5125,6 +5131,12 @@ static int ProcessAgingStepData(AgingUploadPacket *packet)
     cJSON_AddStringToObject(aging_group, "Name", aging_report_device_name());
     cJSON_AddItemToObject(aging_group, "Data", aging_data);
     cJSON_AddItemToArray(value_array, aging_group);
+
+    if (aging_step->sample_data_count <= 0)
+    {
+        cJSON_Delete(value_array);
+        return -1;
+    }
 
     /* 老化设备数据：SampleData.Value 是协议参数 ID。 */
     for (size_t i = 0; i < aging_step->sample_data_count; i++)
@@ -5277,6 +5289,7 @@ void app_AgingData_Get_handle(void *arg)
                 }
                 else
                 {
+                    printf("该阶段莫得数据\n");
                     AgingUploadPacket_Free(packet);
                 }
             }
@@ -5452,6 +5465,13 @@ void app_task_init(void)
 
     // 创建串口数据处理任务
     BaseType_t ret1 = 0;
+    ret1 = create_cpu1_task(app_uart_data_handle, "uart_json", LG_STACK_UART_JSON, LG_PRIO_UART_JSON, &s_uart_json_task_handle);
+    if (ret1 != pdPASS)
+    {
+        // ESP_LOGE(TAG, "uart_data_handle create failed");
+        storage_write_record_cyclic(current_log_pn(), "uart_data_handle create failed!");
+    }
+
     // 读取基本配置和外接设备配置
     ret = readconfig();
     if (ret != ESP_OK)
@@ -5532,13 +5552,6 @@ void app_task_init(void)
     if (ret1 != pdPASS)
     {
         ESP_LOGE(TAG, "button_task create failed");
-    }
-
-    ret1 = create_cpu1_task(app_uart_data_handle, "uart_json", LG_STACK_UART_JSON, LG_PRIO_UART_JSON, &s_uart_json_task_handle);
-    if (ret1 != pdPASS)
-    {
-        // ESP_LOGE(TAG, "uart_data_handle create failed");
-        storage_write_record_cyclic(current_log_pn(), "uart_data_handle create failed!");
     }
 
     // 设置日志级别，后面注释掉

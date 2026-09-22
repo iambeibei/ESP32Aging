@@ -13,8 +13,6 @@
 #include "ConfigData.h"
 #include "appTask.h"
 
-
-
 static char *aging_strdup(const char *s)
 {
     if (!s)
@@ -202,21 +200,22 @@ static AgingErr parse_sample_data(cJSON *step_obj, AgingStep *step)
 
     cJSON *sample = cJSON_GetObjectItemCaseSensitive(step_obj, "SampleData");
 
-    /* sample 是可选字段；缺失、null、{} 都表示当前步骤不采集数据。 */
     if (sample == NULL || cJSON_IsNull(sample))
     {
+        step->sample_data_count=0;
         return AGING_OK;
     }
 
-    if (!cJSON_IsArray(sample))
-    {
-        return AGING_ERR_JSON;
-    }
+    // /* Action 存在但类型不对时才属于协议格式错误。 */
+    // if (!cJSON_IsObject(sample))
+    // {
+    //     return AGING_ERR_JSON;
+    // }
 
     int count = cJSON_GetArraySize(sample);
     if (count <= 0)
     {
-        return AGING_ERR_JSON;
+        return AGING_OK;
     }
 
     step->sample_data = (AgingSampleData *)app_calloc_prefer_psram((size_t)count, sizeof(AgingSampleData));
@@ -641,7 +640,6 @@ AgingErr parse_steps_Ex(cJSON *aging_steps_obj, AgingStep **out_steps, size_t *o
     return AGING_OK;
 }
 
-
 AgingErr aging_config_parse(const char *json_text, AgingConfig *out)
 {
     if (!json_text || !out)
@@ -676,7 +674,7 @@ AgingErr aging_config_parse(const char *json_text, AgingConfig *out)
     cJSON *ClMode = cJSON_GetObjectItem(data, "ControlMode");
     if (ClMode)
     {
-        AgingCMode=(uint8_t)ClMode->valueint;
+        AgingCMode = (uint8_t)ClMode->valueint;
         publish_device_mode(ClMode->valueint);
     }
     cJSON *CycleIndexObj = cJSON_GetObjectItem(data, "CycleIndex");

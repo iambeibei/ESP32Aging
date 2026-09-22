@@ -868,7 +868,7 @@ char *create_sensor_json(int idnum, const char *pn, int current_step, int timest
     cJSON_AddNumberToObject(data, "TIMESTAMP", timestamp);
     cJSON_AddStringToObject(data, "PN", pn);
     cJSON_AddStringToObject(data, "RecordId", RecordId);
-    cJSON_AddNumberToObject(data, "CurrentStep", current_step);
+    cJSON_AddNumberToObject(data, "CurrentStep", current_step+1);
     cJSON_AddItemToObject(data, "Value", value_array);
 
     char *json_str = cJSON_PrintUnformatted(root);

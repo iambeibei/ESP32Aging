@@ -1,12 +1,9 @@
 {
-  "idf.currentSetup": "D:\\.espressif\\v5.5.4\\esp-idf",
   "idf.customExtraVars": {
+    "IDF_PATH": "/home/wbb/espidf/esp-idf",
+    "IDF_TOOLS_PATH": "/home/wbb/.espressif",
+    "IDF_PYTHON_ENV_PATH": "/home/wbb/.espressif/python_env/idf5.4_py3.14_env",
     "IDF_TARGET": "esp32s3"
   },
-  "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-19.1.2_20250312\\esp-clang\\bin\\clangd.exe",
-  "clangd.arguments": [
-    "--background-index",
-    "--query-driver=**",
-    "--compile-commands-dir=d:\\Desktop\\Light_Gateway_XiangMu2222\\Light_Gateway_sqlite_fixed_v4-main\\build"
-  ]
+  "idf.currentSetup": "/home/wbb/espidf/esp-idf"
 }
