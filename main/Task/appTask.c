@@ -3254,7 +3254,7 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
             {
                 storage_print_all_records();
             }
-            else if (strstr(TopicBuf, "Cannextstep"))
+            else if (strstr(TopicBuf, "CanNextstep"))
             {
                 cJSON *Data_obj = cJSON_GetObjectItem(pRoot, "Data");
                 cJSON *NextStep = cJSON_IsObject(Data_obj) ? cJSON_GetObjectItem(Data_obj, "IsCanNext") : NULL;
