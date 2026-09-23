@@ -56,6 +56,8 @@ extern "C"
 
     char *create_aging_state_json_ProgramId(int seq, const char *ProgramId);
 
+    char *create_aging_state_json_StepId(int seq, const char *StepId);
+
     char *create_pn_response_json(int req, int cmd_seq, int code, const char *get_pn);
 
     char *create_device_response(int seq, int cmd_seq, int code, const char *msg);

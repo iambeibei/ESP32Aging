@@ -202,7 +202,7 @@ static AgingErr parse_sample_data(cJSON *step_obj, AgingStep *step)
 
     if (sample == NULL || cJSON_IsNull(sample))
     {
-        step->sample_data_count=0;
+        step->sample_data_count = 0;
         return AGING_OK;
     }
 
@@ -459,6 +459,12 @@ static AgingErr parse_steps(cJSON *aging_steps_obj, AgingConfig *out)
 
         step->method = json_get_strdup(step_obj, "Method");
         if (!step->method)
+        {
+            return AGING_ERR_JSON;
+        }
+
+        step->StepId = json_get_strdup(step_obj, "StepId");
+        if (!step->StepId)
         {
             return AGING_ERR_JSON;
         }

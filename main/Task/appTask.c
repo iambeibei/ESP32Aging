@@ -719,6 +719,19 @@ static void aging_state_publish_ProgramId(const char *ProgramId)
     }
 }
 
+static void aging_state_publish_StepId(const char *StepId)
+{
+    char *response = create_aging_state_json_StepId(time(NULL), StepId);
+    if (response)
+    {
+        if (app_mqtt_publish("device/%s/event/StepId", response, DEVICE_ID) < 0)
+        {
+            storage_write_record_cyclic(current_log_pn(), "MQTT state Publish Failed");
+        }
+        free(response);
+    }
+}
+
 /**
  * @brief 发布老化阶段信息到MQTT
  * @param aging_stage  老化阶段字符串，如 "Standing"
@@ -4752,6 +4765,9 @@ void Aging_Test_Task(void *arg)
                 {
                     AgingStep *current_step = &agingcfg.steps[i];
                     const char *method = current_step->method != NULL ? current_step->method : "unknown";
+                    const char *StepId = current_step->StepId != NULL ? current_step->StepId : "unknown";
+                    aging_state_publish_StepId(StepId);
+
 
                     esp_err_t ret = SelfRecovery_Write_uint16("CR_Step", i);
                     if (ret != ESP_OK)
@@ -5289,7 +5305,7 @@ void app_AgingData_Get_handle(void *arg)
                 }
                 else
                 {
-                    printf("该阶段莫得数据\n");
+                    //printf("该阶段莫得数据\n");
                     AgingUploadPacket_Free(packet);
                 }
             }

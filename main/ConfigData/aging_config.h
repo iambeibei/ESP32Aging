@@ -50,6 +50,8 @@ typedef struct {
 typedef struct {
     char *method;
 
+    char *StepId;
+
     AgingJudgingCondition *judging_conditions;
     size_t judging_condition_count;
 
@@ -61,6 +63,7 @@ typedef struct {
     size_t pre_action_count;
 
     AgingActionItem *after_actions;
+    
     size_t after_action_count;
 } AgingStep;
 

@@ -963,6 +963,42 @@ char *create_aging_state_json_ProgramId(int seq, const char *ProgramId)
     return json_str; // 调用者需 free()
 }
 
+char *create_aging_state_json_StepId(int seq, const char *StepId)
+{
+    if (StepId == NULL)
+    {
+        return NULL;
+    }
+
+    // 1. 创建根对象
+    cJSON *root = cJSON_CreateObject();
+    if (root == NULL)
+    {
+        return NULL;
+    }
+
+    // 2. 添加 Seq
+    cJSON_AddNumberToObject(root, "Seq", seq);
+
+    // 3. 创建 Data 对象
+    cJSON *data = cJSON_CreateObject();
+    if (data == NULL)
+    {
+        cJSON_Delete(root);
+        return NULL;
+    }
+    cJSON_AddItemToObject(root, "Data", data);
+
+    // 4. 添加 ProgramId 字符串
+    cJSON_AddStringToObject(data, "StepId", StepId);
+
+    // 5. 生成紧凑格式 JSON（无换行空格）
+    char *json_str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root); // 释放 cJSON 对象树
+
+    return json_str; // 调用者需 free()
+}
+
 /**
  * @brief 生成如下格式的JSON:
  * {
