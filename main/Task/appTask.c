@@ -54,6 +54,8 @@
 #define NVS_KEY_START_SEQ "start_seq"
 #define NVS_KEY_DEVICE_NUMBER "device_number"
 #define NVS_KEY_SAFE_CODE "safe_code"
+/* "已完成任务"(TaskCP)响应是否已送达上位机；断网时置 1，联网补发成功后清 0。 */
+#define NVS_KEY_TASKCP_PENDING "taskcp_pending"
 
 // 型号直接代码写死,现在待定
 const char DEVICE_TYPE[12] = "Point";
@@ -133,6 +135,19 @@ typedef enum
 
 static AgingCommandState s_aging_cmd_state = AGING_CMD_IDLE;
 static int s_pending_start_seq = 0;
+
+/*
+ * 群控放行相关运行时状态：
+ *   s_waiting_nextstep      —— 是否正处于"等待上位机放行下一步"的窗口内
+ *   s_last_nextstep_cmd_seq —— 最近一次已处理过的放行指令 Seq，用于幂等去重
+ *   s_taskcp_pending        —— "已完成任务"(TaskCP)响应未送达上位机，需联网后补发
+ *
+ * 上位机以"收到设备的放行响应"作为放行成功判据，收不到就会重发同一 Seq 的指令；
+ * 因此设备侧必须对同一 Seq 幂等：不重复推进步骤，但要重新回一次响应。
+ */
+static volatile bool s_waiting_nextstep = false;
+static int s_last_nextstep_cmd_seq = -1;
+static bool s_taskcp_pending = false;
 
 int8_t Mqtt_Log_Mode = -1; // MQTT日志上报模式，-1表示不启动，0为启动运行日志，1为启动错误日志
 
@@ -238,6 +253,15 @@ static uint32_t s_consecutive_data_read_failures = 0;
 static TickType_t s_last_data_read_error_report_tick = 0;
 static uint32_t s_consecutive_data_upload_failures = 0;
 static TickType_t s_last_data_upload_error_report_tick = 0;
+
+/*
+ * SQLite 缓存满（且没有已上传记录可淘汰）时的统计。
+ * 这种情况下本次采样不落库，但未上传(pushed=0)的历史记录不会被覆盖 ——
+ * 属于"限流"而不是数据损坏，老化必须继续。
+ */
+static uint32_t s_sqlite_cache_full_drops = 0;
+static uint32_t s_sqlite_cache_full_reports = 0;
+static TickType_t s_last_cache_full_report_tick = 0;
 
 static const char *current_log_pn(void)
 {
@@ -447,6 +471,46 @@ static void aging_data_upload_result(bool success, int idnum)
     }
 }
 
+/*
+ * SQLite 缓存满且无已上传记录可淘汰：只记录并节流告警，绝不中止老化。
+ *
+ * 说明：此时未上传数据不会被覆盖（淘汰只针对 pushed=1），代价是本次采样不落库。
+ * 断网期间若持续发生，说明缓存已全部是未上传数据，需要靠恢复网络后补发来释放空间。
+ */
+static void aging_cache_full_result(int idnum)
+{
+    s_sqlite_cache_full_drops++;
+
+    char message[APP_LOG_MESSAGE_SIZE];
+    snprintf(message,
+             sizeof(message),
+             "SQLite cache full, sample not persisted, id=%d, dropped_total=%" PRIu32,
+             idnum,
+             s_sqlite_cache_full_drops);
+
+    storage_write_record_cyclic(current_log_pn(), message);
+
+    if (!AgingLogActive)
+    {
+        return;
+    }
+
+    TickType_t now = xTaskGetTickCount();
+    bool should_report = (s_last_cache_full_report_tick == 0) ||
+                         ((now - s_last_cache_full_report_tick) >=
+                          pdMS_TO_TICKS(DATA_READ_ERROR_REPORT_INTERVAL_MS));
+
+    if (should_report)
+    {
+        char mqtt_message[APP_LOG_MESSAGE_SIZE];
+        build_mqtt_log_message(mqtt_message, sizeof(mqtt_message), message);
+        mqtt_run_log(mqtt_message);
+        mqtt_Error_log(mqtt_message);
+        s_last_cache_full_report_tick = now;
+        s_sqlite_cache_full_reports++;
+    }
+}
+
 esp_err_t storage_print_all_records(void)
 {
     FILE *f = fopen("/log/records.dat", "rb");
@@ -502,20 +566,33 @@ esp_err_t storage_print_all_records(void)
 
 #pragma region MQTT响应与状态上报
 
-static void device_response_publish_point(int cmd_seq, int code, const char *msg)
+/*
+ * 通用命令响应（主题 device/%s/cmd/reply/point，与 start_aging / CPower 同一通道）。
+ *
+ * 返回 true 表示 MQTT 已接受该 publish（app_mqtt_publish 返回 msg_id > 0）；
+ * 返回 false 表示未连接或发送失败，调用方需要据此决定是否登记"待补发"。
+ */
+static bool device_response_publish_point(int cmd_seq, int code, const char *msg)
 {
+    bool published = false;
     char *response = create_device_response(time(NULL), cmd_seq, code, msg);
     if (response)
     {
-        if (app_mqtt_publish("device/%s/cmd/reply/point", response, DEVICE_ID) < 0)
+        /*
+         * app_mqtt_publish：未连接返回 -1，成功返回 msg_id(>0)。
+         * 因此统一以 > 0 判定成功（历史代码里的 < 0 判定会漏掉返回 0 的情况）。
+         */
+        int ret = app_mqtt_publish("device/%s/cmd/reply/point", response, DEVICE_ID);
+        published = (ret > 0);
+        if (!published)
         {
-
             char log_msg[128];
             snprintf(log_msg, sizeof(log_msg), "MQTT response Publish Failed: %s", msg);
             storage_write_record_cyclic(current_log_pn(), log_msg);
         }
         free(response);
     }
+    return published;
 }
 
 static void device_response_publish_state(int cmd_seq, int code, const char *msg)
@@ -814,6 +891,62 @@ int publish_aging_complete(int is_complete, const char *aging_number)
 
     return ret;
 }
+
+/*
+ * 带送达追踪的"已完成任务"上报。
+ *
+ * 断网时 publish 会失败，上位机就永远收不到本步完成事件，进而不会下发下一步 ——
+ * 与群控的放行等待叠加会造成永久卡死。因此发送失败时登记待补发标志（并在 NVS
+ * 持久化一个位），联网恢复后由 aging_resend_pending_replies() 补发一次。
+ *
+ * 只保存"有没有待补发"这一个标志，不保存整条报文：补发时按当前 PN 重新生成即可，
+ * 也避免 NVS 频繁写入造成磨损。
+ */
+static void publish_task_complete_tracked(int is_complete, const char *aging_number)
+{
+    int ret = publish_aging_complete(is_complete, aging_number);
+
+    if (ret > 0)
+    {
+        if (s_taskcp_pending)
+        {
+            s_taskcp_pending = false;
+            (void)SelfRecovery_Write_uint16(NVS_KEY_TASKCP_PENDING, 0);
+        }
+        return;
+    }
+
+    if (!s_taskcp_pending)
+    {
+        s_taskcp_pending = true;
+        (void)SelfRecovery_Write_uint16(NVS_KEY_TASKCP_PENDING, 1);
+    }
+
+    ESP_LOGW(TAG, "TaskCP response not delivered (ret=%d); marked pending for resend", ret);
+}
+
+/*
+ * 联网恢复后补发"已完成任务"响应（由 MQTT_EVENT_CONNECTED 调用）。
+ *
+ * 幂等：补发内容与首次发送一致（同一 PN / 老化编号），上位机按内容去重即可；
+ * 仍然失败就保持 pending，等下一次连接再试，天然带退避，不会造成消息风暴。
+ */
+void aging_resend_pending_replies(void)
+{
+    if (!s_taskcp_pending)
+    {
+        return;
+    }
+
+    if (!Network_Flag)
+    {
+        return;
+    }
+
+    aging_runtime_log("Resend pending task-complete response after network recovery");
+    publish_task_complete_tracked(1, AgingNumber);
+}
+
 /**
  * @brief 发布设备模式(单控/群控)到MQTT
  * @param mode 1:单控, 2:群控 (对应 ClMode->valueint)
@@ -2743,6 +2876,9 @@ static void clear_aging_command_runtime(void)
 {
     s_aging_cmd_state = AGING_CMD_IDLE;
     s_pending_start_seq = 0;
+    /* 新一轮老化开始，放行指令的幂等记录必须重置，否则新会话的同 Seq 会被误判为重复指令。 */
+    s_last_nextstep_cmd_seq = -1;
+    s_waiting_nextstep = false;
     memset(PN_Code, 0, sizeof(PN_Code));
     clear_ready_pn_runtime();
 }
@@ -3225,6 +3361,11 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                     {
                         printf("ids[%d] = %d\n", i, ids[i]);
                         query_db1_to_global(ids[i]);
+                        if (g_db1_result == NULL)
+                        {
+                            ESP_LOGE(TAG, "Skip retransmission id=%d: query buffer unavailable", ids[i]);
+                            continue;
+                        }
                         if (g_db1_result->json_data[0] != '\0')
                         {
                             if (app_mqtt_publish("device/%s/data/aging", g_db1_result->json_data, DEVICE_ID) > 0)
@@ -3255,11 +3396,45 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
             }
             else if (strstr(TopicBuf, "CanNextstep"))
             {
+                /*
+                 * 群控放行指令：上位机以"收到本设备的响应"作为放行成功的判据，
+                 * 所以这里必须给出明确回执；上位机收不到回执会重发同一 Seq，
+                 * 因此同一 Seq 必须幂等（不重复推进步骤，但要重放响应）。
+                 */
+                const int next_seq = Seq->valueint;
                 cJSON *Data_obj = cJSON_GetObjectItem(pRoot, "Data");
                 cJSON *NextStep = cJSON_IsObject(Data_obj) ? cJSON_GetObjectItem(Data_obj, "IsCanNext") : NULL;
-                if (cJSON_IsNumber(NextStep))
+
+                if (s_last_nextstep_cmd_seq == next_seq)
                 {
-                    Cannextstep = (uint8_t)NextStep->valueint;
+                    /* 同一 Seq 重复到达：已处理过，只重放响应，不重复推进步骤。 */
+                    ESP_LOGW(TAG, "CanNextstep duplicate seq=%d, replay response only", next_seq);
+                    device_response_publish_point(next_seq, 1, "Next-step already handled (duplicate Seq)");
+                }
+                else if (!cJSON_IsNumber(NextStep))
+                {
+                    ESP_LOGW(TAG, "CanNextstep missing or invalid IsCanNext, seq=%d", next_seq);
+                    device_response_publish_point(next_seq, 0, "Missing or invalid IsCanNext in CanNextstep command");
+                }
+                else if (!s_waiting_nextstep)
+                {
+                    /* 不在等待放行窗口内：指令与当前工艺阶段不匹配，明确回复失败，避免上位机误判。 */
+                    ESP_LOGW(TAG, "CanNextstep received but device is not waiting, seq=%d", next_seq);
+                    device_response_publish_point(next_seq, 0, "Device is not waiting for next-step permission");
+                }
+                else if (NextStep->valueint == 0)
+                {
+                    /* 上位机显式拒绝放行：继续等待，但要回复"已收到"，避免上位机一直重发。 */
+                    ESP_LOGI(TAG, "CanNextstep denied by server, seq=%d, keep waiting", next_seq);
+                    s_last_nextstep_cmd_seq = next_seq;
+                    device_response_publish_point(next_seq, 1, "Next-step denied, keep waiting");
+                }
+                else
+                {
+                    s_last_nextstep_cmd_seq = next_seq;
+                    Cannextstep = 1;
+                    ESP_LOGI(TAG, "CanNextstep accepted, seq=%d", next_seq);
+                    device_response_publish_point(next_seq, 1, "Next-step accepted");
                 }
             }
             else if (strstr(TopicBuf, "CPower")) // 只有根节点才会触发,控制开关相关代码待完善
@@ -3427,6 +3602,19 @@ void Init_ByNetwork_Flag(void *arg)
     {
         if (Network_Flag == 1)
         {
+            /*
+             * 恢复上次运行遗留的"已完成任务未送达"标志。
+             * 若上次断网期间 TaskCP 没发出去，本次联网后由 aging_resend_pending_replies() 补发，
+             * 保证上位机的步骤状态与设备一致。
+             */
+            uint16_t taskcp_pending = 0;
+            if (SelfRecovery_Read_uint16(NVS_KEY_TASKCP_PENDING, &taskcp_pending) == ESP_OK &&
+                taskcp_pending == 1)
+            {
+                s_taskcp_pending = true;
+                ESP_LOGI(TAG, "Pending task-complete response restored; will resend after MQTT connect");
+            }
+
             esp_err_t err = mqtt_init();
             if (err == ESP_ERR_NO_MEM)
             {
@@ -4933,11 +5121,54 @@ void Aging_Test_Task(void *arg)
                     {
                         agingDataAMode = IdleState; // 群控模式下，老化步骤完成后，先把老化状态置为IdleState，等待上位机服务下发下一步任务
                         // 往上位机服务发送任务已完成，等待上位机服务下发下一步任务，得等所有节点都完成
-                        publish_aging_complete(1, AgingNumber);
+                        // 用带追踪的版本：发送失败会登记待补发，联网恢复后自动重发
+                        publish_task_complete_tracked(1, AgingNumber);
+
+                        /*
+                         * 等待上位机放行下一步。
+                         *
+                         * 原来这里是 `while (Cannextstep == 0) { vTaskDelay(10s); }` 的死等：
+                         * 根节点断网时放行指令永远到不了，任务永久卡在步骤之间（不推进、不采样）。
+                         * 现在改为带超时的轮询等待：
+                         *   1) 收到放行指令（CanNextstep）→ 正常推进；
+                         *   2) 超过 LG_NEXTSTEP_WAIT_TIMEOUT_MS 仍无指令 → 本地自动放行，
+                         *      保证老化不中断，并留下"离线自动推进"记录供联网后补偿上报对账；
+                         *   3) 等待期间按 1 秒轮询，老化被中止（指令状态不再是 RUNNING）时能及时退出。
+                         */
+                        s_waiting_nextstep = true;
+                        TickType_t wait_start_tick = xTaskGetTickCount();
+                        bool auto_advanced = false;
+
                         while (Cannextstep == 0)
                         {
-                            vTaskDelay(pdMS_TO_TICKS(10000));
+                            if (s_aging_cmd_state != AGING_CMD_RUNNING)
+                            {
+                                aging_runtime_log("Aging command state left RUNNING while waiting for next-step; stop waiting");
+                                break;
+                            }
+
+                            if ((xTaskGetTickCount() - wait_start_tick) >=
+                                pdMS_TO_TICKS(LG_NEXTSTEP_WAIT_TIMEOUT_MS))
+                            {
+                                auto_advanced = true;
+                                break;
+                            }
+
+                            vTaskDelay(pdMS_TO_TICKS(LG_NEXTSTEP_POLL_INTERVAL_MS));
                         }
+
+                        s_waiting_nextstep = false;
+
+                        if (auto_advanced)//超时自动放行
+                        {
+                            aging_runtime_log("Next-step permission timeout after %u ms (PN=%s, step=%u); auto-advance offline",
+                                              (unsigned)LG_NEXTSTEP_WAIT_TIMEOUT_MS,
+                                              PN_Code,
+                                              (unsigned)(i + 1));
+                            storage_write_record_cyclic(current_log_pn(),
+                                                        "Next-step permission timeout; auto-advanced offline");
+                        }
+
                         Cannextstep = 0;
                     }
                 }
@@ -4950,22 +5181,29 @@ void Aging_Test_Task(void *arg)
         }
         case AgingComplete:
         {
-            while (QueryLatestRecordBySNAndPushState(PN_Code, false, g_db1_result) == 0)
+            if (g_db1_result == NULL)
             {
-                if (g_db1_result->json_data[0] != '\0')
+                aging_error_log("Historical retransmission skipped: query buffer unavailable");
+            }
+            else
+            {
+                while (QueryLatestRecordBySNAndPushState(PN_Code, false, g_db1_result) == 0)
                 {
-                    if (app_mqtt_publish("device/%s/data/aging", g_db1_result->json_data, DEVICE_ID) > 0)
+                    if (g_db1_result->json_data[0] != '\0')
                     {
-                        UpdateRecordPushStateBySNAndID(PN_Code, g_db1_result->seq_no, true);
+                        if (app_mqtt_publish("device/%s/data/aging", g_db1_result->json_data, DEVICE_ID) > 0)
+                        {
+                            UpdateRecordPushStateBySNAndID(PN_Code, g_db1_result->seq_no, true);
+                        }
+                        else
+                        {
+                            aging_error_log("Historical aging-data retransmission failed, seq_no=%d",
+                                            g_db1_result->seq_no);
+                            break;
+                        }
                     }
-                    else
-                    {
-                        aging_error_log("Historical aging-data retransmission failed, seq_no=%d",
-                                        g_db1_result->seq_no);
-                        break;
-                    }
+                    vTaskDelay(pdMS_TO_TICKS(100));
                 }
-                vTaskDelay(pdMS_TO_TICKS(100));
             }
 
             agingState = AgingIdle;
@@ -5364,7 +5602,15 @@ static void app_DataUpload_Functiong(const AgingUploadPacket *packet, int idnum)
                                         false,
                                         packet->value_json);
 
-    if (db_ret != 0)
+    if (db_ret == SQLITE_INSERT_ERR_CACHE_FULL)
+    {
+        /*
+         * 缓存满且没有已上传记录可淘汰：未上传数据不会被覆盖，本次采样不落库。
+         * 只是"限流"，不能中止老化，也不影响后续联网补发。
+         */
+        aging_cache_full_result(idnum);
+    }
+    else if (db_ret != 0)
     {
         aging_error_log("Persist aging data to SQLite failed before MQTT, id=%d, step=%d, sn=%s",
                         idnum,

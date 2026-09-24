@@ -15,9 +15,16 @@ extern "C"
 #define DB_FILE_PATH FATFS_BASE_PATH "/data.db"
 
 /*
- * data_storage 分区约 2 MB。Value 为变长 JSON，单条最大 2 KB。
- * 记录数上限取 1200，同时保留至少约 512 KB 文件系统余量；
- * 缓存满时优先淘汰 pushed=1 的最旧记录。
+ * data_storage 分区 0x260000 = 2 428 928 B（约 2.32 MB，见 partition.csv）。
+ * Value 为变长 JSON，单条上限 DB_VALUE_DATA_MAX_LEN = 2048 B。
+ *
+ * 容量推导：1200 条 × 2048 B = 2 457 600 B，已略大于分区容量；也就是说
+ * 记录数上限实际上不可达，真正在前面试图拦住写入的是 DB_MIN_FREE_BYTES
+ * （剩余空间低于 512 KB 即触发淘汰/拒绝写入）。实测 Value 平均只有几百字节，
+ * 因此 1200 条是"够用且偏保守"的上限，暂不下调；如需调整必须先用
+ * print_fatfs_usage() 实测可用空间与 get_record_count_locked() 实测条数再定。
+ *
+ * 淘汰顺序：只淘汰已上传(pushed=1)中最旧的一条（按 local_id，单调递增）。
  *
  * schema v5：local_id 为数据库内部主键，(sn, seq_no) 唯一。
  * seq_no/IDNUM 可以在每个新的 SN 中从 0 重新开始，不会覆盖其他 SN。
@@ -39,8 +46,23 @@ extern "C"
     void SqLite_Init(void);
 
     /*
+     * InsertStructuredRecord() 返回码：
+     *   0  (SQLITE_INSERT_OK)              成功
+     *  -1  (SQLITE_INSERT_ERR_GENERAL)     参数/Prepare/执行/提交失败
+     *  -2  (SQLITE_INSERT_ERR_CACHE_FULL)  缓存满且没有已上传(pushed=1)记录可淘汰
+     *
+     * 契约：未上传(pushed=0)的记录**绝不淘汰**。缓存满时宁可拒绝本次写入（返回 -2），
+     * 也不能覆盖尚未上传的数据 —— 断网期间本地库是这些数据的唯一副本。
+     * 调用方必须把 -2 当作"可恢复的限流"处理：记录并告警后继续老化，不得中止工艺。
+     */
+#define SQLITE_INSERT_OK             0
+#define SQLITE_INSERT_ERR_GENERAL    (-1)
+#define SQLITE_INSERT_ERR_CACHE_FULL (-2)
+
+    /*
      * 推荐新版接口：结构化保存 DataReport。
      * value_data 传入完整 `Value` 数组 JSON。
+     * 返回 0 成功；-2 表示缓存满且无已上传记录可淘汰（未上传数据不受影响）。
      */
     int InsertStructuredRecord(int seq_no,
                                const char *sn,

@@ -28,6 +28,12 @@ typedef enum
 
 void app_task_init();
 
+/*
+ * 联网恢复后补发未送达的"已完成任务"响应（device/%s/event/TaskCP）。
+ * 由 MQTT_EVENT_CONNECTED 触发；内部幂等，无待补发内容时直接返回。
+ */
+void aging_resend_pending_replies(void);
+
 void Config_Report(int cmd_seq);
 
 int publish_device_mode(int mode);

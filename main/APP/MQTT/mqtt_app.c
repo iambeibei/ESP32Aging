@@ -223,6 +223,13 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
         }
 
         Config_Report(100);
+
+        /*
+         * 断网期间可能有"已完成任务"(TaskCP)响应没发出去，而上位机正是据此判定步骤
+         * 状态、决定是否下发下一步放行指令。连接建立后补发一次，保证设备与上位机
+         * 状态同步、放行结果可追溯（内部幂等，无待补发内容时直接返回）。
+         */
+        aging_resend_pending_replies();
         break;
     }
 
