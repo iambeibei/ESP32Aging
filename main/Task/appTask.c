@@ -137,7 +137,6 @@ static int s_pending_start_seq = 0;
 int8_t Mqtt_Log_Mode = -1; // MQTT日志上报模式，-1表示不启动，0为启动运行日志，1为启动错误日志
 
 AgingDataAcquisitionMode agingDataAMode = IdleState;
-double D_SOC = 100; // 待老化设备的SOC
 
 TaskHandle_t BleData_task_handle = NULL; // 蓝牙任务句柄，用于删除任务使用
 
@@ -3226,9 +3225,9 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                     {
                         printf("ids[%d] = %d\n", i, ids[i]);
                         query_db1_to_global(ids[i]);
-                        if (g_db1_result.json_data[0] != '\0')
+                        if (g_db1_result->json_data[0] != '\0')
                         {
-                            if (app_mqtt_publish("device/%s/data/aging", g_db1_result.json_data, DEVICE_ID) > 0)
+                            if (app_mqtt_publish("device/%s/data/aging", g_db1_result->json_data, DEVICE_ID) > 0)
                             {
                             }
                         }
@@ -4768,7 +4767,6 @@ void Aging_Test_Task(void *arg)
                     const char *StepId = current_step->StepId != NULL ? current_step->StepId : "unknown";
                     aging_state_publish_StepId(StepId);
 
-
                     esp_err_t ret = SelfRecovery_Write_uint16("CR_Step", i);
                     if (ret != ESP_OK)
                     {
@@ -4853,14 +4851,24 @@ void Aging_Test_Task(void *arg)
                             publish_aging_stage("Discharge", AgingNumber);
                         }
                         agingDataAMode = DischargeState;
-                        while (D_SOC >= target_value)
+
+                        uint8_t conditionflag = 1;
+                        while (conditionflag)
                         {
-                            vTaskDelay(pdMS_TO_TICKS(10000));
+                            for (int i = 0; i < current_step->judging_condition_count; i++)
+                            {
+                                double value = -1.0;
+                                bool read_ok = Data_Get_Method(&Aging_device[0], current_step->judging_conditions[i].Name, 1, &value, 1);
+                                if (value <= current_step->judging_conditions[i].value_num)
+                                {
+                                    conditionflag = 0;
+                                    break;
+                                }
+                                vTaskDelay(pdMS_TO_TICKS(1000));
+                            }
+                            vTaskDelay(pdMS_TO_TICKS(2000));
                         }
-                        aging_runtime_log("Discharge condition reached, step=%u, SOC=%.3f, target=%.3f",
-                                          (unsigned)(i + 1),
-                                          D_SOC,
-                                          target_value);
+
                     }
                     else if (strncmp(method, "Recharge", 8) == 0)
                     {
@@ -4869,14 +4877,23 @@ void Aging_Test_Task(void *arg)
                             publish_aging_stage("Recharge", AgingNumber);
                         }
                         agingDataAMode = RechargeState;
-                        while (D_SOC <= target_value)
+                        uint8_t conditionflag = 1;
+                        while (conditionflag)
                         {
-                            vTaskDelay(pdMS_TO_TICKS(10000));
+                            for (int i = 0; i < current_step->judging_condition_count; i++)
+                            {
+                                double value = -1.0;
+                                bool read_ok = Data_Get_Method(&Aging_device[0], current_step->judging_conditions[i].Name, 1, &value, 1);
+                                if (value >= current_step->judging_conditions[i].value_num)
+                                {
+                                    conditionflag = 0;
+                                    break;
+                                }
+                                vTaskDelay(pdMS_TO_TICKS(1000));
+                            }
+                            vTaskDelay(pdMS_TO_TICKS(2000));
                         }
-                        aging_runtime_log("Recharge condition reached, step=%u, SOC=%.3f, target=%.3f",
-                                          (unsigned)(i + 1),
-                                          D_SOC,
-                                          target_value);
+
                     }
                     else
                     {
@@ -4933,18 +4950,18 @@ void Aging_Test_Task(void *arg)
         }
         case AgingComplete:
         {
-            while (QueryLatestRecordBySNAndPushState(PN_Code, false, &g_db1_result) == 0)
+            while (QueryLatestRecordBySNAndPushState(PN_Code, false, g_db1_result) == 0)
             {
-                if (g_db1_result.json_data[0] != '\0')
+                if (g_db1_result->json_data[0] != '\0')
                 {
-                    if (app_mqtt_publish("device/%s/data/aging", g_db1_result.json_data, DEVICE_ID) > 0)
+                    if (app_mqtt_publish("device/%s/data/aging", g_db1_result->json_data, DEVICE_ID) > 0)
                     {
-                        UpdateRecordPushStateBySNAndID(PN_Code, g_db1_result.seq_no, true);
+                        UpdateRecordPushStateBySNAndID(PN_Code, g_db1_result->seq_no, true);
                     }
                     else
                     {
                         aging_error_log("Historical aging-data retransmission failed, seq_no=%d",
-                                        g_db1_result.seq_no);
+                                        g_db1_result->seq_no);
                         break;
                     }
                 }
@@ -5179,11 +5196,6 @@ static int ProcessAgingStepData(AgingUploadPacket *packet)
             parameter_name = (parameter_id != NULL && parameter_id[0] != '\0') ? parameter_id : "Unknown";
         }
 
-        if (read_ok && strstr(parameter_name, "SOC") != NULL)
-        {
-            D_SOC = value;
-        }
-
         if (!add_aging_value_item(aging_data, parameter_name, value))
         {
             cJSON_Delete(value_array);
@@ -5305,7 +5317,7 @@ void app_AgingData_Get_handle(void *arg)
                 }
                 else
                 {
-                    //printf("该阶段莫得数据\n");
+                    // printf("该阶段莫得数据\n");
                     AgingUploadPacket_Free(packet);
                 }
             }
@@ -5415,15 +5427,11 @@ void app_AgingData_Upload_handle(void *arg)
 
             if (agingResumeState.aging_valid == 1)
             {
-                QueryResult resume_record = {0};
-                if (QueryStructuredRecordLatestBySN(packet->sn, &resume_record) == 0)
+                QueryResult *resume_record = (QueryResult *)app_malloc_prefer_psram(sizeof(QueryResult));
+                if (QueryStructuredRecordLatestBySN(packet->sn, resume_record) == 0)
                 {
-                    idnum = resume_record.seq_no + 1;
-                    ESP_LOGI(TAG,
-                             "Resume aging upload from SQLite: PN=%s, last_id=%d, next_id=%d",
-                             packet->sn,
-                             resume_record.seq_no,
-                             idnum);
+                    idnum = resume_record->seq_no + 1;
+                    ESP_LOGI(TAG, "Resume aging upload from SQLite: PN=%s, last_id=%d, next_id=%d", packet->sn, resume_record->seq_no, idnum);
                 }
                 else
                 {
@@ -5431,6 +5439,7 @@ void app_AgingData_Upload_handle(void *arg)
                              "No SQLite history found for resumed PN=%s; IDNUM starts from 0",
                              packet->sn);
                 }
+                free(resume_record);
             }
             else
             {

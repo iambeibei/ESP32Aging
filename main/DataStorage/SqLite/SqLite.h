@@ -28,7 +28,7 @@ extern "C"
 #define SQLITE_CACHE_TABLE_NAME "data_cache"
 #define SQLITE_SCHEMA_VERSION 5
 
-    extern QueryResult g_db1_result;
+    extern QueryResult *g_db1_result;
 
     esp_err_t mount_fatfs_storage(void);
     void unmount_fatfs_storage(void);

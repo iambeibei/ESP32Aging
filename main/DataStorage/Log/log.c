@@ -46,7 +46,7 @@ esp_err_t log_storage_mount(void)
         .max_files = 1,
         .format_if_mount_failed = true};
 
-    esp_err_t ret = esp_vfs_fat_spiflash_mount(BASE_PATH, LOG_PARTITION_LABEL,
+    esp_err_t ret = esp_vfs_fat_spiflash_mount_rw_wl(BASE_PATH, LOG_PARTITION_LABEL,
                                                &mount_config, &s_wl_handle);
     if (ret != ESP_OK)
     {
@@ -61,7 +61,7 @@ esp_err_t log_storage_mount(void)
         if (s_log_mutex == NULL)
         {
             ESP_LOGE(TAG, "Failed to create log mutex");
-            esp_vfs_fat_spiflash_unmount(BASE_PATH, s_wl_handle);
+            esp_vfs_fat_spiflash_unmount_rw_wl(BASE_PATH, s_wl_handle);
             s_wl_handle = WL_INVALID_HANDLE;
             return ESP_ERR_NO_MEM;
         }
@@ -91,7 +91,7 @@ void storage_unmount(void)
 {
     if (s_wl_handle != WL_INVALID_HANDLE)
     {
-        esp_vfs_fat_spiflash_unmount(BASE_PATH, s_wl_handle);
+        esp_vfs_fat_spiflash_unmount_rw_wl(BASE_PATH, s_wl_handle);
         s_wl_handle = WL_INVALID_HANDLE;
     }
 

@@ -19,6 +19,7 @@
 #include "sqlite3.h"
 #include "cJSON.h"
 #include "SqLite.h"
+#include "app_mem.h"
 
 static const char *TAG = "SQLITE";
 
@@ -28,7 +29,7 @@ static sqlite3 *s_db = NULL;
 static bool s_db_ready = false;
 
 char db1_name[96];
-QueryResult g_db1_result = {0};
+QueryResult *g_db1_result=NULL;
 
 /* -------------------------------------------------------------------------- */
 /* 基础工具                                                                    */
@@ -1736,14 +1737,14 @@ int QueryJsonRecordBySeq(int seq_no, QueryResult *out_result)
 
 void query_db1_latest_by_sn_to_global(const char *sn)
 {
-    memset(&g_db1_result, 0, sizeof(g_db1_result));
-    (void)QueryStructuredRecordLatestBySN(sn, &g_db1_result);
+    memset(g_db1_result, 0, sizeof(QueryResult));
+    (void)QueryStructuredRecordLatestBySN(sn, g_db1_result);
 }
 
 void query_db1_to_global(int target_id)
 {
-    memset(&g_db1_result, 0, sizeof(g_db1_result));
-    (void)QueryStructuredRecordBySeq(target_id, &g_db1_result);
+    memset(g_db1_result, 0, sizeof(QueryResult));
+    (void)QueryStructuredRecordBySeq(target_id, g_db1_result);
 }
 
 int QueryStructuredRecordsBySNAndPushState(const char *sn,
@@ -2063,8 +2064,9 @@ void SqLite_Init(void)
         return;
     }
 
+    g_db1_result=(QueryResult *)app_malloc_prefer_psram(sizeof(QueryResult));
     snprintf(db1_name, sizeof(db1_name), "%s", DB_FILE_PATH);
-    memset(&g_db1_result, 0, sizeof(g_db1_result));
+    memset(g_db1_result, 0, sizeof(QueryResult));
 
     if (!sqlite_lock())
     {
