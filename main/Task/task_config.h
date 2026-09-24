@@ -73,18 +73,4 @@
 #define LG_STACK_BUTTON            3072
 #define LG_PRIO_BUTTON             1
 
-/*
- * 群控模式等待上位机下发"下一步放行"(CanNextstep)的最长时间。
- *
- * 上位机是以"收到设备的放行响应"作为放行成功的判据；根节点断网时指令与响应
- * 都到不了，若无超时兜底，老化任务会永久卡在步骤之间（既不推进也不采样）。
- * 超时后本地自动放行继续下一步，并留下"离线自动推进"记录，联网后补偿上报对账。
- *
- * 单位毫秒，默认 10 分钟；需要更长/更短时只改这里。
- */
-#define LG_NEXTSTEP_WAIT_TIMEOUT_MS (10 * 60 * 1000)
-
-/* 群控等待期间轮询间隔（毫秒）：留出中止/状态检查的机会，不要死睡。 */
-#define LG_NEXTSTEP_POLL_INTERVAL_MS 1000
-
 #endif /* LIGHT_GATEWAY_TASK_CONFIG_H */

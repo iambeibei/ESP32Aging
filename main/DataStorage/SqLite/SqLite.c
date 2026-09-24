@@ -1247,19 +1247,10 @@ static int get_overwrite_local_id_locked(sqlite3_int64 *local_id)
 {
     *local_id = -1;
 
-    /*
-     * 只淘汰已上传(pushed=1)的记录，取其中最旧的一条。
-     *
-     * 两条硬约束：
-     * 1) 必须带 WHERE pushed = 1 —— 未上传(pushed=0)的记录是断网期间唯一的数据副本，
-     *    一旦全表都是 pushed=0 就绝不淘汰，宁可拒绝写入也不能丢数据。
-     * 2) 排序用 local_id（INTEGER PRIMARY KEY，单调递增即插入顺序），不用 timestamp /
-     *    created_at —— 后者来自 time(NULL)，会被 SNTP 首次同步的时间跳变污染。
-     */
+    /* pushed=1优先淘汰；同状态下local_id越小越旧。 */
     const char *sql =
         "SELECT local_id FROM " SQLITE_CACHE_TABLE_NAME " "
-        "WHERE pushed = 1 "
-        "ORDER BY local_id ASC LIMIT 1;";
+        "ORDER BY pushed DESC, local_id ASC LIMIT 1;";
 
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(s_db, sql, -1, &stmt, NULL);
@@ -1333,9 +1324,6 @@ int InsertStructuredRecord(int seq_no,
         return -1;
     }
 
-    /* 默认失败码；缓存满且无可淘汰记录时改成 SQLITE_INSERT_ERR_CACHE_FULL。 */
-    int out_rc = SQLITE_INSERT_ERR_GENERAL;
-
     if (!sqlite_lock())
     {
         return -1;
@@ -1380,22 +1368,9 @@ int InsertStructuredRecord(int seq_no,
         {
             sqlite3_int64 overwrite_local_id = -1;
             rc = get_overwrite_local_id_locked(&overwrite_local_id);
-            if (rc == SQLITE_NOTFOUND || overwrite_local_id < 0)
+            if (rc != SQLITE_OK || overwrite_local_id < 0)
             {
-                /*
-                 * 缓存已满，且没有任何已上传(pushed=1)的记录可淘汰。
-                 * 此时不删除、不覆盖，直接拒绝本次写入 —— 未上传数据零丢失。
-                 */
-                ESP_LOGW(TAG,
-                         "SQLite cache full: no uploaded record to evict, drop write (count=%d, low_space=%d)",
-                         record_count,
-                         (int)low_space);
-                out_rc = SQLITE_INSERT_ERR_CACHE_FULL;
-                goto rollback;
-            }
-            if (rc != SQLITE_OK)
-            {
-                ESP_LOGE(TAG, "Select cache eviction candidate failed: rc=%d", rc);
+                ESP_LOGE(TAG, "No record available for cache eviction");
                 goto rollback;
             }
 
@@ -1500,7 +1475,7 @@ rollback:
     }
     (void)db_exec(s_db, "ROLLBACK;");
     sqlite_unlock();
-    return out_rc;
+    return -1;
 }
 
 int InsertDataReportValues(int seq_no,
@@ -1762,26 +1737,12 @@ int QueryJsonRecordBySeq(int seq_no, QueryResult *out_result)
 
 void query_db1_latest_by_sn_to_global(const char *sn)
 {
-    /* g_db1_result 是 PSRAM 上的堆对象（SqLite_Init 里分配），分配失败时必须挡住而不是解引用空指针。 */
-    if (g_db1_result == NULL)
-    {
-        ESP_LOGE(TAG, "g_db1_result is not allocated");
-        return;
-    }
-
     memset(g_db1_result, 0, sizeof(QueryResult));
     (void)QueryStructuredRecordLatestBySN(sn, g_db1_result);
 }
 
 void query_db1_to_global(int target_id)
 {
-    /* 同上：PSRAM 分配失败时不能直接解引用。 */
-    if (g_db1_result == NULL)
-    {
-        ESP_LOGE(TAG, "g_db1_result is not allocated");
-        return;
-    }
-
     memset(g_db1_result, 0, sizeof(QueryResult));
     (void)QueryStructuredRecordBySeq(target_id, g_db1_result);
 }
