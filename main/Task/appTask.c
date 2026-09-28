@@ -3261,6 +3261,7 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                 {
                     Cannextstep = (uint8_t)NextStep->valueint;
                 }
+                device_response_publish_point(Seq->valueint, 1, "CanNextstep set");            
             }
             else if (strstr(TopicBuf, "CPower")) // 只有根节点才会触发,控制开关相关代码待完善
             {
