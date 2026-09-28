@@ -3,6 +3,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* 服务端地址统一取自 main/Task/service_urls.h */
+#include "service_urls.h"
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "esp_heap_caps.h"
@@ -307,7 +310,7 @@ esp_err_t test_http_getproto(int Id)
 
 esp_err_t test_http_getproto_New(int64_t Id)
 {
-    const char *url ="https://ipc.poweroak.ltd:29009/DataCenter/V1/Protocol/GetWholeProtocol";
+    const char *url = LG_URL_HTTP_PROTOCOL_WHOLE_URL;
 
     char post_data[32];
     snprintf(post_data, sizeof(post_data), "%" PRId64, Id);

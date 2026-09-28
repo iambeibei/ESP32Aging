@@ -12,6 +12,7 @@ typedef enum
     AgingStartCheck, // 开始检查状态
     AgingDeviceCheck, // 老化设备检查阶段，有蓝牙功能就连接蓝牙
     AgingAction, // 执行老化
+    AgingDataCheck,//老化数据检测
     AgingComplete // 老化完成
 
 } AgingProcessState;

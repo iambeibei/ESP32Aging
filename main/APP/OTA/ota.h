@@ -4,12 +4,13 @@
 #include <stddef.h>
 #include "esp_err.h"
 
+/* OTA 根目录地址统一取自 main/Task/service_urls.h */
+#include "service_urls.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/** 默认 OTA 目录。目录末尾可以带 /，也可以不带 /。 */
-#define SIMPLE_OTA_DEFAULT_BASE_URL      "http://10.16.160.51:8888/OTABin/"
 
 /** 固定版本描述文件名。 */
 #define SIMPLE_OTA_DEFAULT_METADATA_FILE "update.json"
@@ -30,7 +31,7 @@ extern "C" {
  * @brief OTA 配置
  */
 typedef struct {
-    const char *base_url;                  /**< OTA 根目录，例如 http://10.16.160.51:8888/OTABin/ */
+    const char *base_url;                  /**< OTA 根目录，默认取 LG_URL_OTA_BASE_URL（见 service_urls.h） */
     const char *metadata_file;             /**< 版本描述文件，通常固定为 update.json */
     const char *cert_pem;                  /**< HTTPS 根证书；HTTP 可为 NULL */
     bool skip_cert_common_name_check;      /**< HTTPS 是否跳过证书 CN 检查 */

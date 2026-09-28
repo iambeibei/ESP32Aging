@@ -671,7 +671,7 @@ esp_err_t simple_ota_check_and_update(const simple_ota_config_t *config)
 esp_err_t simple_ota_check_and_update_default(void)
 {
     simple_ota_config_t config = {
-        .base_url = SIMPLE_OTA_DEFAULT_BASE_URL,
+        .base_url = LG_URL_OTA_BASE_URL,
         .metadata_file = SIMPLE_OTA_DEFAULT_METADATA_FILE,
         .cert_pem = NULL,
         .skip_cert_common_name_check = false,

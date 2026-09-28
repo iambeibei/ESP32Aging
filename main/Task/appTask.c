@@ -30,6 +30,8 @@
 #include "scpi_dynamic.h"
 #include "aging_config.h"
 #include "GetProto.h"
+#include "service_urls.h"
+#include "esp_http_client.h"
 #include "appTask.h"
 #include "modbus_cmd.h"
 #include "esp_heap_caps.h"
@@ -2995,6 +2997,8 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                 cJSON *recordId = cJSON_GetObjectItem(pRoot, "RecordId");
                 if (recordId)
                 {
+                    //清空RecordId
+                    memset(RecordId, 0, sizeof(RecordId));
                     strncpy(RecordId, recordId->valuestring, sizeof(RecordId) - 1);
                     RecordId[sizeof(RecordId) - 1] = '\0';
                     // 存nvs
@@ -3261,7 +3265,7 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                 {
                     Cannextstep = (uint8_t)NextStep->valueint;
                 }
-                device_response_publish_point(Seq->valueint, 1, "CanNextstep set");            
+                device_response_publish_point(Seq->valueint, 1, "CanNextstep set");
             }
             else if (strstr(TopicBuf, "CPower")) // 只有根节点才会触发,控制开关相关代码待完善
             {
@@ -4869,7 +4873,6 @@ void Aging_Test_Task(void *arg)
                             }
                             vTaskDelay(pdMS_TO_TICKS(2000));
                         }
-
                     }
                     else if (strncmp(method, "Recharge", 8) == 0)
                     {
@@ -4894,7 +4897,6 @@ void Aging_Test_Task(void *arg)
                             }
                             vTaskDelay(pdMS_TO_TICKS(2000));
                         }
-
                     }
                     else
                     {
@@ -4946,10 +4948,10 @@ void Aging_Test_Task(void *arg)
             }
 
             aging_runtime_log("All aging steps completed; entering completion stage");
-            agingState = AgingComplete;
+            agingState = AgingDataCheck;
             break;
         }
-        case AgingComplete:
+        case AgingDataCheck:
         {
             while (QueryLatestRecordBySNAndPushState(PN_Code, false, g_db1_result) == 0)
             {
@@ -4968,6 +4970,13 @@ void Aging_Test_Task(void *arg)
                 }
                 vTaskDelay(pdMS_TO_TICKS(100));
             }
+            
+
+            agingState = AgingComplete;
+            break;
+        }
+        case AgingComplete:
+        {
 
             agingState = AgingIdle;
             agingDataAMode = IdleState;
