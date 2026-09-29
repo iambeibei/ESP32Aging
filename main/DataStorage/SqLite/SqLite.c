@@ -20,6 +20,7 @@
 #include "cJSON.h"
 #include "SqLite.h"
 #include "app_mem.h"
+#include "sqllib1.h"
 
 static const char *TAG = "SQLITE";
 
@@ -105,11 +106,11 @@ static void fill_query_result_from_stmt(sqlite3_stmt *stmt, QueryResult *result)
 
     memset(result, 0, sizeof(QueryResult));
 
-    /* 查询列顺序固定：seq_no, sn, current_step, timestamp, pushed, value_data, created_at */
+    /* 查询列顺序固定：seq_no, pn, current_step, timestamp, pushed, value_data, created_at */
     result->seq_no = sqlite3_column_int(stmt, 0);
 
-    const unsigned char *sn = sqlite3_column_text(stmt, 1);
-    safe_copy(result->PN, sizeof(result->PN), (const char *)sn);
+    const unsigned char *pn = sqlite3_column_text(stmt, 1);
+    safe_copy(result->PN, sizeof(result->PN), (const char *)pn);
 
     result->current_step = (short)sqlite3_column_int(stmt, 2);
     result->timestamp = sqlite3_column_int(stmt, 3);
@@ -714,7 +715,7 @@ static int get_user_version(sqlite3 *db)
     return version;
 }
 
-static int create_schema_v5(sqlite3 *db)
+static int create_schema_v6(sqlite3 *db)
 {
     if (db == NULL)
     {
@@ -722,42 +723,42 @@ static int create_schema_v5(sqlite3 *db)
     }
 
     /*
-     * local_id 是数据库内部主键；IDNUM(seq_no)只在同一个SN内唯一。
+     * local_id 是数据库内部主键；IDNUM(seq_no)只在同一个PN内唯一。
      * 这修复了“第二台设备IDNUM重新从0开始时覆盖第一台设备记录”的问题。
      */
     int rc = db_exec(db,
                      "CREATE TABLE IF NOT EXISTS " SQLITE_CACHE_TABLE_NAME " ("
                      "local_id INTEGER PRIMARY KEY,"
                      "seq_no INTEGER NOT NULL,"
-                     "sn TEXT NOT NULL CHECK(length(sn) < 64),"
+                     "pn TEXT NOT NULL CHECK(length(pn) < 64),"
                      "current_step INTEGER NOT NULL,"
                      "timestamp INTEGER NOT NULL,"
                      "pushed INTEGER NOT NULL DEFAULT 0 CHECK(pushed IN (0,1)),"
                      "value_data TEXT NOT NULL CHECK(length(CAST(value_data AS BLOB)) <= 2048),"
                      "created_at INTEGER NOT NULL,"
-                     "UNIQUE(sn, seq_no)"
+                     "UNIQUE(pn, seq_no)"
                      ");");
     if (rc != SQLITE_OK) return rc;
 
     rc = db_exec(db,
-                 "CREATE INDEX IF NOT EXISTS idx_cache_sn_seq_v5 "
-                 "ON " SQLITE_CACHE_TABLE_NAME " (sn, seq_no DESC);");
+                 "CREATE INDEX IF NOT EXISTS idx_cache_pn_seq_v6 "
+                 "ON " SQLITE_CACHE_TABLE_NAME " (pn, seq_no DESC);");
     if (rc != SQLITE_OK) return rc;
 
     rc = db_exec(db,
-                 "CREATE INDEX IF NOT EXISTS idx_cache_sn_push_seq_v5 "
-                 "ON " SQLITE_CACHE_TABLE_NAME " (sn, pushed, seq_no);");
+                 "CREATE INDEX IF NOT EXISTS idx_cache_pn_push_seq_v6 "
+                 "ON " SQLITE_CACHE_TABLE_NAME " (pn, pushed, seq_no);");
     if (rc != SQLITE_OK) return rc;
 
     rc = db_exec(db,
-                 "CREATE INDEX IF NOT EXISTS idx_cache_push_local_v5 "
+                 "CREATE INDEX IF NOT EXISTS idx_cache_push_local_v6 "
                  "ON " SQLITE_CACHE_TABLE_NAME " (pushed, local_id);");
     if (rc != SQLITE_OK) return rc;
 
-    return db_exec(db, "PRAGMA user_version = 5;");
+    return db_exec(db, "PRAGMA user_version = 6;");
 }
 
-static bool sqlite_schema_is_v5(sqlite3 *db)
+static bool sqlite_schema_is_v6(sqlite3 *db)
 {
     if (db == NULL || !sqlite_table_exists(db, SQLITE_CACHE_TABLE_NAME))
     {
@@ -772,7 +773,7 @@ static bool sqlite_schema_is_v5(sqlite3 *db)
     static const char *required_columns[] = {
         "local_id",
         "seq_no",
-        "sn",
+        "pn",
         "current_step",
         "timestamp",
         "pushed",
@@ -787,45 +788,50 @@ static bool sqlite_schema_is_v5(sqlite3 *db)
         sizeof(required_columns) / sizeof(required_columns[0]));
 }
 
-static int create_v5_temp_table(sqlite3 *db)
+static int create_v6_temp_table(sqlite3 *db)
 {
     if (db == NULL)
     {
         return SQLITE_MISUSE;
     }
 
-    int rc = db_exec(db, "DROP TABLE IF EXISTS data_cache_v5_tmp;");
+    int rc = db_exec(db, "DROP TABLE IF EXISTS data_cache_v6_tmp;");
     if (rc != SQLITE_OK)
     {
         return rc;
     }
 
     return db_exec(db,
-                   "CREATE TABLE data_cache_v5_tmp ("
+                   "CREATE TABLE data_cache_v6_tmp ("
                    "local_id INTEGER PRIMARY KEY,"
                    "seq_no INTEGER NOT NULL,"
-                   "sn TEXT NOT NULL CHECK(length(sn) < 64),"
+                   "pn TEXT NOT NULL CHECK(length(pn) < 64),"
                    "current_step INTEGER NOT NULL,"
                    "timestamp INTEGER NOT NULL,"
                    "pushed INTEGER NOT NULL DEFAULT 0 CHECK(pushed IN (0,1)),"
                    "value_data TEXT NOT NULL CHECK(length(CAST(value_data AS BLOB)) <= 2048),"
                    "created_at INTEGER NOT NULL,"
-                   "UNIQUE(sn, seq_no)"
+                   "UNIQUE(pn, seq_no)"
                    ");");
 }
 
-static int migrate_legacy_schema_to_v5(sqlite3 *db)
+/*
+ * v3/v4/v5 的老表都把电池包编号存放在 sn 列；v6 统一改名为 pn。
+ * 不使用 ALTER TABLE RENAME：当前嵌入式 SQLite 组件实测
+ * ALTER TABLE ... RENAME 可能返回 SQLITE_ERROR，
+ * 因此改成事务内“临时表复制 -> 重建主表 -> 回填”。
+ *
+ * 注意：老表可能带 local_id（v5）也可能不带（v3/v4）。
+ * local_id 只是数据库内部主键，重建时重新生成不影响业务数据。
+ */
+static int migrate_legacy_schema_to_v6(sqlite3 *db)
 {
     if (db == NULL)
     {
         return SQLITE_MISUSE;
     }
 
-    /*
-     * 老版本 v3/v4 没有 local_id；不使用 ALTER TABLE RENAME。
-     * 当前嵌入式 SQLite 组件实测 ALTER TABLE ... RENAME 可能返回
-     * SQLITE_ERROR，因此改成事务内“临时表复制 -> 重建主表 -> 回填”。
-     */
+    /* 这些是“老表”的列名，必须保持 sn 不变。 */
     static const char *legacy_columns[] = {
         "seq_no",
         "sn",
@@ -854,12 +860,13 @@ static int migrate_legacy_schema_to_v5(sqlite3 *db)
         return rc;
     }
 
-    rc = create_v5_temp_table(db);
+    rc = create_v6_temp_table(db);
     if (rc != SQLITE_OK) goto rollback;
 
+    /* 源列是老表的 sn，目标列是新表的 pn。 */
     rc = db_exec(db,
-                 "INSERT OR REPLACE INTO data_cache_v5_tmp "
-                 "(seq_no, sn, current_step, timestamp, pushed, value_data, created_at) "
+                 "INSERT OR REPLACE INTO data_cache_v6_tmp "
+                 "(seq_no, pn, current_step, timestamp, pushed, value_data, created_at) "
                  "SELECT seq_no, sn, current_step, timestamp, pushed, value_data, created_at "
                  "FROM " SQLITE_CACHE_TABLE_NAME " "
                  "WHERE length(sn) < 64 "
@@ -873,59 +880,59 @@ static int migrate_legacy_schema_to_v5(sqlite3 *db)
                  "CREATE TABLE " SQLITE_CACHE_TABLE_NAME " ("
                  "local_id INTEGER PRIMARY KEY,"
                  "seq_no INTEGER NOT NULL,"
-                 "sn TEXT NOT NULL CHECK(length(sn) < 64),"
+                 "pn TEXT NOT NULL CHECK(length(pn) < 64),"
                  "current_step INTEGER NOT NULL,"
                  "timestamp INTEGER NOT NULL,"
                  "pushed INTEGER NOT NULL DEFAULT 0 CHECK(pushed IN (0,1)),"
                  "value_data TEXT NOT NULL CHECK(length(CAST(value_data AS BLOB)) <= 2048),"
                  "created_at INTEGER NOT NULL,"
-                 "UNIQUE(sn, seq_no)"
+                 "UNIQUE(pn, seq_no)"
                  ");");
     if (rc != SQLITE_OK) goto rollback;
 
     rc = db_exec(db,
                  "INSERT OR REPLACE INTO " SQLITE_CACHE_TABLE_NAME " "
-                 "(seq_no, sn, current_step, timestamp, pushed, value_data, created_at) "
-                 "SELECT seq_no, sn, current_step, timestamp, pushed, value_data, created_at "
-                 "FROM data_cache_v5_tmp;");
+                 "(seq_no, pn, current_step, timestamp, pushed, value_data, created_at) "
+                 "SELECT seq_no, pn, current_step, timestamp, pushed, value_data, created_at "
+                 "FROM data_cache_v6_tmp;");
     if (rc != SQLITE_OK) goto rollback;
 
-    rc = db_exec(db, "DROP TABLE data_cache_v5_tmp;");
-    if (rc != SQLITE_OK) goto rollback;
-
-    rc = db_exec(db,
-                 "CREATE INDEX IF NOT EXISTS idx_cache_sn_seq_v5 "
-                 "ON " SQLITE_CACHE_TABLE_NAME " (sn, seq_no DESC);");
+    rc = db_exec(db, "DROP TABLE data_cache_v6_tmp;");
     if (rc != SQLITE_OK) goto rollback;
 
     rc = db_exec(db,
-                 "CREATE INDEX IF NOT EXISTS idx_cache_sn_push_seq_v5 "
-                 "ON " SQLITE_CACHE_TABLE_NAME " (sn, pushed, seq_no);");
+                 "CREATE INDEX IF NOT EXISTS idx_cache_pn_seq_v6 "
+                 "ON " SQLITE_CACHE_TABLE_NAME " (pn, seq_no DESC);");
     if (rc != SQLITE_OK) goto rollback;
 
     rc = db_exec(db,
-                 "CREATE INDEX IF NOT EXISTS idx_cache_push_local_v5 "
+                 "CREATE INDEX IF NOT EXISTS idx_cache_pn_push_seq_v6 "
+                 "ON " SQLITE_CACHE_TABLE_NAME " (pn, pushed, seq_no);");
+    if (rc != SQLITE_OK) goto rollback;
+
+    rc = db_exec(db,
+                 "CREATE INDEX IF NOT EXISTS idx_cache_push_local_v6 "
                  "ON " SQLITE_CACHE_TABLE_NAME " (pushed, local_id);");
     if (rc != SQLITE_OK) goto rollback;
 
     /* 仅作为版本标记尝试写入；后续启动不依赖它判断 schema。 */
-    (void)db_exec(db, "PRAGMA user_version = 5;");
+    (void)db_exec(db, "PRAGMA user_version = 6;");
 
     rc = db_exec(db, "COMMIT;");
     if (rc == SQLITE_OK)
     {
-        ESP_LOGI(TAG, "Legacy SQLite schema migrated to v5");
+        ESP_LOGI(TAG, "SQLite legacy schema migrated to v6 (column sn renamed to pn)");
     }
     return rc;
 
 rollback:
     (void)db_exec(db, "ROLLBACK;");
-    ESP_LOGE(TAG, "Legacy SQLite schema migration failed: rc=%d, errmsg=%s",
+    ESP_LOGE(TAG, "SQLite legacy schema migration to v6 failed: rc=%d, errmsg=%s",
              rc, sqlite3_errmsg(db));
     return rc;
 }
 
-static int ensure_schema_v5(sqlite3 *db, int reported_user_version)
+static int ensure_schema_v6(sqlite3 *db, int reported_user_version)
 {
     if (db == NULL)
     {
@@ -934,32 +941,32 @@ static int ensure_schema_v5(sqlite3 *db, int reported_user_version)
 
     if (!sqlite_table_exists(db, SQLITE_CACHE_TABLE_NAME))
     {
-        ESP_LOGI(TAG, "SQLite data_cache table does not exist; creating v5 schema");
-        return create_schema_v5(db);
+        ESP_LOGI(TAG, "SQLite data_cache table does not exist; creating v6 schema");
+        return create_schema_v6(db);
     }
 
-    if (sqlite_schema_is_v5(db))
+    if (sqlite_schema_is_v6(db))
     {
         /*
-         * 真实结构已经是 v5。即使 PRAGMA user_version 返回 0 也绝不能迁移。
+         * 真实结构已经是 v6。即使 PRAGMA user_version 返回 0 也绝不能迁移。
          * 只补齐索引并尝试重新写版本标记。
          */
         if (reported_user_version != SQLITE_SCHEMA_VERSION)
         {
             ESP_LOGW(TAG,
-                     "SQLite table structure is already v5 but user_version=%d; "
+                     "SQLite table structure is already v6 but user_version=%d; "
                      "ignoring version mismatch and keeping existing data",
                      reported_user_version);
         }
 
-        return create_schema_v5(db);
+        return create_schema_v6(db);
     }
 
     ESP_LOGW(TAG,
-             "SQLite legacy table detected by schema probe (user_version=%d); migrating to v5",
+             "SQLite legacy table detected by schema probe (user_version=%d); migrating to v6",
              reported_user_version);
 
-    return migrate_legacy_schema_to_v5(db);
+    return migrate_legacy_schema_to_v6(db);
 }
 
 static int get_record_count_locked(int *record_count)
@@ -1080,7 +1087,7 @@ static int init_database_locked(void)
         sqlite_log_table_definition(s_db, SQLITE_CACHE_TABLE_NAME);
     }
 
-    rc = ensure_schema_v5(s_db, version);
+    rc = ensure_schema_v6(s_db, version);
     if (rc != SQLITE_OK)
     {
         ESP_LOGE(TAG,
@@ -1210,14 +1217,14 @@ static bool sqlite_storage_low_on_free_space(void)
     return free_bytes < DB_MIN_FREE_BYTES;
 }
 
-static int get_existing_local_id_locked(const char *sn, int seq_no, sqlite3_int64 *local_id)
+static int get_existing_local_id_locked(const char *pn, int seq_no, sqlite3_int64 *local_id)
 {
     *local_id = -1;
 
     sqlite3_stmt *stmt = NULL;
     const char *sql =
         "SELECT local_id FROM " SQLITE_CACHE_TABLE_NAME " "
-        "WHERE sn=? AND seq_no=? LIMIT 1;";
+        "WHERE pn=? AND seq_no=? LIMIT 1;";
 
     int rc = sqlite3_prepare_v2(s_db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK)
@@ -1225,7 +1232,7 @@ static int get_existing_local_id_locked(const char *sn, int seq_no, sqlite3_int6
         return rc;
     }
 
-    sqlite3_bind_text(stmt, 1, sn, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 1, pn, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, 2, seq_no);
 
     rc = sqlite3_step(stmt);
@@ -1299,21 +1306,21 @@ static int delete_local_id_locked(sqlite3_int64 local_id)
 /* -------------------------------------------------------------------------- */
 
 int InsertStructuredRecord(int seq_no,
-                           const char *sn,
+                           const char *pn,
                            int current_step,
                            int timestamp,
                            bool pushed,
                            const char *value_data)
 {
-    if (seq_no < 0 || sn == NULL || sn[0] == '\0' || value_data == NULL)
+    if (seq_no < 0 || pn == NULL || pn[0] == '\0' || value_data == NULL)
     {
         ESP_LOGE(TAG, "InsertStructuredRecord invalid parameter");
         return -1;
     }
 
-    if (strlen(sn) >= DB_SN_MAX_LEN)
+    if (strlen(pn) >= DB_PN_MAX_LEN)
     {
-        ESP_LOGE(TAG, "PN length invalid: %u bytes", (unsigned)strlen(sn));
+        ESP_LOGE(TAG, "PN length invalid: %u bytes", (unsigned)strlen(pn));
         return -1;
     }
 
@@ -1345,7 +1352,7 @@ int InsertStructuredRecord(int seq_no,
 
     sqlite3_stmt *stmt = NULL;
     sqlite3_int64 existing_local_id = -1;
-    int existing_rc = get_existing_local_id_locked(sn, seq_no, &existing_local_id);
+    int existing_rc = get_existing_local_id_locked(pn, seq_no, &existing_local_id);
 
     if (existing_rc != SQLITE_OK && existing_rc != SQLITE_NOTFOUND)
     {
@@ -1415,7 +1422,7 @@ int InsertStructuredRecord(int seq_no,
     {
         const char *sql =
             "INSERT INTO " SQLITE_CACHE_TABLE_NAME " "
-            "(seq_no, sn, current_step, timestamp, pushed, value_data, created_at) "
+            "(seq_no, pn, current_step, timestamp, pushed, value_data, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?);";
 
         rc = sqlite3_prepare_v2(s_db, sql, -1, &stmt, NULL);
@@ -1426,7 +1433,7 @@ int InsertStructuredRecord(int seq_no,
         }
 
         sqlite3_bind_int(stmt, 1, seq_no);
-        sqlite3_bind_text(stmt, 2, sn, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, pn, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(stmt, 3, current_step);
         sqlite3_bind_int(stmt, 4, timestamp);
         sqlite3_bind_int(stmt, 5, pushed ? 1 : 0);
@@ -1457,9 +1464,9 @@ int InsertStructuredRecord(int seq_no,
     }
 
     ESP_LOGI(TAG,
-             "structured record committed: seq_no=%d, sn=%s, step=%d, timestamp=%d, pushed=%d, value_len=%u",
+             "structured record committed: seq_no=%d, PN=%s, step=%d, timestamp=%d, pushed=%d, value_len=%u",
              seq_no,
-             sn,
+             pn,
              current_step,
              timestamp,
              pushed ? 1 : 0,
@@ -1479,7 +1486,7 @@ rollback:
 }
 
 int InsertDataReportValues(int seq_no,
-                           const char *sn,
+                           const char *pn,
                            int current_step,
                            int timestamp,
                            bool pushed,
@@ -1531,7 +1538,7 @@ int InsertDataReportValues(int seq_no,
         return -1;
     }
 
-    int ret = InsertStructuredRecord(seq_no, sn, current_step, timestamp, pushed, value_json);
+    int ret = InsertStructuredRecord(seq_no, pn, current_step, timestamp, pushed, value_json);
     free(value_json);
     return ret;
 }
@@ -1540,9 +1547,9 @@ int InsertDataReportValues(int seq_no,
 /* 更新                                                                        */
 /* -------------------------------------------------------------------------- */
 
-int UpdateRecordPushStateBySNAndID(const char *sn, int seq_no, bool pushed)
+int UpdateRecordPushStateByPNAndID(const char *pn, int seq_no, bool pushed)
 {
-    if (sn == NULL || sn[0] == '\0' || seq_no < 0)
+    if (pn == NULL || pn[0] == '\0' || seq_no < 0)
     {
         return -1;
     }
@@ -1556,7 +1563,7 @@ int UpdateRecordPushStateBySNAndID(const char *sn, int seq_no, bool pushed)
 
     sqlite3_stmt *stmt = NULL;
     const char *sql =
-        "UPDATE " SQLITE_CACHE_TABLE_NAME " SET pushed=? WHERE sn=? AND seq_no=?;";
+        "UPDATE " SQLITE_CACHE_TABLE_NAME " SET pushed=? WHERE pn=? AND seq_no=?;";
 
     int rc = sqlite3_prepare_v2(s_db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK)
@@ -1567,7 +1574,7 @@ int UpdateRecordPushStateBySNAndID(const char *sn, int seq_no, bool pushed)
     }
 
     sqlite3_bind_int(stmt, 1, pushed ? 1 : 0);
-    sqlite3_bind_text(stmt, 2, sn, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, pn, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, 3, seq_no);
 
     rc = sqlite3_step(stmt);
@@ -1577,13 +1584,13 @@ int UpdateRecordPushStateBySNAndID(const char *sn, int seq_no, bool pushed)
     if (rc != SQLITE_DONE || changed <= 0)
     {
         ESP_LOGW(TAG, "Push-state update failed/not found: PN=%s seq_no=%d rc=%d",
-                 sn, seq_no, rc);
+                 pn, seq_no, rc);
         sqlite_unlock();
         return -1;
     }
 
     ESP_LOGI(TAG, "Push-state updated: PN=%s seq_no=%d pushed=%d",
-             sn, seq_no, pushed ? 1 : 0);
+             pn, seq_no, pushed ? 1 : 0);
     sqlite_unlock();
     return 0;
 }
@@ -1598,7 +1605,7 @@ int UpdateRecordPushState(int seq_no, bool pushed)
         return -1;
     }
 
-    /* legacy：若多个SN拥有相同seq_no，只更新最近插入的一条。 */
+    /* legacy：若多个PN拥有相同seq_no，只更新最近插入的一条。 */
     const char *sql =
         "UPDATE " SQLITE_CACHE_TABLE_NAME " SET pushed=? "
         "WHERE local_id=(SELECT local_id FROM " SQLITE_CACHE_TABLE_NAME " "
@@ -1627,7 +1634,7 @@ int UpdateRecordPushState(int seq_no, bool pushed)
 /* -------------------------------------------------------------------------- */
 
 static int query_one_locked(const char *sql,
-                            const char *sn,
+                            const char *pn,
                             int seq_no,
                             int pushed_filter,
                             QueryResult *out_result)
@@ -1641,9 +1648,9 @@ static int query_one_locked(const char *sql,
     }
 
     int bind_index = 1;
-    if (sn != NULL)
+    if (pn != NULL)
     {
-        sqlite3_bind_text(stmt, bind_index++, sn, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, bind_index++, pn, -1, SQLITE_TRANSIENT);
     }
     if (seq_no >= 0)
     {
@@ -1671,9 +1678,9 @@ static int query_one_locked(const char *sql,
     return -1;
 }
 
-int QueryStructuredRecordLatestBySN(const char *sn, QueryResult *out_result)
+int QueryStructuredRecordLatestByPN(const char *pn, QueryResult *out_result)
 {
-    if (sn == NULL || sn[0] == '\0' || out_result == NULL)
+    if (pn == NULL || pn[0] == '\0' || out_result == NULL)
     {
         return -1;
     }
@@ -1688,19 +1695,19 @@ int QueryStructuredRecordLatestBySN(const char *sn, QueryResult *out_result)
     }
 
     const char *sql =
-        "SELECT seq_no, sn, current_step, timestamp, pushed, value_data, created_at "
+        "SELECT seq_no, pn, current_step, timestamp, pushed, value_data, created_at "
         "FROM " SQLITE_CACHE_TABLE_NAME " "
-        "WHERE sn=? ORDER BY seq_no DESC, local_id DESC LIMIT 1;";
+        "WHERE pn=? ORDER BY seq_no DESC, local_id DESC LIMIT 1;";
 
-    int ret = query_one_locked(sql, sn, -1, -1, out_result);
+    int ret = query_one_locked(sql, pn, -1, -1, out_result);
     if (ret == 0)
     {
         ESP_LOGI(TAG, "Latest record found: PN=%s last_seq=%d pushed=%d",
-                 sn, out_result->seq_no, out_result->pushed ? 1 : 0);
+                 pn, out_result->seq_no, out_result->pushed ? 1 : 0);
     }
     else
     {
-        ESP_LOGI(TAG, "No cached record for PN=%s", sn);
+        ESP_LOGI(TAG, "No cached record for PN=%s", pn);
     }
 
     sqlite_unlock();
@@ -1719,9 +1726,9 @@ int QueryStructuredRecordBySeq(int seq_no, QueryResult *out_result)
         return -1;
     }
 
-    /* legacy：跨SN时返回最近插入的同seq_no记录。 */
+    /* legacy：跨PN时返回最近插入的同seq_no记录。 */
     const char *sql =
-        "SELECT seq_no, sn, current_step, timestamp, pushed, value_data, created_at "
+        "SELECT seq_no, pn, current_step, timestamp, pushed, value_data, created_at "
         "FROM " SQLITE_CACHE_TABLE_NAME " "
         "WHERE seq_no=? ORDER BY local_id DESC LIMIT 1;";
 
@@ -1735,10 +1742,10 @@ int QueryJsonRecordBySeq(int seq_no, QueryResult *out_result)
     return QueryStructuredRecordBySeq(seq_no, out_result);
 }
 
-void query_db1_latest_by_sn_to_global(const char *sn)
+void query_db1_latest_by_pn_to_global(const char *pn)
 {
     memset(g_db1_result, 0, sizeof(QueryResult));
-    (void)QueryStructuredRecordLatestBySN(sn, g_db1_result);
+    (void)QueryStructuredRecordLatestByPN(pn, g_db1_result);
 }
 
 void query_db1_to_global(int target_id)
@@ -1747,7 +1754,7 @@ void query_db1_to_global(int target_id)
     (void)QueryStructuredRecordBySeq(target_id, g_db1_result);
 }
 
-int QueryStructuredRecordsBySNAndPushState(const char *sn,
+int QueryStructuredRecordsByPNAndPushState(const char *pn,
                                            bool pushed,
                                            QueryResult *out_array,
                                            int max_count,
@@ -1755,7 +1762,7 @@ int QueryStructuredRecordsBySNAndPushState(const char *sn,
 {
     if (out_count != NULL) *out_count = 0;
 
-    if (sn == NULL || sn[0] == '\0' || out_array == NULL || max_count <= 0 || out_count == NULL)
+    if (pn == NULL || pn[0] == '\0' || out_array == NULL || max_count <= 0 || out_count == NULL)
     {
         return -1;
     }
@@ -1770,9 +1777,9 @@ int QueryStructuredRecordsBySNAndPushState(const char *sn,
     }
 
     const char *sql =
-        "SELECT seq_no, sn, current_step, timestamp, pushed, value_data, created_at "
+        "SELECT seq_no, pn, current_step, timestamp, pushed, value_data, created_at "
         "FROM " SQLITE_CACHE_TABLE_NAME " "
-        "WHERE sn=? AND pushed=? "
+        "WHERE pn=? AND pushed=? "
         "ORDER BY seq_no ASC, local_id ASC LIMIT ?;";
 
     sqlite3_stmt *stmt = NULL;
@@ -1784,7 +1791,7 @@ int QueryStructuredRecordsBySNAndPushState(const char *sn,
         return -1;
     }
 
-    sqlite3_bind_text(stmt, 1, sn, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 1, pn, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, 2, pushed ? 1 : 0);
     sqlite3_bind_int(stmt, 3, max_count);
 
@@ -1806,11 +1813,11 @@ int QueryStructuredRecordsBySNAndPushState(const char *sn,
     return (count > 0) ? 0 : -1;
 }
 
-int QueryLatestRecordBySNAndPushState(const char *sn,
+int QueryLatestRecordByPNAndPushState(const char *pn,
                                       bool pushed,
                                       QueryResult *out_result)
 {
-    if (sn == NULL || sn[0] == '\0' || out_result == NULL)
+    if (pn == NULL || pn[0] == '\0' || out_result == NULL)
     {
         return -1;
     }
@@ -1826,12 +1833,12 @@ int QueryLatestRecordBySNAndPushState(const char *sn,
 
     /* 补发按IDNUM从小到大，避免乱序。 */
     const char *sql =
-        "SELECT seq_no, sn, current_step, timestamp, pushed, value_data, created_at "
+        "SELECT seq_no, pn, current_step, timestamp, pushed, value_data, created_at "
         "FROM " SQLITE_CACHE_TABLE_NAME " "
-        "WHERE sn=? AND pushed=? "
+        "WHERE pn=? AND pushed=? "
         "ORDER BY seq_no ASC, local_id ASC LIMIT 1;";
 
-    int ret = query_one_locked(sql, sn, -1, pushed ? 1 : 0, out_result);
+    int ret = query_one_locked(sql, pn, -1, pushed ? 1 : 0, out_result);
     sqlite_unlock();
     return ret;
 }
@@ -1854,7 +1861,7 @@ int QueryUnpushedRecords(QueryResult *out_array, int max_count, int *out_count)
     }
 
     const char *sql =
-        "SELECT seq_no, sn, current_step, timestamp, pushed, value_data, created_at "
+        "SELECT seq_no, pn, current_step, timestamp, pushed, value_data, created_at "
         "FROM " SQLITE_CACHE_TABLE_NAME " "
         "WHERE pushed=0 ORDER BY local_id ASC LIMIT ?;";
 
@@ -1972,7 +1979,7 @@ static int serialize_value_array_for_storage(cJSON *value_item,
     return 0;
 }
 
-int InsertJsonRecord(int seq_no, const char *sn, bool pushed, const char *json_data)
+int InsertJsonRecord(int seq_no, const char *pn, bool pushed, const char *json_data)
 {
     if (json_data == NULL)
     {
@@ -1991,22 +1998,22 @@ int InsertJsonRecord(int seq_no, const char *sn, bool pushed, const char *json_d
         payload = root;
     }
 
-    const char *final_sn = sn;
+    const char *final_pn = pn;
     int final_seq_no = seq_no;
     int final_timestamp = 0;
     int final_step = 0;
     char value_data[DB_VALUE_DATA_MAX_LEN + 1] = {0};
 
-    cJSON *sn_item = cJSON_GetObjectItemCaseSensitive(payload, "PN");
+    cJSON *pn_item = cJSON_GetObjectItemCaseSensitive(payload, "PN");
     cJSON *id_item = cJSON_GetObjectItemCaseSensitive(payload, "IDNUM");
     cJSON *timestamp_item = cJSON_GetObjectItemCaseSensitive(payload, "TIMESTAMP");
     cJSON *step_item = cJSON_GetObjectItemCaseSensitive(payload, "CurrentStep");
     cJSON *value_item = cJSON_GetObjectItemCaseSensitive(payload, "Value");
 
-    if ((final_sn == NULL || final_sn[0] == '\0') &&
-        cJSON_IsString(sn_item) && sn_item->valuestring != NULL)
+    if ((final_pn == NULL || final_pn[0] == '\0') &&
+        cJSON_IsString(pn_item) && pn_item->valuestring != NULL)
     {
-        final_sn = sn_item->valuestring;
+        final_pn = pn_item->valuestring;
     }
 
     if (final_seq_no < 0 && cJSON_IsNumber(id_item))
@@ -2023,14 +2030,14 @@ int InsertJsonRecord(int seq_no, const char *sn, bool pushed, const char *json_d
         return -1;
     }
 
-    if (final_sn == NULL || final_sn[0] == '\0' || final_seq_no < 0 || final_timestamp <= 0)
+    if (final_pn == NULL || final_pn[0] == '\0' || final_seq_no < 0 || final_timestamp <= 0)
     {
         cJSON_Delete(root);
         return -1;
     }
 
     int ret = InsertStructuredRecord(final_seq_no,
-                                     final_sn,
+                                     final_pn,
                                      final_step,
                                      final_timestamp,
                                      pushed,

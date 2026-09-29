@@ -16,7 +16,7 @@ extern "C" {
  *
  * 这样实时 MQTT 与 SQLite 补发共用同一份 Value，不再维护第二套字段映射。
  */
-#define DB_SN_MAX_LEN             64
+#define DB_PN_MAX_LEN             64
 #define DB_STEP_MAX_LEN           32
 #define DB_VALUE_DATA_MAX_LEN     2048
 /* 完整上报 JSON = Value(<=2048) + 外层字段，预留足够余量。 */
@@ -33,7 +33,7 @@ extern "C" {
 typedef struct
 {
     int seq_no;
-    char PN[DB_SN_MAX_LEN];
+    char PN[DB_PN_MAX_LEN];
     short current_step;
     int timestamp;
     bool pushed;

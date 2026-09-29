@@ -130,25 +130,28 @@ AgingDeviceCheck → AgingAction → AgingComplete`，由 `Aging_Test_Task`
 
 ### 数据流
 
-1. `app_AgingData_Get_handle` 按周期采样，构造 `AgingUploadPacket`（SN、步骤、时间戳和 `Value` JSON
-   在**采样时刻即被固化**，因此慢速上传者不会把不同步骤/SN 的数据混在一起），并以 `pushed=0` 插入。
+1. `app_AgingData_Get_handle` 按周期采样，构造 `AgingUploadPacket`（PN、步骤、时间戳和 `Value` JSON
+   在**采样时刻即被固化**，因此慢速上传者不会把不同步骤/PN 的数据混在一起），并以 `pushed=0` 插入。
 2. `app_AgingData_Upload_handle` 出队、发布，然后把 `pushed` 置为 `1`。
-3. `QueryLatestRecordBySNAndPushState` 驱动未上传记录的补发。
+3. `QueryLatestRecordByPNAndPushState` 驱动未上传记录的补发。
 
 当前上传队列与 `Value` 格式的设计依据见 [MODIFICATION_NOTES.md](MODIFICATION_NOTES.md)。
 
 ### 持久化
 
-**SQLite**（`/fatfs/data.db`，schema **v5**，表 `data_cache`）：`local_id` 是内部主键；
-`(sn, seq_no)` 唯一，因此第二个电池包 IDNUM 从 0 重新开始也不会覆盖第一个的数据。
+**SQLite**（`/fatfs/data.db`，schema **v6**，表 `data_cache`）：`local_id` 是内部主键；
+`(pn, seq_no)` 唯一，因此第二个电池包 IDNUM 从 0 重新开始也不会覆盖第一个的数据。
+（v6 之前的版本该列名为 `sn`；启动时由 `migrate_legacy_schema_to_v6()` 自动迁移，见下。）
 `pushed` 标记上传完成状态。容量限制（1200 条记录、512 KB 最小剩余空间）只在插入路径上生效，
 且每插入一条淘汰一行 —— 优先淘汰最旧的 `pushed=1` 记录。
 
 这一层来之不易的约束（分散记录在 `SQLITE_*.md` 中）：
 
 - `PRAGMA user_version` 在该嵌入式 SQLite 上**不可靠**。schema 检测是探测**实际列**，而不是读版本
-  pragma。不要把 `sqlite_schema_is_v5()`"简化"成读 `user_version`。
+  pragma。不要把 `sqlite_schema_is_v6()`"简化"成读 `user_version`。
 - `ALTER TABLE ... RENAME` 在这里会失败；迁移采用的是事务性的临时表拷贝/重建。
+  `migrate_legacy_schema_to_v6()` 同时负责 v3/v4 → v6 和 v5(`sn`) → v6(`pn`) 两条路径：
+  它探测的是**老表的 `sn` 列**，读出后写入新表的 `pn` 列，这个 `sn` 不能跟着改名。
 - 日志 pragma 被刻意设为 `journal_mode=DELETE` + `synchronous=FULL`（从 MEMORY/NORMAL 改过来，
   用于修复 `disk image is malformed` 损坏问题）。不要为了速度改回去。
 - `cleanup_database_files()` **故意不设调用方** —— 它会删除数据库，仅供人工维修使用。

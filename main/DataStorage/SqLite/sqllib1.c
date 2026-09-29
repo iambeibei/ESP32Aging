@@ -8,6 +8,7 @@
 #include "sqllib1.h"
 #include "cJSON.h"
 #include <time.h>
+#include "appTask.h"
 
 static void safe_copy(char *dst, size_t dst_size, const char *src)
 {
@@ -174,11 +175,12 @@ int db_build_data_report_json(const QueryResult *record,
         return -1;
     }
 
-    cJSON_AddNumberToObject(root, "Seq", (double)time(NULL));
+    cJSON_AddNumberToObject(root, "Seq", time(NULL));
     cJSON_AddItemToObject(root, "Data", data);
     cJSON_AddNumberToObject(data, "IDNUM", record->seq_no);
     cJSON_AddNumberToObject(data, "TIMESTAMP", record->timestamp);
     cJSON_AddStringToObject(data, "PN", record->PN);
+    cJSON_AddStringToObject(data, "RecordId", RecordId);
     cJSON_AddNumberToObject(data, "CurrentStep", record->current_step);
     cJSON_AddItemToObject(data, "Value", value_array);
 
@@ -212,8 +214,8 @@ static void fill_query_result_from_stmt(sqlite3_stmt *stmt, QueryResult *result)
 
     result->seq_no = sqlite3_column_int(stmt, 0);
 
-    const unsigned char *sn = sqlite3_column_text(stmt, 1);
-    safe_copy(result->PN, sizeof(result->PN), (const char *)sn);
+    const unsigned char *pn = sqlite3_column_text(stmt, 1);
+    safe_copy(result->PN, sizeof(result->PN), (const char *)pn);
 
     result->current_step = (short)sqlite3_column_int(stmt, 2);
     result->timestamp = sqlite3_column_int(stmt, 3);
@@ -297,7 +299,7 @@ int db_exec(sqlite3 *db, const char *sql)
 /*
  * 通用查询函数。
  * 传入 SQL 必须按如下列顺序返回：
- *   seq_no, sn, current_step, timestamp, pushed, value_data, created_at
+ *   seq_no, pn, current_step, timestamp, pushed, value_data, created_at
  */
 int db_query_to_variable(sqlite3 *db, const char *sql, QueryResult *result)
 {

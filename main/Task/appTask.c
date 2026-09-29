@@ -46,7 +46,7 @@
 #define AGING_UPLOAD_VALUE_COUNT 32
 // 最多支持6个外接设备
 #define MAX_EXTERNAL_DEVICE_COUNT 6
-#define AGING_UPLOAD_SN_MAX_LEN 64
+#define AGING_UPLOAD_PN_MAX_LEN 64
 
 #define NVS_KEY_CURRENT_PN "bt_name"
 #define NVS_KEY_READY_PN "bt_name_Ready"
@@ -90,7 +90,7 @@ static int read_device_count = 0;           // 外接设备数量
 
 typedef struct
 {
-    char sn[AGING_UPLOAD_SN_MAX_LEN];
+    char pn[AGING_UPLOAD_PN_MAX_LEN];
     int current_step;
     int timestamp;
     uint8_t value_count;
@@ -4955,13 +4955,13 @@ void Aging_Test_Task(void *arg)
         }
         case AgingDataCheck:
         {
-            while (QueryLatestRecordBySNAndPushState(PN_Code, false, g_db1_result) == 0)
+            while (QueryLatestRecordByPNAndPushState(PN_Code, false, g_db1_result) == 0)
             {
                 if (g_db1_result->json_data[0] != '\0')
                 {
                     if (app_mqtt_publish("device/%s/data/aging", g_db1_result->json_data, DEVICE_ID) > 0)
                     {
-                        UpdateRecordPushStateBySNAndID(PN_Code, g_db1_result->seq_no, true);
+                        UpdateRecordPushStateByPNAndID(PN_Code, g_db1_result->seq_no, true);
                     }
                     else
                     {
@@ -4990,9 +4990,10 @@ void Aging_Test_Task(void *arg)
                         {
                             if (app_mqtt_publish("device/%s/data/aging", g_db1_result->json_data, DEVICE_ID) > 0)
                             {
+                                
                             }
                         }
-                        vTaskDelay(pdMS_TO_TICKS(100));
+                        vTaskDelay(pdMS_TO_TICKS(1000));
                     }
                     free(ids);
                 }
@@ -5181,7 +5182,7 @@ static int ProcessAgingStepData(AgingUploadPacket *packet)
     }
 
     memset(packet, 0, sizeof(*packet));
-    snprintf(packet->sn, sizeof(packet->sn), "%s", PN_Code);
+    snprintf(packet->pn, sizeof(packet->pn), "%s", PN_Code);
     packet->current_step = CurrentAgingStep;
     packet->timestamp = (int)time(NULL);
 
@@ -5371,7 +5372,7 @@ static void app_DataUpload_Functiong(const AgingUploadPacket *packet, int idnum)
     }
 
     char *publish_string = create_sensor_json(idnum,
-                                              packet->sn,
+                                              packet->pn,
                                               packet->current_step,
                                               packet->timestamp,
                                               packet->value_json);
@@ -5394,7 +5395,7 @@ static void app_DataUpload_Functiong(const AgingUploadPacket *packet, int idnum)
      * 不会出现“MQTT刚发出但SQLite还没来得及保存”的本地数据丢失窗口。
      */
     int db_ret = InsertStructuredRecord(idnum,
-                                        packet->sn,
+                                        packet->pn,
                                         packet->current_step,
                                         packet->timestamp,
                                         false,
@@ -5402,10 +5403,10 @@ static void app_DataUpload_Functiong(const AgingUploadPacket *packet, int idnum)
 
     if (db_ret != 0)
     {
-        aging_error_log("Persist aging data to SQLite failed before MQTT, id=%d, step=%d, sn=%s",
+        aging_error_log("Persist aging data to SQLite failed before MQTT, id=%d, step=%d, PN=%s",
                         idnum,
                         packet->current_step,
-                        packet->sn);
+                        packet->pn);
     }
     else
     {
@@ -5421,15 +5422,15 @@ static void app_DataUpload_Functiong(const AgingUploadPacket *packet, int idnum)
 
     if (upload_success && db_ret == 0)
     {
-        if (UpdateRecordPushStateBySNAndID(packet->sn, idnum, true) != 0)
+        if (UpdateRecordPushStateByPNAndID(packet->pn, idnum, true) != 0)
         {
             /*
              * MQTT已提交但状态更新失败时保持 pushed=0 更安全。
              * 后续可能重复补发，但不会静默丢数据。
              */
-            aging_error_log("MQTT submitted but SQLite pushed-state update failed, id=%d, sn=%s",
+            aging_error_log("MQTT submitted but SQLite pushed-state update failed, id=%d, PN=%s",
                             idnum,
-                            packet->sn);
+                            packet->pn);
         }
     }
 
@@ -5442,7 +5443,7 @@ static void app_DataUpload_Functiong(const AgingUploadPacket *packet, int idnum)
 void app_AgingData_Upload_handle(void *arg)
 {
     int idnum = 0;
-    char active_sn[AGING_UPLOAD_SN_MAX_LEN] = {0};
+    char active_pn[AGING_UPLOAD_PN_MAX_LEN] = {0};
 
     while (1)
     {
@@ -5453,34 +5454,34 @@ void app_AgingData_Upload_handle(void *arg)
         }
 
         /*
-         * 每个SN独立维护IDNUM。
-         * 掉电恢复时，第一包数据到来后从SQLite查询该SN最后一个IDNUM并继续 +1。
-         * 正常新SN则从0开始。
+         * 每个PN独立维护IDNUM。
+         * 掉电恢复时，第一包数据到来后从SQLite查询该PN最后一个IDNUM并继续 +1。
+         * 正常新PN则从0开始。
          */
-        if (strncmp(active_sn, packet->sn, sizeof(active_sn)) != 0)
+        if (strncmp(active_pn, packet->pn, sizeof(active_pn)) != 0)
         {
-            snprintf(active_sn, sizeof(active_sn), "%s", packet->sn);
+            snprintf(active_pn, sizeof(active_pn), "%s", packet->pn);
             idnum = 0;
 
             if (agingResumeState.aging_valid == 1)
             {
                 QueryResult *resume_record = (QueryResult *)app_malloc_prefer_psram(sizeof(QueryResult));
-                if (QueryStructuredRecordLatestBySN(packet->sn, resume_record) == 0)
+                if (QueryStructuredRecordLatestByPN(packet->pn, resume_record) == 0)
                 {
                     idnum = resume_record->seq_no + 1;
-                    ESP_LOGI(TAG, "Resume aging upload from SQLite: PN=%s, last_id=%d, next_id=%d", packet->sn, resume_record->seq_no, idnum);
+                    ESP_LOGI(TAG, "Resume aging upload from SQLite: PN=%s, last_id=%d, next_id=%d", packet->pn, resume_record->seq_no, idnum);
                 }
                 else
                 {
                     ESP_LOGW(TAG,
                              "No SQLite history found for resumed PN=%s; IDNUM starts from 0",
-                             packet->sn);
+                             packet->pn);
                 }
                 free(resume_record);
             }
             else
             {
-                ESP_LOGI(TAG, "New aging upload session: PN=%s, IDNUM starts from 0", packet->sn);
+                ESP_LOGI(TAG, "New aging upload session: PN=%s, IDNUM starts from 0", packet->pn);
             }
         }
 
