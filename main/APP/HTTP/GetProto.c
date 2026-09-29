@@ -485,3 +485,96 @@ int app_read_HTTP_data(char *data_buffer, int buffer_len, uint32_t timeout)
     free(msg.data);
     return copy_len;
 }
+
+
+esp_err_t test_http_post_record_query(int32_t seq, int32_t id_num, const char *record_id,char *out_response_buffer, int out_buffer_len)
+{
+    const char *url = LG_URL_Get_LOST_IDNUM_URL;
+
+    // ---- Build request JSON body: {"Seq":...,"Data":{"RecordId":"...","IdNum":...}} ----
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddItemToObject(root, "Seq", cJSON_CreateNumber(seq));
+
+    cJSON *data = cJSON_CreateObject();
+    cJSON_AddItemToObject(data, "RecordId", cJSON_CreateString(record_id));
+    cJSON_AddItemToObject(data, "IdNum", cJSON_CreateNumber(id_num));
+
+    cJSON_AddItemToObject(root, "Data", data);
+
+    char *post_data = cJSON_PrintUnformatted(root);
+    if (post_data == NULL) {
+        ESP_LOGE(TAG, "Failed to print JSON body");
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 30000,
+        .buffer_size = 1024,
+        .buffer_size_tx = 1024,
+        .keep_alive_enable = false,
+        //.crt_bundle_attach = esp_crt_bundle_attach,
+        // 不再需要 .event_handler
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        ESP_LOGE(TAG, "esp_http_client_init failed");
+        free(post_data);
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_err_t err;
+
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "User-Agent", "CSharp-HttpClient/1.0");
+    esp_http_client_set_header(client, "Accept", "application/json");
+
+    // 走底层流程，而不是 esp_http_client_perform
+    err = esp_http_client_open(client, strlen(post_data));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
+        goto cleanup;
+    }
+
+    int wlen = esp_http_client_write(client, post_data, strlen(post_data));
+    if (wlen < 0) {
+        ESP_LOGE(TAG, "Write failed");
+        err = ESP_FAIL;
+        goto cleanup;
+    }
+
+    int content_length = esp_http_client_fetch_headers(client);
+    if (content_length < 0) {
+        ESP_LOGE(TAG, "HTTP client fetch headers failed");
+        err = ESP_FAIL;
+        goto cleanup;
+    }
+
+    // 直接把响应体读入调用者提供的 buffer
+    int data_read = esp_http_client_read_response(client, out_response_buffer, out_buffer_len - 1);
+    if (data_read < 0) {
+        ESP_LOGE(TAG, "Failed to read response");
+        err = ESP_FAIL;
+        goto cleanup;
+    }
+    out_response_buffer[data_read] = '\0';
+
+    int status_code = esp_http_client_get_status_code(client);
+    ESP_LOGI(TAG, "HTTP Status = %d, content_length = %d", status_code, content_length);
+    ESP_LOGI(TAG, "Response Body: %s", out_response_buffer);
+
+    err = ESP_OK;
+
+cleanup:
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    free(post_data);
+    cJSON_Delete(root);
+
+    return err;
+}
+

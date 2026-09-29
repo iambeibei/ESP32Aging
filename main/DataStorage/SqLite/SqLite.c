@@ -109,7 +109,7 @@ static void fill_query_result_from_stmt(sqlite3_stmt *stmt, QueryResult *result)
     result->seq_no = sqlite3_column_int(stmt, 0);
 
     const unsigned char *sn = sqlite3_column_text(stmt, 1);
-    safe_copy(result->SN, sizeof(result->SN), (const char *)sn);
+    safe_copy(result->PN, sizeof(result->PN), (const char *)sn);
 
     result->current_step = (short)sqlite3_column_int(stmt, 2);
     result->timestamp = sqlite3_column_int(stmt, 3);
@@ -1313,7 +1313,7 @@ int InsertStructuredRecord(int seq_no,
 
     if (strlen(sn) >= DB_SN_MAX_LEN)
     {
-        ESP_LOGE(TAG, "SN length invalid: %u bytes", (unsigned)strlen(sn));
+        ESP_LOGE(TAG, "PN length invalid: %u bytes", (unsigned)strlen(sn));
         return -1;
     }
 
@@ -1576,13 +1576,13 @@ int UpdateRecordPushStateBySNAndID(const char *sn, int seq_no, bool pushed)
 
     if (rc != SQLITE_DONE || changed <= 0)
     {
-        ESP_LOGW(TAG, "Push-state update failed/not found: SN=%s seq_no=%d rc=%d",
+        ESP_LOGW(TAG, "Push-state update failed/not found: PN=%s seq_no=%d rc=%d",
                  sn, seq_no, rc);
         sqlite_unlock();
         return -1;
     }
 
-    ESP_LOGI(TAG, "Push-state updated: SN=%s seq_no=%d pushed=%d",
+    ESP_LOGI(TAG, "Push-state updated: PN=%s seq_no=%d pushed=%d",
              sn, seq_no, pushed ? 1 : 0);
     sqlite_unlock();
     return 0;
@@ -1695,12 +1695,12 @@ int QueryStructuredRecordLatestBySN(const char *sn, QueryResult *out_result)
     int ret = query_one_locked(sql, sn, -1, -1, out_result);
     if (ret == 0)
     {
-        ESP_LOGI(TAG, "Latest record found: SN=%s last_seq=%d pushed=%d",
+        ESP_LOGI(TAG, "Latest record found: PN=%s last_seq=%d pushed=%d",
                  sn, out_result->seq_no, out_result->pushed ? 1 : 0);
     }
     else
     {
-        ESP_LOGI(TAG, "No cached record for SN=%s", sn);
+        ESP_LOGI(TAG, "No cached record for PN=%s", sn);
     }
 
     sqlite_unlock();
@@ -1779,7 +1779,7 @@ int QueryStructuredRecordsBySNAndPushState(const char *sn,
     int rc = sqlite3_prepare_v2(s_db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK)
     {
-        ESP_LOGE(TAG, "Prepare SN/pushed query failed: %s", sqlite3_errmsg(s_db));
+        ESP_LOGE(TAG, "Prepare PN/pushed query failed: %s", sqlite3_errmsg(s_db));
         sqlite_unlock();
         return -1;
     }
@@ -1997,7 +1997,7 @@ int InsertJsonRecord(int seq_no, const char *sn, bool pushed, const char *json_d
     int final_step = 0;
     char value_data[DB_VALUE_DATA_MAX_LEN + 1] = {0};
 
-    cJSON *sn_item = cJSON_GetObjectItemCaseSensitive(payload, "SN");
+    cJSON *sn_item = cJSON_GetObjectItemCaseSensitive(payload, "PN");
     cJSON *id_item = cJSON_GetObjectItemCaseSensitive(payload, "IDNUM");
     cJSON *timestamp_item = cJSON_GetObjectItemCaseSensitive(payload, "TIMESTAMP");
     cJSON *step_item = cJSON_GetObjectItemCaseSensitive(payload, "CurrentStep");

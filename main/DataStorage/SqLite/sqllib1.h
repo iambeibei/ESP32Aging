@@ -33,7 +33,7 @@ extern "C" {
 typedef struct
 {
     int seq_no;
-    char SN[DB_SN_MAX_LEN];
+    char PN[DB_SN_MAX_LEN];
     short current_step;
     int timestamp;
     bool pushed;

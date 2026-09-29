@@ -34,7 +34,7 @@
 #define LG_PRIO_MESH_RX            11
 
 /* ---------------- 老化及应用业务任务 ---------------- */
-#define LG_STACK_AGING_CTRL        6144
+#define LG_STACK_AGING_CTRL        8192
 #define LG_PRIO_AGING_CTRL         8
 
 #define LG_STACK_BLE_DATA          6144

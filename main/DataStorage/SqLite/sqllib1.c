@@ -178,7 +178,7 @@ int db_build_data_report_json(const QueryResult *record,
     cJSON_AddItemToObject(root, "Data", data);
     cJSON_AddNumberToObject(data, "IDNUM", record->seq_no);
     cJSON_AddNumberToObject(data, "TIMESTAMP", record->timestamp);
-    cJSON_AddStringToObject(data, "SN", record->SN);
+    cJSON_AddStringToObject(data, "PN", record->PN);
     cJSON_AddNumberToObject(data, "CurrentStep", record->current_step);
     cJSON_AddItemToObject(data, "Value", value_array);
 
@@ -213,7 +213,7 @@ static void fill_query_result_from_stmt(sqlite3_stmt *stmt, QueryResult *result)
     result->seq_no = sqlite3_column_int(stmt, 0);
 
     const unsigned char *sn = sqlite3_column_text(stmt, 1);
-    safe_copy(result->SN, sizeof(result->SN), (const char *)sn);
+    safe_copy(result->PN, sizeof(result->PN), (const char *)sn);
 
     result->current_step = (short)sqlite3_column_int(stmt, 2);
     result->timestamp = sqlite3_column_int(stmt, 3);
@@ -353,7 +353,7 @@ void db_print_result(const char *db_name, const QueryResult *result)
 
     printf("\n=== %s Query Result ===\n", db_name);
     printf("seq_no:       %d\n", result->seq_no);
-    printf("SN:           %s\n", result->SN);
+    printf("PN:           %s\n", result->PN);
     printf("current_step: %d\n", result->current_step);
     printf("timestamp:    %d\n", result->timestamp);
     printf("pushed:       %s\n", result->pushed ? "true" : "false");

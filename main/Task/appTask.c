@@ -2997,7 +2997,7 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                 cJSON *recordId = cJSON_GetObjectItem(pRoot, "RecordId");
                 if (recordId)
                 {
-                    //清空RecordId
+                    // 清空RecordId
                     memset(RecordId, 0, sizeof(RecordId));
                     strncpy(RecordId, recordId->valuestring, sizeof(RecordId) - 1);
                     RecordId[sizeof(RecordId) - 1] = '\0';
@@ -3224,7 +3224,7 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
 
                 if (ids != NULL && count > 0)
                 {
-                    printf("Parsed %d IDs:\n", count);
+                    // printf("Parsed %d IDs:\n", count);
                     for (int i = 0; i < count; i++)
                     {
                         printf("ids[%d] = %d\n", i, ids[i]);
@@ -3630,18 +3630,16 @@ static void button_task(void *arg)
                 print_application_task_stacks();
 
                 // send_control_command(Sensor1, 0xFF, 50);
-                click_count = 2;
+                click_count = 1;
             }
             else if (click_count == 1)
             {
-                show_free_heap("内存");
 
                 click_count = 2;
             }
             else if (click_count == 2)
             {
                 show_free_heap("内存");
-
                 click_count = 3;
             }
             else if (click_count == 3)
@@ -4132,6 +4130,9 @@ static bool Data_Get_Method(Externaldevice *device, const char *idorname, uint8_
 
 #pragma region 老化指令与工艺执行
 
+// 最后验证时使用
+int s_idnum_index = 0;
+
 static bool WaitAgingDeviceProtocolReady(uint32_t timeout_ms)
 {
     TickType_t start_tick = xTaskGetTickCount();
@@ -4530,6 +4531,7 @@ void Aging_Test_Task(void *arg)
 {
     uint8_t FailCount = 0;
     bool aging_action_logged = false;
+    char *Lost_Data_List = (char *)app_malloc_prefer_psram(1024);
 
     while (1)
     {
@@ -4970,7 +4972,31 @@ void Aging_Test_Task(void *arg)
                 }
                 vTaskDelay(pdMS_TO_TICKS(100));
             }
-            
+            // 清空数据
+            memset(Lost_Data_List, 0, 1024);
+            esp_err_t ret = test_http_post_record_query(time(NULL), s_idnum_index, RecordId, Lost_Data_List, 1024);
+            if (ret == ESP_OK)
+            {
+                int count = 0;
+                int *ids = parse_ids_array(Lost_Data_List, &count);
+                if (ids != NULL && count > 0)
+                {
+                    // printf("Parsed %d IDs:\n", count);
+                    for (int i = 0; i < count; i++)
+                    {
+                        printf("ids[%d] = %d\n", i, ids[i]);
+                        query_db1_to_global(ids[i]);
+                        if (g_db1_result->json_data[0] != '\0')
+                        {
+                            if (app_mqtt_publish("device/%s/data/aging", g_db1_result->json_data, DEVICE_ID) > 0)
+                            {
+                            }
+                        }
+                        vTaskDelay(pdMS_TO_TICKS(100));
+                    }
+                    free(ids);
+                }
+            }
 
             agingState = AgingComplete;
             break;
@@ -5408,6 +5434,7 @@ static void app_DataUpload_Functiong(const AgingUploadPacket *packet, int idnum)
     }
 
     aging_data_upload_result(upload_success, idnum);
+    s_idnum_index = idnum;
     free(publish_string);
 }
 

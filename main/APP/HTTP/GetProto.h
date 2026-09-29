@@ -20,6 +20,9 @@ esp_err_t test_http_getproto_New(int64_t Id);
 esp_err_t Http_init(void);
 int app_read_HTTP_data(char *data_buffer, int buffer_len, uint32_t timeout);
 
+esp_err_t test_http_post_record_query(int32_t seq, int32_t id_num, const char *record_id,char *out_response_buffer, int out_buffer_len);
+
+
 #ifdef __cplusplus
 }
 #endif
