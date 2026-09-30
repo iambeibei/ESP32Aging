@@ -31,6 +31,9 @@
  *                Macros
  *******************************************************/
 
+/* 接收 BLE 设备名时使用的缓冲区大小，报文中的 name_len 必须裁剪到这个值以内。 */
+#define BLE_NAME_BUF_SIZE 64
+
 /*******************************************************
  *                Constants
  *******************************************************/
@@ -144,6 +147,16 @@ void send_mesh_message(uint8_t *target_mac, uint8_t *data, int len)
 
 static void recv_cb(mesh_addr_t *from, mesh_data_t *data)
 {
+    /*
+     * 所有 case 都以 data->data[0] 及后续字节为输入，
+     * 空载荷或空指针必须先拦截，否则命令分发就发生越界读。
+     */
+    if (from == NULL || data == NULL || data->data == NULL || data->size == 0)
+    {
+        ESP_LOGE(MESH_TAG, "Error in receiving raw mesh data: empty payload");
+        return;
+    }
+
     // 取出数据中的命令
     uint8_t cmd = data->data[0];
 
@@ -165,10 +178,17 @@ static void recv_cb(mesh_addr_t *from, mesh_data_t *data)
     case CMD_ROUTE_TABLE:
     {
         // 原有路由表处理
-        int size = data->size - 1;
-        if (s_route_table_lock == NULL || size % 6 != 0)
+        int size = (int)data->size - 1;
+
+        /*
+         * 必须同时校验上界：路由表缓冲区只有 CONFIG_MESH_ROUTE_TABLE_SIZE 个条目，
+         * 否则超长报文会写穿 s_route_table，并把 s_route_table_size 写成非法值。
+         */
+        if (s_route_table_lock == NULL || size <= 0 || size % 6 != 0 ||
+            (size / 6) > CONFIG_MESH_ROUTE_TABLE_SIZE ||
+            (size_t)size > sizeof(s_route_table))
         {
-            ESP_LOGE(MESH_TAG, "Error in receiving raw mesh data: Unexpected size");
+            ESP_LOGE(MESH_TAG, "Error in receiving raw mesh data: Unexpected route table size %d", size);
             return;
         }
         xSemaphoreTake(s_route_table_lock, portMAX_DELAY);
@@ -205,8 +225,27 @@ static void recv_cb(mesh_addr_t *from, mesh_data_t *data)
 
     case CMD_BLE_CONNECT:
     {
+        if (data->size < 2)
+        {
+            ESP_LOGE(MESH_TAG, "Error in receiving raw mesh data: BLE connect frame too short");
+            return;
+        }
+
         uint8_t name_len = data->data[1];
-        char device_name[64];
+
+        /* name_len 最大 255，必须裁剪到缓冲区容量 - 1，并校验报文实际长度。 */
+        if (name_len > BLE_NAME_BUF_SIZE - 1)
+        {
+            name_len = (uint8_t)(BLE_NAME_BUF_SIZE - 1);
+        }
+
+        if ((size_t)name_len + 2 > data->size)
+        {
+            ESP_LOGE(MESH_TAG, "Error in receiving raw mesh data: BLE connect name truncated");
+            return;
+        }
+
+        char device_name[BLE_NAME_BUF_SIZE];
         memcpy(device_name, data->data + 2, name_len);
         device_name[name_len] = '\0';
 
@@ -249,10 +288,19 @@ static void recv_cb(mesh_addr_t *from, mesh_data_t *data)
         printf("\n=== BLE Scan Results from Node " MACSTR " ===\n",
                MAC2STR(from->addr));
 
-        for (int i = 0; i < device_count && pos < data->size; i++)
+        for (int i = 0; i < device_count && pos < (int)data->size; i++)
         {
             int name_len = data->data[pos++];
-            char name[64];
+
+            /* 名称长度、MAC 与 RSSI 都必须落在报文范围内，否则越界读。 */
+            if (name_len > (int)(BLE_NAME_BUF_SIZE - 1) ||
+                (pos + name_len + 6 + 1) > (int)data->size)
+            {
+                ESP_LOGE(MESH_TAG, "Error in receiving raw mesh data: BLE scan result entry truncated");
+                break;
+            }
+
+            char name[BLE_NAME_BUF_SIZE];
             memcpy(name, data->data + pos, name_len);
             name[name_len] = '\0';
             pos += name_len;
@@ -271,9 +319,27 @@ static void recv_cb(mesh_addr_t *from, mesh_data_t *data)
 
     case CMD_BLE_CONNECT_RESULT:
     {
+        if (data->size < 3)
+        {
+            ESP_LOGE(MESH_TAG, "Error in receiving raw mesh data: BLE connect result frame too short");
+            return;
+        }
+
         uint8_t success = data->data[1];
         uint8_t name_len = data->data[2];
-        char device_name[64];
+
+        if (name_len > (uint8_t)(BLE_NAME_BUF_SIZE - 1))
+        {
+            name_len = (uint8_t)(BLE_NAME_BUF_SIZE - 1);
+        }
+
+        if ((size_t)name_len + 3 > data->size)
+        {
+            ESP_LOGE(MESH_TAG, "Error in receiving raw mesh data: BLE connect result name truncated");
+            return;
+        }
+
+        char device_name[BLE_NAME_BUF_SIZE];
         memcpy(device_name, data->data + 3, name_len);
         device_name[name_len] = '\0';
 
@@ -304,18 +370,28 @@ static void recv_cb(mesh_addr_t *from, mesh_data_t *data)
 
     case CMD_USER_MSG:
     {
+        /*
+         * 帧结构为 [cmd][6字节MAC][消息]，data->size < 8 时 data->size - 7
+         * 会得到负数，后续 VLA/ memcpy 长度/ printf 精度都会失效。
+         */
+        if (data->size < 8)
+        {
+            ESP_LOGE(MESH_TAG, "Error in receiving raw mesh data: user message frame too short");
+            return;
+        }
+
         // 解析收到的消息
         uint8_t *sender_mac = data->data + 1;     // 发送者MAC
         char *message = (char *)(data->data + 7); // 消息内容
-        int msg_len = data->size - 7;
+        size_t msg_len = data->size - 7;
 
         // 打印收到的消息
         ESP_LOGI(MESH_TAG, "收到来自 " MACSTR " 的消息: %.*s",
-                 MAC2STR(sender_mac), msg_len, message);
+                 MAC2STR(sender_mac), (int)msg_len, message);
 
         // 控制台显示
         printf("\n[收到消息] 来自 " MACSTR ": %.*s\n> ",
-               MAC2STR(sender_mac), msg_len, message);
+               MAC2STR(sender_mac), (int)msg_len, message);
         fflush(stdout);
 
         // ===== 发送回执（确认消息）=====
@@ -324,8 +400,10 @@ static void recv_cb(mesh_addr_t *from, mesh_data_t *data)
 
 // 构造回执消息: [CMD_MSG_ACK] [本机MAC] [收到的消息前20字节]
 #define MAX_ECHO_LEN 20
-        int echo_len = (msg_len < MAX_ECHO_LEN) ? msg_len : MAX_ECHO_LEN;
-        uint8_t ack_buffer[1 + 6 + echo_len + 1];
+        size_t echo_len = (msg_len < MAX_ECHO_LEN) ? msg_len : MAX_ECHO_LEN;
+
+        /* 使用固定长度缓冲，避免由报文长度决定的变长数组。 */
+        uint8_t ack_buffer[1 + 6 + MAX_ECHO_LEN + 1];
 
         ack_buffer[0] = CMD_MSG_ACK;               // 命令：消息确认
         memcpy(ack_buffer + 1, my_mac, 6);         // 本机MAC
@@ -333,6 +411,7 @@ static void recv_cb(mesh_addr_t *from, mesh_data_t *data)
         ack_buffer[7 + echo_len] = '\0';           // 字符串结束符
 
         ack_data.size = 1 + 6 + echo_len;
+        ack_data.size = (ack_data.size < sizeof(ack_buffer)) ? ack_data.size : sizeof(ack_buffer);
         ack_data.proto = MESH_PROTO_BIN;
         ack_data.tos = MESH_TOS_P2P;
         ack_data.data = ack_buffer;
@@ -354,17 +433,23 @@ static void recv_cb(mesh_addr_t *from, mesh_data_t *data)
     }
     case CMD_MSG_ACK:
     {
+        if (data->size < 8)
+        {
+            ESP_LOGE(MESH_TAG, "Error in receiving raw mesh data: message ack frame too short");
+            return;
+        }
+
         // 处理收到的回执消息
         uint8_t *ack_sender = data->data + 1;      // 发送回执的节点MAC
         char *echo_msg = (char *)(data->data + 7); // 回显的消息内容
-        int echo_len = data->size - 7;
+        size_t echo_len = data->size - 7;
 
         ESP_LOGI(MESH_TAG, "收到来自 " MACSTR " 的回执: %.*s",
-                 MAC2STR(ack_sender), echo_len, echo_msg);
+                 MAC2STR(ack_sender), (int)echo_len, echo_msg);
 
         // 控制台显示
         printf("\n[回执] 节点 " MACSTR " 已收到消息: %.*s\n> ",
-               MAC2STR(ack_sender), echo_len, echo_msg);
+               MAC2STR(ack_sender), (int)echo_len, echo_msg);
         break;
     }
     default:
@@ -376,16 +461,26 @@ static void recv_cb(mesh_addr_t *from, mesh_data_t *data)
 void esp_mesh__task(void *arg)
 {
     is_running = true;
-    char *print;
     mesh_data_t data;
     esp_err_t err;
 
     while (is_running)
     {
-        asprintf(&print, "layer:%d IP:" IPSTR, esp_mesh_get_layer(), IP2STR(&s_current_ip));
-        ESP_LOGI(MESH_TAG, "Tried to publish %s", print);
-
-        free(print);
+        /*
+         * asprintf 失败时不会给 print 赋值，必须初始化并在使用前判断返回值，
+         * 否则会打印/释放未初始化的野指针。
+         */
+        char *print = NULL;
+        if (asprintf(&print, "layer:%d IP:" IPSTR, esp_mesh_get_layer(), IP2STR(&s_current_ip)) < 0 ||
+            print == NULL)
+        {
+            ESP_LOGW(MESH_TAG, "Failed to build mesh status string");
+        }
+        else
+        {
+            ESP_LOGI(MESH_TAG, "Tried to publish %s", print);
+            free(print);
+        }
         if (esp_mesh_is_root())
         { // 只有是根节点，就发送路由表
             // 获取当前路由表
@@ -977,9 +1072,13 @@ static void mesh_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             ESP_LOGI(MESH_TAG, "<MESH_EVENT_PARENT_DISCONNECTED> reason:%d", disconnected->reason);
 
             // ===== 防抖：3秒内不重复处理 =====
-            static int s_last_disconnect_time = 0;
-            int now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-            if (now - s_last_disconnect_time < 3000)
+            /*
+             * 用 tick 域做差值比较：xTaskGetTickCount() * portTICK_PERIOD_MS
+             * 在 int 上约 24.8 天溢出为负，会让防抖判断失效。
+             */
+            static TickType_t s_last_disconnect_time = 0;
+            TickType_t now = xTaskGetTickCount();
+            if ((TickType_t)(now - s_last_disconnect_time) < pdMS_TO_TICKS(3000))
             {
                 ESP_LOGW(MESH_TAG, "Ignore duplicate PARENT_DISCONNECTED within 3s");
                 break;

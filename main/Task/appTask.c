@@ -57,6 +57,34 @@
 #define NVS_KEY_DEVICE_NUMBER "device_number"
 #define NVS_KEY_SAFE_CODE "safe_code"
 
+// BLE 加密帧最小长度：app_enc_process_Decrypt() 用 in_data_len - 6 参与无符号运算，
+// 入参必须大于头部长度 6，否则会出现无符号下溢。
+#define BLE_ENC_MIN_FRAME_LEN 6
+
+// 补发 ID 列表缓冲区大小（Aging_Test_Task 内使用）
+#define AGING_LOST_DATA_LIST_SIZE 1024
+
+// 历史数据补发循环最大轮数（每轮 100ms），防止异常记录导致老化任务永久挂起
+#define AGING_RETRANSMIT_MAX_ROUNDS 2000
+
+// 群控模式下等待上位机下发下一步指令的超时时间（秒）
+#define AGING_NEXT_STEP_WAIT_TIMEOUT_S 600
+#define AGING_NEXT_STEP_WAIT_MAX_ROUNDS AGING_NEXT_STEP_WAIT_TIMEOUT_S
+
+// 停止老化时等待数据采集任务自行退出的超时（毫秒）
+#define AGING_STOP_WAIT_MS 12000
+// 重复 start_aging 时等待上一轮老化任务退出的超时（毫秒）
+#define AGING_RESTART_WAIT_MS 15000
+
+// 工步判据等待的最大轮数（每轮约 2 秒），防止设备掉线后无限等待
+#define AGING_CONDITION_WAIT_MAX_ROUNDS 1800
+
+// BLE 扫描完成等待的最大秒数
+#define AGING_BLE_SCAN_WAIT_MAX_ROUNDS 30
+
+// 静置工步允许的最大时长（分钟）
+#define AGING_STANDING_MINUTES_MAX 100000.0
+
 // 型号直接代码写死,现在待定
 const char DEVICE_TYPE[12] = "Point";
 
@@ -157,7 +185,31 @@ static TaskHandle_t s_button_task_handle = NULL;
 
 static QueueHandle_t Upload_data_queue = NULL; // 上传数据队列
 
+/* 补发 ID 列表缓冲区，由 Aging_Test_Task 独占，任务退出时释放。 */
+static char *s_lost_data_list = NULL;
+
 AgingResumeState agingResumeState = {0}; // 定义全局老化恢复状态变量
+
+/* 老化停止请求标志：由控制方（MQTT/HTTP/重入的start）置位，由老化与采集任务消费。 */
+static volatile bool s_aging_stop_requested = false;
+
+/* 老化生命周期互斥量：串行化“停止请求 / 等待退出 / 释放共享资源”三段动作。 */
+static SemaphoreHandle_t s_aging_lifecycle_mutex = NULL;
+
+/*
+ * 清空老化恢复状态。
+ * AgingJson 由 read_json_from_spiffs() 分配，直接 memset 会让该堆块失去引用而泄漏。
+ */
+static void aging_resume_state_clear(void)
+{
+    if (agingResumeState.AgingJson != NULL)
+    {
+        free(agingResumeState.AgingJson);
+        agingResumeState.AgingJson = NULL;
+    }
+
+    memset(&agingResumeState, 0, sizeof(agingResumeState));
+}
 
 uint8_t BTDisConnect = 0; // 蓝牙断开标志位，为1是主动去断开蓝牙触发的，为0是被动断开蓝牙触发的
 
@@ -170,6 +222,20 @@ static void Device_Init(Externaldevice **device1, int devicecount);
 static void AgingDevice_RuntimeFree(void);
 static bool ExDevice_Check(void);
 const char *AgingDataName(const char *id);
+
+/*
+ * 老化生命周期控制（R9 修复）
+ * ------------------------------------------------------------------
+ * 原则：共享资源（Aging_device / agingcfg / agingResumeState / Aging.json）
+ * 只能在“确认没有任何消费者任务在运行”之后释放；任何任务都不得再被
+ * 其它任务用 vTaskDelete 强制删除，改为“置停止请求 → 任务自行退出 →
+ * 退出前释放资源并把自己的句柄清零”。
+ */
+static void aging_release_shared_resources(void);
+static bool aging_wait_for_data_task_exit(TickType_t timeout_ticks);
+static bool aging_wait_for_aging_task_exit(TickType_t timeout_ticks);
+static bool aging_stop_or_release(const char *reason);
+static bool aging_request_stop_and_wait(const char *reason, TickType_t timeout_ticks);
 
 /*
  * 所有本项目业务任务统一固定到 CPU1。
@@ -1157,15 +1223,20 @@ static esp_err_t readconfig()
         if (read_devices == NULL)
         {
             ESP_LOGE(TAG, "read_devices malloc failed");
+            return ESP_ERR_NO_MEM;
         }
 
         memset(read_devices, 0, sizeof(Externaldevice) * MAX_EXTERNAL_DEVICE_COUNT);
     }
 
-    char file_names[MAX_EXTERNAL_DEVICE_COUNT][64];
+    /*
+     * 文件列表缓冲区必须与 spiffs_get_file_names() 的步长（SPIFFS_FILE_NAME_MAX_LEN）
+     * 和 max_files 一致，否则 /spiffs 下文件数超过 MAX_EXTERNAL_DEVICE_COUNT 时会越界。
+     */
+    char file_names[SPIFFS_MAX_FILE_LIST_COUNT][SPIFFS_FILE_NAME_MAX_LEN];
     size_t file_count = 0;
 
-    esp_err_t ret = spiffs_get_file_names(file_names, 10, &file_count);
+    esp_err_t ret = spiffs_get_file_names(file_names, SPIFFS_MAX_FILE_LIST_COUNT, &file_count);
 
     if (ret == ESP_OK)
     {
@@ -1177,6 +1248,12 @@ static esp_err_t readconfig()
             }
             else if (strstr(file_names[i], "device") != NULL) // 外接设备加载
             {
+                if (read_devices == NULL || read_device_count >= MAX_EXTERNAL_DEVICE_COUNT)
+                {
+                    ESP_LOGW(TAG, "External device slots full, skip device json: %s", file_names[i]);
+                    continue;
+                }
+
                 Externaldevice *dev = &read_devices[read_device_count];
 
                 ret = parse_device_json_to_externaldevice(file_names[i], dev);
@@ -1654,6 +1731,7 @@ static bool Onely_Set_DeviceId(char *device_id)
 
     process_packet_AllConfig(updated_json, strlen(updated_json));
 
+    cJSON_free(updated_json);
     cJSON_free(json_str);
     return true;
 }
@@ -1732,8 +1810,12 @@ static void app_uart_data_handle(void *arg)
             DeviceNumber = Modbus_ExtractU64((uint8_t *)uart_buf);
             SelfRecovery_Write_uint64(NVS_KEY_DEVICE_NUMBER, DeviceNumber);
             char newDeId[32];
-            snprintf(newDeId, sizeof(newDeId), "%lld", DeviceNumber);
-            Onely_Set_DeviceId(newDeId); // 将标定的PN写入配置json中去
+            snprintf(newDeId, sizeof(newDeId), "%lld", (long long)DeviceNumber);
+            if (!Onely_Set_DeviceId(newDeId)) // 将标定的PN写入配置json中去
+            {
+                ESP_LOGE(TAG, "Failed to persist device id into config json");
+                local_error_log("Persist device id into config json failed");
+            }
 
             if (IsReset == 1)
             {
@@ -1793,8 +1875,7 @@ static void app_uart_data_handle(void *arg)
             continue;
         }
         char cmd_buf[32];
-        memcpy(cmd_buf, cmd->valuestring, sizeof(cmd_buf) - 1);
-        cmd_buf[sizeof(cmd_buf) - 1] = '\0';
+        snprintf(cmd_buf, sizeof(cmd_buf), "%s", cmd->valuestring);
         cJSON_Delete(pRoot);
 
         if (strncmp(cmd_buf, "ChangeConfig", 12) == 0)
@@ -2084,11 +2165,31 @@ static int app_ble_recv_data_Ack(void *BleRecBuf1, int max_len, uint32_t wait_ti
 
         if (IsEnc)
         {
+            /*
+             * app_enc_process_Decrypt() 内部用 in_data_len - 6 参与无符号运算，
+             * in_data_len <= 6 会下溢；调用方必须保证帧长合法并检查返回值。
+             */
+            if (len <= BLE_ENC_MIN_FRAME_LEN)
+            {
+                ESP_LOGE(TAG, "BLE encrypted frame too short (len: %d)", len);
+                return -1;
+            }
+
             uint8_t data[1024] = {0};
             uint16_t outLen = 0;
-            app_enc_process_Decrypt(BleRecBuf, len, data, &outLen);
+            if (app_enc_process_Decrypt(BleRecBuf, (size_t)len, data, &outLen) != ESP_OK)
+            {
+                ESP_LOGE(TAG, "BLE decrypt failed (len: %d)", len);
+                return -1;
+            }
+            if ((outLen == 0U) || ((int)outLen > max_len) || ((size_t)outLen > sizeof(data)))
+            {
+                ESP_LOGE(TAG, "BLE decrypt length invalid (outLen: %u, max_len: %d)",
+                         (unsigned)outLen, max_len);
+                return -1;
+            }
             memcpy(BleRecBuf, data, outLen);
-            len = outLen;
+            len = (int)outLen;
             // 打印解密之后的数据
             ESP_LOGI(TAG, "Decrypted BLE data: ");
             for (int i = 0; i < len; i++)
@@ -2200,11 +2301,31 @@ void app_ble_data_handle(void *arg)
             // 会话解密
             if (IsEnc)
             {
-                uint8_t data[1024] = {0};
-                uint16_t outLen = 0;
-                app_enc_process_Decrypt(BleRecBuf, len, data, &outLen);
-                memcpy(BleRecBuf, data, outLen);
-                len = outLen;
+                if (len <= BLE_ENC_MIN_FRAME_LEN)
+                {
+                    ESP_LOGE(TAG, "BLE encrypted frame too short (len: %d)", len);
+                    needSendToUart = false;
+                }
+                else
+                {
+                    uint8_t data[1024] = {0};
+                    uint16_t outLen = 0;
+                    if (app_enc_process_Decrypt(BleRecBuf, (size_t)len, data, &outLen) != ESP_OK)
+                    {
+                        ESP_LOGE(TAG, "BLE decrypt failed (len: %d)", len);
+                        needSendToUart = false;
+                    }
+                    else if ((outLen == 0U) || ((size_t)outLen > sizeof(BleRecBuf)))
+                    {
+                        ESP_LOGE(TAG, "BLE decrypt length invalid (outLen: %u)", (unsigned)outLen);
+                        needSendToUart = false;
+                    }
+                    else
+                    {
+                        memcpy(BleRecBuf, data, outLen);
+                        len = (int)outLen;
+                    }
+                }
             }
 
             if (needSendToUart)
@@ -2875,7 +2996,7 @@ static bool start_aging_with_ready_pn(const char *aging_json, int start_seq)
     }
 
     /* 新任务不能继承上一次运行时的恢复游标。 */
-    memset(&agingResumeState, 0, sizeof(agingResumeState));
+    aging_resume_state_clear();
 
     AgingLogActive = true;
     aging_runtime_log("Start aging command accepted; initializing aging task, cmd_seq=%d", start_seq);
@@ -2889,8 +3010,11 @@ static bool start_aging_with_ready_pn(const char *aging_json, int start_seq)
         s_aging_cmd_state = AGING_CMD_IDLE;
         s_pending_start_seq = 0;
         memset(PN_Code, 0, sizeof(PN_Code));
-        SelfRecovery_Write_str(NVS_KEY_CURRENT_PN, "");
-        SelfRecovery_Write_uint16(NVS_KEY_AGING_VALID, 0);
+        if (SelfRecovery_Write_str(NVS_KEY_CURRENT_PN, "") != ESP_OK ||
+            SelfRecovery_Write_uint16(NVS_KEY_AGING_VALID, 0) != ESP_OK)
+        {
+            local_error_log("Clear aging recovery state failed at aging start failure");
+        }
         persist_pending_start_state(false, 0);
 
         device_response_publish_point(start_seq, 0, "Aging start failed during initialization");
@@ -3068,36 +3192,15 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                 aging_runtime_log("Stop aging command received, command_state=%s",
                                   aging_cmd_state_name(s_aging_cmd_state));
 
-                if (Aging_test_task_handle != NULL)
-                {
-                    vTaskDelete(Aging_test_task_handle);
-                    Aging_test_task_handle = NULL;
-                }
-                if (AgingData_task_handle != NULL)
-                {
-                    vTaskDelete(AgingData_task_handle);
-                    AgingData_task_handle = NULL;
-                }
-                if (ble_is_connected())
-                {
-                    BTDisConnect = 1;
-                    ble_disconnect();
-                }
+                /*
+                 * 不再跨任务 vTaskDelete：
+                 * 有老化任务在跑时只置停止请求，由任务自行退出并释放共享资源；
+                 * 没有任务在跑时（例如WAIT_PN阶段被取消）才在这里同步释放残留资源。
+                 */
+                aging_stop_or_release("mqtt stop_aging");
 
-                SelfRecovery_Erase_aging_valid();
-                AgingDevice_RuntimeFree();
                 agingState = AgingIdle;
                 agingDataAMode = IdleState;
-                memset(&agingResumeState, 0, sizeof(agingResumeState));
-
-                if (agingcfg.device_count != 0 || agingcfg.step_count != 0)
-                {
-                    aging_config_free(&agingcfg);
-                    memset(&agingcfg, 0, sizeof(agingcfg));
-                }
-
-                /* WAIT_PN时agingcfg尚未解析，因此Aging.json必须无条件删除。 */
-                spiffs_file_delete("Aging.json");
 
                 aging_state_publish("agingStop");
                 aging_runtime_log("Aging stopped and resources released");
@@ -3239,6 +3342,11 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                     {
                         printf("ids[%d] = %d\n", i, ids[i]);
                         query_db1_to_global(ids[i]);
+                        if (g_db1_result == NULL)
+                        {
+                            ESP_LOGE(TAG, "Query result buffer unavailable, skip id=%d", ids[i]);
+                            continue;
+                        }
                         if (g_db1_result->json_data[0] != '\0')
                         {
                             if (app_mqtt_publish("device/%s/data/aging", g_db1_result->json_data, DEVICE_ID) > 0)
@@ -3552,8 +3660,11 @@ void Init_ByNetwork_Flag(void *arg)
                             AgingLogActive = false;
                             s_aging_cmd_state = AGING_CMD_IDLE;
                             memset(PN_Code, 0, sizeof(PN_Code));
-                            SelfRecovery_Write_uint16(NVS_KEY_AGING_VALID, 0);
-                            SelfRecovery_Write_str(NVS_KEY_CURRENT_PN, "");
+                            if (SelfRecovery_Write_uint16(NVS_KEY_AGING_VALID, 0) != ESP_OK ||
+                                SelfRecovery_Write_str(NVS_KEY_CURRENT_PN, "") != ESP_OK)
+                            {
+                                local_error_log("Clear aging recovery state failed after invalid resume");
+                            }
                         }
                     }
                     else
@@ -3561,8 +3672,11 @@ void Init_ByNetwork_Flag(void *arg)
                         ESP_LOGE(TAG, "Aging recovery data invalid: Aging.json or current PN missing");
                         s_aging_cmd_state = AGING_CMD_IDLE;
                         memset(PN_Code, 0, sizeof(PN_Code));
-                        SelfRecovery_Write_uint16(NVS_KEY_AGING_VALID, 0);
-                        SelfRecovery_Write_str(NVS_KEY_CURRENT_PN, "");
+                        if (SelfRecovery_Write_uint16(NVS_KEY_AGING_VALID, 0) != ESP_OK ||
+                            SelfRecovery_Write_str(NVS_KEY_CURRENT_PN, "") != ESP_OK)
+                        {
+                            local_error_log("Clear aging recovery state failed: invalid recovery data");
+                        }
                     }
                 }
                 else
@@ -3826,15 +3940,17 @@ static bool Data_Set_Method(Externaldevice *device, const char *idorname, const 
                 return false;
             }
 
-            /* 写命令一般不强依赖返回值，但为了兼容设备仍然读取一次。 */
+            /* 写命令一般不强依赖返回值，但为了兼容设备仍然读取一次。
+             * 预留 1 字节用于补 '\0'，避免按 C 字符串打印时越界读。 */
             int len = device->CurrentRecvFunc(RecBuf,
-                                              sizeof(RecBuf),
+                                              sizeof(RecBuf) - 1,
                                               pdMS_TO_TICKS(1000));
 
             SetFlag = true;
 
             if (len > 0)
             {
+                RecBuf[len] = '\0';
                 ESP_LOGI(TAG, "SCPI write ack: %s", RecBuf);
             }
         }
@@ -3900,12 +4016,15 @@ static bool Data_Set_Method(Externaldevice *device, const char *idorname, const 
                 return false;
             }
 
+            /* 预留 1 字节补 '\0'，避免后续按字符串处理时越界读。 */
             int len = device->CurrentRecvFunc(RecBuf,
-                                              sizeof(RecBuf),
+                                              sizeof(RecBuf) - 1,
                                               pdMS_TO_TICKS(1000));
 
             if (len > 0)
             {
+                RecBuf[len] = '\0';
+
                 /*
                  * 简单校验：回包长度 >= 8 通常表示正常
                  */
@@ -4021,9 +4140,12 @@ static bool Data_Get_Method(Externaldevice *device, const char *idorname, uint8_
                 *value = -1;
                 return false;
             }
-            int len = device->CurrentRecvFunc(RecBuf, 1024, pdMS_TO_TICKS(1000));
+            /* 预留 1 字节补 '\0'，scpi_dynamic_parse_response() 按 C 字符串解析。 */
+            int len = device->CurrentRecvFunc(RecBuf, sizeof(RecBuf) - 1, pdMS_TO_TICKS(1000));
             if (len > 0)
             {
+                RecBuf[len] = '\0';
+
                 size_t count = 0;
                 double parsed_value = 0;
                 if (scpi_dynamic_parse_response(cmd, (char *)RecBuf, &parsed_value, 1, &count) == ESP_OK && count > 0)
@@ -4070,9 +4192,12 @@ static bool Data_Get_Method(Externaldevice *device, const char *idorname, uint8_
                 *value = -1;
                 return false;
             }
-            int len = device->CurrentRecvFunc(RecBuf, 1024, pdMS_TO_TICKS(1000));
+            /* 预留 1 字节补 '\0'，避免后续按字符串处理时越界读。 */
+            int len = device->CurrentRecvFunc(RecBuf, sizeof(RecBuf) - 1, pdMS_TO_TICKS(1000));
             if (len > 0)
             {
+                RecBuf[len] = '\0';
+
                 int32_t raw_value = 0;
                 if (Modbus_Parse03RawValue(RecBuf, len, item->reg_len, item->is_unsigned, &raw_value))
                 {
@@ -4211,28 +4336,14 @@ static bool aging_command_json_parse(const char *packet_copy)
     agingState = AgingIdle;
     agingDataAMode = IdleState;
 
-    if (Aging_test_task_handle != NULL)
+    /*
+     * 重入保护：上一轮老化仍在运行时，先请求停止并等待它自行退出（含共享资源释放），
+     * 再解析新配置。等待超时必须放弃本次启动，否则会出现“旧任务还在释放、新配置已生效”的竞态。
+     */
+    if (!aging_request_stop_and_wait("restart aging", pdMS_TO_TICKS(AGING_RESTART_WAIT_MS)))
     {
-        vTaskDelete(Aging_test_task_handle);
-        Aging_test_task_handle = NULL;
-    }
-    if (AgingData_task_handle != NULL)
-    {
-        vTaskDelete(AgingData_task_handle);
-        AgingData_task_handle = NULL;
-    }
-    if (ble_is_connected())
-    {
-        BTDisConnect = 1;
-        ble_disconnect();
-    }
-
-    AgingDevice_RuntimeFree();
-
-    if (agingcfg.device_count != 0 || agingcfg.step_count != 0)
-    {
-        aging_config_free(&agingcfg);
-        memset(&agingcfg, 0, sizeof(agingcfg));
+        aging_error_log("Previous aging task did not exit in time; start command rejected");
+        return false;
     }
 
     AgingErr err = aging_config_parse(packet_copy, &agingcfg);
@@ -4243,15 +4354,22 @@ static bool aging_command_json_parse(const char *packet_copy)
         goto start_failed;
     }
 
-    int64_t protoid = 0;
-    get_json_int64(packet_copy, "ProtoID", &protoid);
-
-    agingcfg.devices[0].ProtoID = protoid;
-
+    /* 先校验设备数组有效性，再访问 devices[0]，否则无设备节点时会先解引用空指针。 */
     if (agingcfg.device_count <= 0 || agingcfg.devices == NULL)
     {
         aging_error_log("Aging configuration has no device");
         goto start_failed;
+    }
+
+    int64_t protoid = 0;
+    if (get_json_int64(packet_copy, "ProtoID", &protoid) == 0)
+    {
+        agingcfg.devices[0].ProtoID = protoid;
+    }
+    else
+    {
+        ESP_LOGW(TAG, "ProtoID not found in aging packet, keep parsed value %lld",
+                 (long long)agingcfg.devices[0].ProtoID);
     }
 
     if (agingcfg.step_count <= 0 || agingcfg.steps == NULL)
@@ -4358,14 +4476,10 @@ start_failed:
     IsAgingDevice = 0;
     agingState = AgingIdle;
     agingDataAMode = IdleState;
-    AgingDevice_RuntimeFree();
 
-    if (agingcfg.device_count != 0 || agingcfg.step_count != 0)
-    {
-        aging_config_free(&agingcfg);
-        memset(&agingcfg, 0, sizeof(agingcfg));
-    }
-    spiffs_file_delete("Aging.json");
+    /* 与中止/完成路径保持同一套释放逻辑，避免两份实现漂移。 */
+    aging_release_shared_resources();
+    s_aging_stop_requested = false;
 
     return false;
 }
@@ -4485,16 +4599,34 @@ static bool ExDevice_Check(void)
 
 // static double aging_get_condition_value(const AgingStep *step, const char *expect_name, double default_value)
 
-static void Aging_Task_Abort_Cleanup(void)
-{
-    agingState = AgingIdle;
-    agingDataAMode = IdleState;
+/* -------------------------------------------------------------------------- */
+/* 老化生命周期：停止请求 / 等待退出 / 释放共享资源                              */
+/* -------------------------------------------------------------------------- */
 
-    if (AgingData_task_handle != NULL)
+static void aging_lifecycle_lock(void)
+{
+    if (s_aging_lifecycle_mutex != NULL)
     {
-        vTaskDelete(AgingData_task_handle);
-        AgingData_task_handle = NULL;
+        xSemaphoreTake(s_aging_lifecycle_mutex, portMAX_DELAY);
     }
+}
+
+static void aging_lifecycle_unlock(void)
+{
+    if (s_aging_lifecycle_mutex != NULL)
+    {
+        xSemaphoreGive(s_aging_lifecycle_mutex);
+    }
+}
+
+/*
+ * 释放老化共享资源。
+ * 调用前必须保证没有任何消费者任务在运行（老化任务、数据采集任务都已退出）。
+ * 内部自带生命周期互斥保护，可被任务侧与控制侧共用。
+ */
+static void aging_release_shared_resources(void)
+{
+    aging_lifecycle_lock();
 
     if (ble_is_connected())
     {
@@ -4503,7 +4635,7 @@ static void Aging_Task_Abort_Cleanup(void)
     }
 
     SelfRecovery_Erase_aging_valid();
-    memset(&agingResumeState, 0, sizeof(agingResumeState));
+    aging_resume_state_clear();
 
     AgingDevice_RuntimeFree();
     if (agingcfg.device_count != 0 || agingcfg.step_count != 0)
@@ -4522,9 +4654,150 @@ static void Aging_Task_Abort_Cleanup(void)
                                                &BleData_task_handle);
         if (task_ret != pdPASS)
         {
-            aging_error_log("Restore BLE data task failed during aging abort cleanup");
+            aging_error_log("Restore BLE data task failed during aging cleanup");
         }
     }
+
+    aging_lifecycle_unlock();
+}
+
+/*
+ * 等待数据采集任务自行退出。
+ * 句柄只由采集任务自己在退出前清零，因此为 NULL 即代表它不再访问共享资源。
+ */
+static bool aging_wait_for_data_task_exit(TickType_t timeout_ticks)
+{
+    TickType_t waited = 0;
+    const TickType_t step = pdMS_TO_TICKS(100);
+
+    while (AgingData_task_handle != NULL && waited < timeout_ticks)
+    {
+        vTaskDelay(step);
+        waited += step;
+    }
+
+    if (AgingData_task_handle != NULL)
+    {
+        ESP_LOGE(TAG, "Aging data task did not exit within %u ms",
+                 (unsigned)(timeout_ticks * portTICK_PERIOD_MS));
+        aging_error_log("Aging data task exit timeout; releasing shared resources anyway");
+        return false;
+    }
+
+    return true;
+}
+
+/* 等待老化控制任务自行退出（用于重复 start_aging 的重入保护）。 */
+static bool aging_wait_for_aging_task_exit(TickType_t timeout_ticks)
+{
+    TickType_t waited = 0;
+    const TickType_t step = pdMS_TO_TICKS(100);
+
+    while (Aging_test_task_handle != NULL && waited < timeout_ticks)
+    {
+        vTaskDelay(step);
+        waited += step;
+    }
+
+    return Aging_test_task_handle == NULL;
+}
+
+/*
+ * 停止老化：有任务在跑则请求停止，没有任务在跑则同步释放共享资源。
+ * 返回 true 表示资源已同步释放（调用方可立即重配置）；false 表示已发出停止请求。
+ */
+static bool aging_stop_or_release(const char *reason)
+{
+    aging_lifecycle_lock();
+
+    if (Aging_test_task_handle == NULL)
+    {
+        /* 没有老化任务在跑，可能存在残留资源（例如WAIT_PN阶段被取消），同步释放。 */
+        bool has_residue = (Aging_device != NULL) ||
+                           (agingcfg.device_count != 0 || agingcfg.step_count != 0);
+        aging_lifecycle_unlock();
+
+        if (has_residue)
+        {
+            aging_release_shared_resources();
+            aging_runtime_log("Aging residue released synchronously: %s",
+                              reason != NULL ? reason : "unknown");
+        }
+
+        s_aging_stop_requested = false;
+        return true;
+    }
+
+    s_aging_stop_requested = true;
+    aging_lifecycle_unlock();
+
+    ESP_LOGW(TAG, "Aging stop requested: %s", reason != NULL ? reason : "unknown");
+    return false;
+}
+
+/*
+ * 请求停止并等待老化任务真正退出（重复 start_aging 时使用）。
+ * 返回 true 表示已退出并释放完毕，false 表示超时（调用方必须放弃本次启动）。
+ */
+static bool aging_request_stop_and_wait(const char *reason, TickType_t timeout_ticks)
+{
+    aging_lifecycle_lock();
+
+    if (Aging_test_task_handle == NULL)
+    {
+        bool has_residue = (Aging_device != NULL) ||
+                           (agingcfg.device_count != 0 || agingcfg.step_count != 0);
+        aging_lifecycle_unlock();
+
+        if (has_residue)
+        {
+            aging_release_shared_resources();
+        }
+
+        s_aging_stop_requested = false;
+        return true;
+    }
+
+    s_aging_stop_requested = true;
+    aging_lifecycle_unlock();
+
+    ESP_LOGW(TAG, "Aging stop requested: %s", reason != NULL ? reason : "unknown");
+
+    if (!aging_wait_for_aging_task_exit(timeout_ticks))
+    {
+        ESP_LOGE(TAG, "Previous aging task did not exit within %u ms",
+                 (unsigned)(timeout_ticks * portTICK_PERIOD_MS));
+        return false;
+    }
+
+    /* 任务已自行释放共享资源，这里只兜底清理可能的残留。 */
+    aging_lifecycle_lock();
+    bool has_residue = (Aging_device != NULL) ||
+                       (agingcfg.device_count != 0 || agingcfg.step_count != 0);
+    s_aging_stop_requested = false;
+    aging_lifecycle_unlock();
+
+    if (has_residue)
+    {
+        aging_release_shared_resources();
+    }
+
+    return true;
+}
+
+static void Aging_Task_Abort_Cleanup(void)
+{
+    agingState = AgingIdle;
+    agingDataAMode = IdleState;
+
+    /*
+     * 不再跨任务 vTaskDelete：置停止请求，等采集任务处理完本轮后自行退出，
+     * 这样它不会在访问 Aging_device / agingcfg 的过程中被“抽掉地板”。
+     */
+    s_aging_stop_requested = true;
+    aging_wait_for_data_task_exit(pdMS_TO_TICKS(AGING_STOP_WAIT_MS));
+
+    aging_release_shared_resources();
 
     /* 异常终止后彻底回到IDLE，下一台必须重新set_pn。 */
     clear_aging_command_runtime();
@@ -4538,7 +4811,15 @@ static void Aging_Task_Abort_And_Delete(void)
     s_last_data_read_error_report_tick = 0;
     s_consecutive_data_upload_failures = 0;
     s_last_data_upload_error_report_tick = 0;
+
+    /* 句柄只由任务自己清零，供“等待退出”的一方判定。 */
     Aging_test_task_handle = NULL;
+    s_aging_stop_requested = false;
+
+    /* 释放本任务独占的补发 ID 列表缓冲区，避免任务退出后泄漏。 */
+    free(s_lost_data_list);
+    s_lost_data_list = NULL;
+
     vTaskDelete(NULL); // 删除当前任务
 }
 
@@ -4546,10 +4827,31 @@ void Aging_Test_Task(void *arg)
 {
     uint8_t FailCount = 0;
     bool aging_action_logged = false;
-    char *Lost_Data_List = (char *)app_malloc_prefer_psram(1024);
+
+    if (s_lost_data_list == NULL)
+    {
+        s_lost_data_list = (char *)app_malloc_prefer_psram(AGING_LOST_DATA_LIST_SIZE);
+    }
+
+    char *Lost_Data_List = s_lost_data_list;
+    if (Lost_Data_List == NULL)
+    {
+        ESP_LOGE(TAG, "Lost_Data_List malloc failed");
+        aging_error_log("Aging task aborted: lost data list buffer allocation failed");
+        Aging_Task_Abort_And_Delete();
+        return;
+    }
+
+    bool aging_finished = false;
 
     while (1)
     {
+        /* 收到停止请求：不再做任何工步，直接进入统一退出流程。 */
+        if (s_aging_stop_requested)
+        {
+            break;
+        }
+
         switch (agingState)
         {
         case AgingIdle:
@@ -4622,10 +4924,22 @@ void Aging_Test_Task(void *arg)
                     aging_runtime_log("Connecting Bluetooth aging device, attempt=%u", (unsigned)FailCount);
                     ble_start_scan(10);
 
-                    while (!ScanComplete)
+                    /* 扫描完成等待必须带超时，并且要能被停止请求打断。 */
+                    int scan_wait_rounds = 0;
+                    while (!ScanComplete && !s_aging_stop_requested &&
+                           scan_wait_rounds < AGING_BLE_SCAN_WAIT_MAX_ROUNDS)
                     {
                         vTaskDelay(pdMS_TO_TICKS(1000));
+                        scan_wait_rounds++;
                     }
+
+                    if (!ScanComplete)
+                    {
+                        aging_error_log("BLE scan did not complete within %d seconds",
+                                        (int)AGING_BLE_SCAN_WAIT_MAX_ROUNDS);
+                        break;
+                    }
+
                     ScanComplete = false;
 
                     if (ble_connect_by_name(PN_Code))
@@ -4669,6 +4983,16 @@ void Aging_Test_Task(void *arg)
                         break;
                     }
                 }
+
+                /* 没有任何工步配置采样数据时 itest == step_count，此处必须兜底，否则越界访问。 */
+                if (itest >= Aging_device[0].step_count ||
+                    Aging_device[0].steps[itest].sample_data == NULL ||
+                    Aging_device[0].steps[itest].sample_data_count == 0)
+                {
+                    aging_error_log("Bluetooth aging device has no sample data item for communication check");
+                    break;
+                }
+
                 double data = 0;
                 const char *parameter = Aging_device[0].steps[itest].sample_data[0].Value;
                 if (Data_Get_Method(&Aging_device[0], parameter, 1, &data, 0))
@@ -4810,7 +5134,13 @@ void Aging_Test_Task(void *arg)
 
                     CurrentAgingStep = i;
 
-                    Aging_Execute_ActionList(current_step->pre_actions, current_step->pre_action_count, 1, &Aging_device[0], method, "pre_action", 0);
+                    if (!Aging_Execute_ActionList(current_step->pre_actions, current_step->pre_action_count, 1, &Aging_device[0], method, "pre_action", 0))
+                    {
+                        aging_error_log("Pre-action execution failed, step=%u/%u, method=%s",
+                                        (unsigned)(i + 1),
+                                        (unsigned)agingcfg.step_count,
+                                        method);
+                    }
 
                     for (int j = 0; j < read_device_count; j++)
                     {
@@ -4819,12 +5149,18 @@ void Aging_Test_Task(void *arg)
                             if (read_devices[j].steps[k].method != NULL &&
                                 strcmp(read_devices[j].steps[k].method, method) == 0)
                             {
-                                Aging_Execute_ActionList(read_devices[j].steps[k].pre_actions,
-                                                         read_devices[j].steps[k].pre_action_count,
-                                                         1,
-                                                         &read_devices[j],
-                                                         read_devices[j].steps[k].method,
-                                                         "pre_action", 1);
+                                if (!Aging_Execute_ActionList(read_devices[j].steps[k].pre_actions,
+                                                              read_devices[j].steps[k].pre_action_count,
+                                                              1,
+                                                              &read_devices[j],
+                                                              read_devices[j].steps[k].method,
+                                                              "pre_action", 1))
+                                {
+                                    aging_error_log("External device pre-action failed, device=%u, step=%u, method=%s",
+                                                    (unsigned)j,
+                                                    (unsigned)k,
+                                                    read_devices[j].steps[k].method != NULL ? read_devices[j].steps[k].method : "unknown");
+                                }
                                 break;
                             }
                         }
@@ -4838,6 +5174,20 @@ void Aging_Test_Task(void *arg)
                         }
 
                         time_t now = time(NULL);
+
+                        /*
+                         * 静置时长必须为正且在合理范围内：
+                         * 负数或异常大值转 uint64_t 后会得到错误的 deadline，导致本工步永久等待。
+                         */
+                        if (!(target_value > 0.0) || target_value > AGING_STANDING_MINUTES_MAX)
+                        {
+                            aging_error_log("Invalid standing duration %.3f minutes, step=%u/%u",
+                                            target_value,
+                                            (unsigned)(i + 1),
+                                            (unsigned)agingcfg.step_count);
+                            break;
+                        }
+
                         uint64_t deadline = now + (uint64_t)(target_value * 60.0);
                         agingDataAMode = StandingState;
 
@@ -4856,7 +5206,7 @@ void Aging_Test_Task(void *arg)
                             }
                         }
 
-                        while (now < deadline)
+                        while (now < deadline && !s_aging_stop_requested)
                         {
                             vTaskDelay(pdMS_TO_TICKS(10000));
                             now = time(NULL);
@@ -4875,12 +5225,19 @@ void Aging_Test_Task(void *arg)
                         agingDataAMode = DischargeState;
 
                         uint8_t conditionflag = 1;
-                        while (conditionflag)
+                        uint16_t wait_rounds = 0;
+                        while (conditionflag && !s_aging_stop_requested)
                         {
                             for (int i = 0; i < current_step->judging_condition_count; i++)
                             {
                                 double value = -1.0;
                                 bool read_ok = Data_Get_Method(&Aging_device[0], current_step->judging_conditions[i].Name, 1, &value, 1);
+                                if (!read_ok)
+                                {
+                                    ESP_LOGW(TAG, "Discharge condition read failed, condition=%u", (unsigned)i);
+                                    continue;
+                                }
+
                                 if (value <= current_step->judging_conditions[i].value_num)
                                 {
                                     conditionflag = 0;
@@ -4889,6 +5246,16 @@ void Aging_Test_Task(void *arg)
                                 vTaskDelay(pdMS_TO_TICKS(1000));
                             }
                             vTaskDelay(pdMS_TO_TICKS(2000));
+
+                            /* 设备长期无法满足判据时不能永久占用老化任务。 */
+                            if (conditionflag && (++wait_rounds >= AGING_CONDITION_WAIT_MAX_ROUNDS))
+                            {
+                                aging_error_log("Discharge condition wait timeout after %u rounds, step=%u/%u",
+                                                (unsigned)wait_rounds,
+                                                (unsigned)(i + 1),
+                                                (unsigned)agingcfg.step_count);
+                                break;
+                            }
                         }
                     }
                     else if (strncmp(method, "Recharge", 8) == 0)
@@ -4899,12 +5266,19 @@ void Aging_Test_Task(void *arg)
                         }
                         agingDataAMode = RechargeState;
                         uint8_t conditionflag = 1;
-                        while (conditionflag)
+                        uint16_t wait_rounds = 0;
+                        while (conditionflag && !s_aging_stop_requested)
                         {
                             for (int i = 0; i < current_step->judging_condition_count; i++)
                             {
                                 double value = -1.0;
                                 bool read_ok = Data_Get_Method(&Aging_device[0], current_step->judging_conditions[i].Name, 1, &value, 1);
+                                if (!read_ok)
+                                {
+                                    ESP_LOGW(TAG, "Recharge condition read failed, condition=%u", (unsigned)i);
+                                    continue;
+                                }
+
                                 if (value >= current_step->judging_conditions[i].value_num)
                                 {
                                     conditionflag = 0;
@@ -4913,6 +5287,16 @@ void Aging_Test_Task(void *arg)
                                 vTaskDelay(pdMS_TO_TICKS(1000));
                             }
                             vTaskDelay(pdMS_TO_TICKS(2000));
+
+                            /* 设备长期无法满足判据时不能永久占用老化任务。 */
+                            if (conditionflag && (++wait_rounds >= AGING_CONDITION_WAIT_MAX_ROUNDS))
+                            {
+                                aging_error_log("Recharge condition wait timeout after %u rounds, step=%u/%u",
+                                                (unsigned)wait_rounds,
+                                                (unsigned)(i + 1),
+                                                (unsigned)agingcfg.step_count);
+                                break;
+                            }
                         }
                     }
                     else
@@ -4923,12 +5307,18 @@ void Aging_Test_Task(void *arg)
                                         method);
                     }
 
-                    Aging_Execute_ActionList(current_step->after_actions,
-                                             current_step->after_action_count,
-                                             1,
-                                             &Aging_device[0],
-                                             method,
-                                             "after_action", 0);
+                    if (!Aging_Execute_ActionList(current_step->after_actions,
+                                                  current_step->after_action_count,
+                                                  1,
+                                                  &Aging_device[0],
+                                                  method,
+                                                  "after_action", 0))
+                    {
+                        aging_error_log("After-action execution failed, step=%u/%u, method=%s",
+                                        (unsigned)(i + 1),
+                                        (unsigned)agingcfg.step_count,
+                                        method);
+                    }
 
                     for (int j = 0; j < read_device_count; j++)
                     {
@@ -4937,12 +5327,18 @@ void Aging_Test_Task(void *arg)
                             if (read_devices[j].steps[k].method != NULL &&
                                 strcmp(read_devices[j].steps[k].method, method) == 0)
                             {
-                                Aging_Execute_ActionList(read_devices[j].steps[k].after_actions,
-                                                         read_devices[j].steps[k].after_action_count,
-                                                         1,
-                                                         &read_devices[j],
-                                                         read_devices[j].steps[k].method,
-                                                         "after_action", 1);
+                                if (!Aging_Execute_ActionList(read_devices[j].steps[k].after_actions,
+                                                              read_devices[j].steps[k].after_action_count,
+                                                              1,
+                                                              &read_devices[j],
+                                                              read_devices[j].steps[k].method,
+                                                              "after_action", 1))
+                                {
+                                    aging_error_log("External device after-action failed, device=%u, step=%u, method=%s",
+                                                    (unsigned)j,
+                                                    (unsigned)k,
+                                                    read_devices[j].steps[k].method != NULL ? read_devices[j].steps[k].method : "unknown");
+                                }
                                 break;
                             }
                         }
@@ -4954,9 +5350,23 @@ void Aging_Test_Task(void *arg)
                         agingDataAMode = IdleState; // 群控模式下，老化步骤完成后，先把老化状态置为IdleState，等待上位机服务下发下一步任务
                         // 往上位机服务发送任务已完成，等待上位机服务下发下一步任务，得等所有节点都完成
                         publish_aging_complete(1, AgingNumber);
-                        while (Cannextstep == 0)
+
+                        /*
+                         * 群控模式下等待上位机下发下一步指令。
+                         * 必须带超时，否则服务端丢消息时老化任务会永久挂起。
+                         */
+                        int wait_rounds = 0;
+                        while (Cannextstep == 0 && !s_aging_stop_requested &&
+                               wait_rounds < AGING_NEXT_STEP_WAIT_MAX_ROUNDS)
                         {
-                            vTaskDelay(pdMS_TO_TICKS(10000));
+                            vTaskDelay(pdMS_TO_TICKS(1000));
+                            wait_rounds++;
+                        }
+
+                        if (Cannextstep == 0)
+                        {
+                            aging_error_log("Group-control next-step command timeout after %d seconds",
+                                            (int)AGING_NEXT_STEP_WAIT_TIMEOUT_S);
                         }
                         Cannextstep = 0;
                     }
@@ -4970,26 +5380,50 @@ void Aging_Test_Task(void *arg)
         }
         case AgingDataCheck:
         {
-            while (QueryLatestRecordByPNAndPushState(PN_Code, false, g_db1_result) == 0)
+            if (g_db1_result == NULL)
             {
-                if (g_db1_result->json_data[0] != '\0')
+                aging_error_log("Historical aging-data retransmission skipped: query buffer unavailable");
+            }
+
+            int retransmit_rounds = 0;
+            while (g_db1_result != NULL &&
+                   QueryLatestRecordByPNAndPushState(PN_Code, false, g_db1_result) == 0)
+            {
+                if (g_db1_result->json_data[0] == '\0')
                 {
-                    if (app_mqtt_publish("device/%s/data/aging", g_db1_result->json_data, DEVICE_ID) > 0)
-                    {
-                        UpdateRecordPushStateByPNAndID(PN_Code, g_db1_result->seq_no, true);
-                    }
-                    else
-                    {
-                        aging_error_log("Historical aging-data retransmission failed, seq_no=%d",
-                                        g_db1_result->seq_no);
-                        break;
-                    }
+                    /*
+                     * 空数据记录既不会发布也不会推进 pushed 状态，
+                     * 不跳出会让补发流程永久占用老化任务。
+                     */
+                    aging_error_log("Empty historical aging-data record found; stop retransmission");
+                    break;
                 }
+
+                if (app_mqtt_publish("device/%s/data/aging", g_db1_result->json_data, DEVICE_ID) > 0)
+                {
+                    UpdateRecordPushStateByPNAndID(PN_Code, g_db1_result->seq_no, true);
+                }
+                else
+                {
+                    aging_error_log("Historical aging-data retransmission failed, seq_no=%d",
+                                    g_db1_result->seq_no);
+                    break;
+                }
+
                 vTaskDelay(pdMS_TO_TICKS(100));
+
+                /* 兜底：服务端长期无响应时不能让补发流程永久占用老化任务。 */
+                if (++retransmit_rounds >= AGING_RETRANSMIT_MAX_ROUNDS)
+                {
+                    aging_error_log("Historical aging-data retransmission timeout after %d rounds",
+                                    (int)AGING_RETRANSMIT_MAX_ROUNDS);
+                    break;
+                }
             }
             // 清空数据
-            memset(Lost_Data_List, 0, 1024);
-            esp_err_t ret = test_http_post_record_query(time(NULL), s_idnum_index, RecordId, Lost_Data_List, 1024);
+            memset(Lost_Data_List, 0, AGING_LOST_DATA_LIST_SIZE);
+            esp_err_t ret = test_http_post_record_query(time(NULL), s_idnum_index, RecordId,
+                                                        Lost_Data_List, AGING_LOST_DATA_LIST_SIZE);
             if (ret == ESP_OK)
             {
                 int count = 0;
@@ -5001,6 +5435,11 @@ void Aging_Test_Task(void *arg)
                     {
                         printf("ids[%d] = %d\n", i, ids[i]);
                         query_db1_to_global(ids[i]);
+                        if (g_db1_result == NULL)
+                        {
+                            ESP_LOGE(TAG, "Query result buffer unavailable, skip id=%d", ids[i]);
+                            continue;
+                        }
                         if (g_db1_result->json_data[0] != '\0')
                         {
                             if (app_mqtt_publish("device/%s/data/aging", g_db1_result->json_data, DEVICE_ID) > 0)
@@ -5019,40 +5458,9 @@ void Aging_Test_Task(void *arg)
         }
         case AgingComplete:
         {
-
             agingState = AgingIdle;
             agingDataAMode = IdleState;
             agingResumeState.aging_valid = 0;
-
-            if (ble_is_connected())
-            {
-                BTDisConnect = 1;
-                ble_disconnect();
-            }
-
-            SelfRecovery_Erase_aging_valid();
-            memset(&agingResumeState, 0, sizeof(agingResumeState));
-
-            if (BleData_task_handle == NULL)
-            {
-                BaseType_t task_ret = create_cpu1_task(app_ble_data_handle,
-                                                       "ble_data",
-                                                       LG_STACK_BLE_DATA,
-                                                       LG_PRIO_BLE_DATA,
-                                                       &BleData_task_handle);
-                if (task_ret != pdPASS)
-                {
-                    aging_error_log("Recover BLE data task failed after aging completion");
-                }
-            }
-
-            AgingDevice_RuntimeFree();
-            if (agingcfg.device_count != 0 || agingcfg.step_count != 0)
-            {
-                aging_config_free(&agingcfg);
-                memset(&agingcfg, 0, sizeof(agingcfg));
-            }
-            spiffs_file_delete("Aging.json");
 
             s_aging_cmd_state = AGING_CMD_IDLE;
             s_pending_start_seq = 0;
@@ -5068,15 +5476,59 @@ void Aging_Test_Task(void *arg)
 
             memset(PN_Code, 0, sizeof(PN_Code));
             clear_ready_pn_runtime();
-            Aging_test_task_handle = NULL;
-            vTaskDelete(NULL);
-            return;
+
+            /*
+             * 资源释放统一交给退出流程：先让采集任务自行退出，
+             * 再由 aging_release_shared_resources() 释放共享资源。
+             */
+            aging_finished = true;
+            break;
         }
+        }
+
+        if (aging_finished)
+        {
+            break;
         }
 
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
+
+    /* ==================== 统一退出流程 ==================== */
+    agingState = AgingIdle;
+    agingDataAMode = IdleState;
+
+    /*
+     * 置停止请求并等待采集任务自行退出。
+     * 采集任务可能在访问 Aging_device / agingcfg，必须等它退出后再释放。
+     */
+    s_aging_stop_requested = true;
+    aging_wait_for_data_task_exit(pdMS_TO_TICKS(AGING_STOP_WAIT_MS));
+
+    /*
+     * 先释放再清标志：万一采集任务等待超时仍未退出，
+     * 它在标志仍为 true 时会在下一轮立即退出，不会再去访问已释放的资源。
+     */
+    aging_release_shared_resources();
+    s_aging_stop_requested = false;
+
+    AgingLogActive = false;
+    s_consecutive_data_read_failures = 0;
+    s_last_data_read_error_report_tick = 0;
+    s_consecutive_data_upload_failures = 0;
+    s_last_data_upload_error_report_tick = 0;
+
+    /* 句柄只由本任务清零，供“等待退出”的一方判定。 */
+    Aging_test_task_handle = NULL;
+
+    free(s_lost_data_list);
+    s_lost_data_list = NULL;
+
+    aging_runtime_log("Aging task exited and released shared resources");
+    vTaskDelete(NULL);
+    return;
 }
+
 #pragma endregion
 
 #pragma region 老化采样与数据上传
@@ -5349,6 +5801,15 @@ void app_AgingData_Get_handle(void *arg)
 {
     while (1)
     {
+        /*
+         * 收到停止请求即退出：本轮处理已经完成，不会再访问共享资源。
+         * 句柄由本任务自己清零，老化任务据此确认“没有消费者”。
+         */
+        if (s_aging_stop_requested)
+        {
+            break;
+        }
+
         if (agingDataAMode != IdleState)
         {
             AgingUploadPacket *packet = (AgingUploadPacket *)app_calloc_prefer_psram(1, sizeof(AgingUploadPacket));
@@ -5361,7 +5822,13 @@ void app_AgingData_Get_handle(void *arg)
                 int sample_count = ProcessAgingStepData(packet);
                 if (sample_count > 0 && packet->value_json != NULL)
                 {
-                    if (xQueueSend(Upload_data_queue, &packet, pdMS_TO_TICKS(50)) != pdTRUE)
+                    /* 队列可能未创建（例如根节点路径），必须判空后再发送。 */
+                    if (Upload_data_queue == NULL)
+                    {
+                        aging_error_log("Aging upload-data queue is not created; current sample was dropped");
+                        AgingUploadPacket_Free(packet);
+                    }
+                    else if (xQueueSend(Upload_data_queue, &packet, pdMS_TO_TICKS(50)) != pdTRUE)
                     {
                         aging_error_log("Aging upload-data queue is full; current sample was dropped");
                         AgingUploadPacket_Free(packet);
@@ -5377,6 +5844,14 @@ void app_AgingData_Get_handle(void *arg)
 
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
+
+    agingDataAMode = IdleState;
+
+    /* 句柄只由本任务清零，老化任务据此判断“已无消费者”。 */
+    AgingData_task_handle = NULL;
+
+    ESP_LOGI(TAG, "Aging data acquisition task exited");
+    vTaskDelete(NULL);
 }
 
 static void app_DataUpload_Functiong(const AgingUploadPacket *packet, int idnum)
@@ -5463,6 +5938,12 @@ void app_AgingData_Upload_handle(void *arg)
     while (1)
     {
         AgingUploadPacket *packet = NULL;
+        if (Upload_data_queue == NULL)
+        {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
         if (xQueueReceive(Upload_data_queue, &packet, portMAX_DELAY) != pdTRUE || packet == NULL)
         {
             continue;
@@ -5512,6 +5993,18 @@ void app_AgingData_Upload_handle(void *arg)
 
 void app_task_init(void)
 {
+    /* 老化生命周期互斥量：串行化停止请求 / 等待退出 / 释放共享资源。 */
+    if (s_aging_lifecycle_mutex == NULL)
+    {
+        s_aging_lifecycle_mutex = xSemaphoreCreateMutex();
+        if (s_aging_lifecycle_mutex == NULL)
+        {
+            ESP_LOGE(TAG, "Failed to create aging lifecycle mutex");
+        }
+    }
+
+    s_aging_stop_requested = false;
+
     // 初始化NVS
     ESP_ERROR_CHECK(nvs_flash_init());
     // 初始化SPIFFS,存配置相关的

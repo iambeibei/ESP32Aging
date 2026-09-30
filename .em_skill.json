@@ -1,0 +1,8 @@
+{
+  "embedded_coding_standard": {
+    "review": {
+      "rules": ["Huawei C"],
+      "updated_at": "2026-09-30"
+    }
+  }
+}

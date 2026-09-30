@@ -270,6 +270,18 @@ void Modbus_ParseResponseBasic(const uint8_t *response, size_t length)
     {
         uint8_t byte_count = response[2];
 
+        /*
+         * 0x03 响应帧长必须 >= 3(头) + byte_count + 2(CRC)，
+         * 否则 response[3 + i*2] / response[4 + i*2] 会越界读。
+         */
+        if (length < (size_t)(3 + byte_count + 2))
+        {
+            printf("Invalid 0x03 response length: %u, byte_count: %u\n",
+                   (unsigned)length,
+                   byte_count);
+            return;
+        }
+
         printf("Slave: %u, Function: 0x03, Byte Count: %u\n", slave_addr, byte_count);
 
         for (uint8_t i = 0; i < byte_count / 2; i++)

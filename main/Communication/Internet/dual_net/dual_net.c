@@ -643,8 +643,11 @@ esp_err_t dual_net_init(void)
 
     s_wifi_state = WIFI_STATE_IDLE;
 
-    esp_err_t ret=ESP_FAIL;
-    ESP_LOGW(TAG, "Ethernet init failed, fallback to WiFi only");
+    /*
+     * 以太网初始化当前整体停用，这里不能再保留“初始化失败”的占位返回值和日志：
+     * 否则本函数恒定返回 ESP_FAIL，调用方会误记录一条并不存在的故障。
+     */
+    esp_err_t ret = ESP_OK;
     eth_up = false;
     eth_link_up = false;
     // 要改回来
@@ -702,7 +705,8 @@ esp_err_t dual_net_init(void)
     {
         //ESP_LOGE(TAG, "Failed to create dual_net_monitor_task");
         storage_write_record_cyclic("", "Failed to create dual_net_monitor_task");
-        return ESP_FAIL;
+        ret = ESP_FAIL;
+        return ret;
     }
 
     dual_net_refresh_wifi_ip_state();

@@ -32,28 +32,32 @@ void SelfRecovery_Deinit(void)
 
 esp_err_t SelfRecovery_Write_str(const char *key, const char *value)
 {
-    if (my_handle == 0)
+    if (my_handle == 0 || key == NULL || value == NULL)
+    {
         return ESP_ERR_INVALID_STATE;
+    }
+
     esp_err_t err = nvs_set_str(my_handle, key, value);
     if (err == ESP_OK)
     {
+        /* 只提交一次：此前重复 nvs_commit 会用第二次结果覆盖第一次的错误码。 */
         err = nvs_commit(my_handle);
         if (err == ESP_OK)
         {
             ESP_LOGI(TAG, "Written str: %s = %s", key, value);
         }
     }
+
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "Write str failed: %s", esp_err_to_name(err));
     }
-    err = nvs_commit(my_handle);
     return err;
 }
 
 esp_err_t SelfRecovery_Read_str(const char *key, char *out_value, size_t max_len)
 {
-    if (my_handle == 0 || out_value == NULL || max_len == 0)
+    if (my_handle == 0 || key == NULL || out_value == NULL || max_len == 0)
     {
         return ESP_ERR_INVALID_STATE;
     }
@@ -76,6 +80,11 @@ esp_err_t SelfRecovery_Read_str(const char *key, char *out_value, size_t max_len
 
 esp_err_t SelfRecovery_Write_uint16(const char *key, uint16_t value)
 {
+    if (my_handle == 0 || key == NULL)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     esp_err_t err = nvs_set_u16(my_handle, key, value);
     if (err != ESP_OK)
     {
@@ -92,6 +101,11 @@ esp_err_t SelfRecovery_Write_uint16(const char *key, uint16_t value)
 
 esp_err_t SelfRecovery_Read_uint16(const char *key, uint16_t *value)
 {
+    if (my_handle == 0 || key == NULL || value == NULL)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     esp_err_t err = nvs_get_u16(my_handle, key, value);
     if (err != ESP_OK)
     {
@@ -108,6 +122,11 @@ esp_err_t SelfRecovery_Read_uint16(const char *key, uint16_t *value)
 
 esp_err_t SelfRecovery_Write_uint64(const char *key, uint64_t val)
 {
+    if (my_handle == 0 || key == NULL)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     esp_err_t err = nvs_set_u64(my_handle, key, val);
     if (err != ESP_OK)
     {
@@ -123,6 +142,11 @@ esp_err_t SelfRecovery_Write_uint64(const char *key, uint64_t val)
 
 esp_err_t SelfRecovery_Read_uint64(const char *key, uint64_t *val)
 {
+    if (my_handle == 0 || key == NULL || val == NULL)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     esp_err_t err = nvs_get_u64(my_handle, key, val);
     if (err != ESP_OK)
     {

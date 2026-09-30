@@ -74,6 +74,44 @@ static int json_get_int(cJSON *obj, const char *key, int default_value)
     return default_value;
 }
 
+/*
+ * 点表中的数值字段来自外部 JSON，直接强转 uint16_t/uint8_t 会把
+ * 负值变成 65535、超范围值静默截断，导致读写到错误寄存器。这里统一钳位。
+ */
+static uint16_t json_get_u16_clamped(cJSON *obj, const char *key, int default_value)
+{
+    int v = json_get_int(obj, key, default_value);
+
+    if (v < 0)
+    {
+        return 0U;
+    }
+
+    if (v > 0xFFFF)
+    {
+        return 0xFFFFU;
+    }
+
+    return (uint16_t)v;
+}
+
+static uint8_t json_get_u8_clamped(cJSON *obj, const char *key, int default_value)
+{
+    int v = json_get_int(obj, key, default_value);
+
+    if (v < 0)
+    {
+        return 0U;
+    }
+
+    if (v > 0xFF)
+    {
+        return 0xFFU;
+    }
+
+    return (uint8_t)v;
+}
+
 static ProtocolItemRW parse_rw(const char *rw)
 {
     if (!rw)
@@ -101,7 +139,8 @@ bool ModbusJson_Parse(const char *json_text, ProtocolInfo *out_info)
     cJSON *root = cJSON_Parse(json_text);
     if (!root)
     {
-        printf("JSON parse failed: %s\n", cJSON_GetErrorPtr());
+        printf("JSON parse failed: %s\n",
+               cJSON_GetErrorPtr() != NULL ? cJSON_GetErrorPtr() : "unknown");
         return false;
     }
 
@@ -155,13 +194,13 @@ bool ModbusJson_Parse(const char *json_text, ProtocolInfo *out_info)
 
         item->rw = parse_rw(item->rw_str);
 
-        item->reg_addr = (uint16_t)json_get_int(node, "寄存器地址", 0);
-        item->reg_len = (uint16_t)json_get_int(node, "长度", 1);
+        item->reg_addr = json_get_u16_clamped(node, "寄存器地址", 0);
+        item->reg_len = json_get_u16_clamped(node, "长度", 1);
 
         item->precision = json_get_double(node, "精度", 1.0);
         item->compensation = json_get_double(node, "补偿", 0.0);
 
-        item->is_unsigned = (uint8_t)json_get_int(node, "无符号", 1);
+        item->is_unsigned = json_get_u8_clamped(node, "无符号", 1);
 
         if (item->reg_len == 0)
             item->reg_len = 1;

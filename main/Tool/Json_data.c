@@ -679,9 +679,19 @@ char *CreateDataReportJson(int idnum, int timestamp, char *sn_buffer, int curren
 // 解析 JSON 字符串中的 int64_t 值
 int get_json_int64(const char *json, const char *key, int64_t *value)
 {
+    if (json == NULL || key == NULL || value == NULL)
+    {
+        return -1;
+    }
+
     char key_buf[64];
 
-    snprintf(key_buf, sizeof(key_buf), "\"%s\"", key);
+    int key_len = snprintf(key_buf, sizeof(key_buf), "\"%s\"", key);
+    if (key_len < 0 || key_len >= (int)sizeof(key_buf))
+    {
+        // key 过长导致 key_buf 被截断，不能继续按截断内容匹配
+        return -1;
+    }
 
     // 找到 "ID"
     const char *p = strstr(json, key_buf);
@@ -776,6 +786,11 @@ fail:
  */
 char *create_json_agingStage(int timestamp, const char *aging_stage, const char *aging_number)
 {
+    if (aging_stage == NULL || aging_number == NULL)
+    {
+        return NULL;
+    }
+
     // 预估最大长度，留足余量
     char buf[256];
     int len = snprintf(buf, sizeof(buf),
@@ -807,6 +822,11 @@ char *create_json_agingStage(int timestamp, const char *aging_stage, const char 
  */
 char *create_json_agingComplete(int timestamp, int is_complete, const char *aging_number)
 {
+    if (aging_number == NULL)
+    {
+        return NULL;
+    }
+
     char buf[256];
     int len = snprintf(buf, sizeof(buf),
                        "{\"Seq\":%d,"
@@ -1141,15 +1161,28 @@ char *update_device_id_in_json(const char *json_input, const char *new_device_id
     }
 
     // 4. 修改 DEVICE_ID
+    /*
+     * 不能先 cJSON_SetValuestring(item, "DEVICE_ID")：
+     * 这会把旧节点的 valuestring 指向 .rodata 里的字符串字面量，
+     * 随后 ReplaceItemInObject 删除旧节点时会对字面量执行 free()，破坏堆。
+     * 直接用 CreateString + ReplaceItemInObject 完成替换即可。
+     */
     cJSON *device_id_item = cJSON_GetObjectItem(value_obj, "DEVICE_ID");
     if (device_id_item == NULL) {
         // DEVICE_ID 不存在，新增一个
-        cJSON_AddStringToObject(value_obj, "DEVICE_ID", new_device_id);
+        if (cJSON_AddStringToObject(value_obj, "DEVICE_ID", new_device_id) == NULL) {
+            cJSON_Delete(root);
+            return NULL;
+        }
     } else {
         // DEVICE_ID 已存在，替换值
-        cJSON_SetValuestring(device_id_item, "DEVICE_ID");  // 保持key不变
-        cJSON_ReplaceItemInObject(value_obj, "DEVICE_ID",
-                                  cJSON_CreateString(new_device_id));
+        cJSON *new_item = cJSON_CreateString(new_device_id);
+        if (new_item == NULL) {
+            cJSON_Delete(root);
+            return NULL;
+        }
+
+        cJSON_ReplaceItemInObject(value_obj, "DEVICE_ID", new_item);
     }
 
     // 5. 序列化为JSON字符串

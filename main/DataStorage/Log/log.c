@@ -21,17 +21,21 @@ static SemaphoreHandle_t s_log_mutex = NULL;
 
 void Get_Index_From_Flash(uint16_t index)
 {
-    if (s_log_mutex != NULL)
+    if (s_log_mutex == NULL)
     {
-        xSemaphoreTake(s_log_mutex, portMAX_DELAY);
+        ESP_LOGE(TAG, "Log mutex is not initialized; index update rejected");
+        return;
+    }
+
+    if (xSemaphoreTake(s_log_mutex, portMAX_DELAY) != pdTRUE)
+    {
+        ESP_LOGE(TAG, "Failed to take log mutex; index update rejected");
+        return;
     }
 
     s_current_index = (index < MAX_RECORDS) ? index : 0;
 
-    if (s_log_mutex != NULL)
-    {
-        xSemaphoreGive(s_log_mutex);
-    }
+    xSemaphoreGive(s_log_mutex);
 }
 
 // 辅助函数：通过索引计算文件偏移
@@ -253,31 +257,38 @@ esp_err_t storage_write_record_cyclic(const char *pn, const char *str)
 // 获取当前写入索引
 uint16_t storage_get_current_index(void)
 {
-    uint16_t index;
-    if (s_log_mutex != NULL)
+    if (s_log_mutex == NULL)
     {
-        xSemaphoreTake(s_log_mutex, portMAX_DELAY);
+        return s_current_index;
     }
-    index = s_current_index;
-    if (s_log_mutex != NULL)
+
+    if (xSemaphoreTake(s_log_mutex, portMAX_DELAY) != pdTRUE)
     {
-        xSemaphoreGive(s_log_mutex);
+        return s_current_index;
     }
+
+    uint16_t index = s_current_index;
+    xSemaphoreGive(s_log_mutex);
     return index;
 }
 
 // 重置循环写入位置
 void storage_reset_cyclic_position(void)
 {
-    if (s_log_mutex != NULL)
+    if (s_log_mutex == NULL)
     {
-        xSemaphoreTake(s_log_mutex, portMAX_DELAY);
+        ESP_LOGE(TAG, "Log mutex is not initialized; cyclic position reset rejected");
+        return;
     }
+
+    if (xSemaphoreTake(s_log_mutex, portMAX_DELAY) != pdTRUE)
+    {
+        ESP_LOGE(TAG, "Failed to take log mutex; cyclic position reset rejected");
+        return;
+    }
+
     s_current_index = 0;
-    if (s_log_mutex != NULL)
-    {
-        xSemaphoreGive(s_log_mutex);
-    }
+    xSemaphoreGive(s_log_mutex);
     ESP_LOGI(TAG, "Cyclic position reset to 0");
 }
 
