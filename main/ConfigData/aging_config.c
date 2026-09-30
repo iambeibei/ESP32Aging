@@ -409,8 +409,7 @@ static AgingErr parse_devices(cJSON *aging_devices_obj, AgingConfig *out)
 
         out->devices[i].Type = json_get_strdup(dev, "Type");
         out->devices[i].Communication = json_get_strdup(dev, "Communication");
-        /* ProtoID 为 int64_t，必须用 64 位接口读取，否则超过 INT32_MAX 会被截断。 */
-        out->devices[i].ProtoID = (int64_t)json_get_ll(dev, "ProtoID", 0);
+        out->devices[i].ProtoID = json_get_int(dev, "ProtoID", 0);
 
         if (!out->devices[i].Type || !out->devices[i].Communication || out->devices[i].ProtoID == 0)
         {
@@ -502,12 +501,6 @@ void aging_steps_free(AgingStep *steps, size_t step_count)
     for (size_t i = 0; i < step_count; i++)
     {
         AgingStep *step = &steps[i];
-
-        if (step->StepId)
-        {
-            free(step->StepId);
-            step->StepId = NULL;
-        }
 
         if (step->method)
         {
@@ -761,7 +754,6 @@ void aging_config_free(AgingConfig *cfg)
     {
         for (size_t i = 0; i < cfg->step_count; i++)
         {
-            free(cfg->steps[i].StepId);
             free(cfg->steps[i].method);
 
             if (cfg->steps[i].judging_conditions)

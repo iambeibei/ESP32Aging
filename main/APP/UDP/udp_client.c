@@ -24,11 +24,6 @@
 #include "log.h"
 
 static const char *TAG = "udp_client";
-
-/* UDP 接收缓冲区与队列项大小必须一致，避免入队/出队时越界拷贝。 */
-#define UDP_RECV_BUF_SIZE 400
-#define UDP_DATA_QUEUE_LEN 10
-
 static uint16_t udp_client_local_port = 0;
 static bool localport_is_saved = false;
 
@@ -207,12 +202,6 @@ int udp_client_receive(uint8_t *buffer, size_t buffer_size, int timeout_ms)
 
     struct sockaddr_storage source_addr;
     socklen_t socklen = sizeof(source_addr);
-    /* buffer_size 为 size_t，等于 0 时 buffer_size - 1 会回绕成超大长度。 */
-    if (buffer_size == 0)
-    {
-        return -1;
-    }
-
     int len = recvfrom(client->sock, buffer, buffer_size - 1, 0,
                        (struct sockaddr *)&source_addr, &socklen);
 
@@ -269,7 +258,6 @@ void udp_client_deinit(void)
     }
 
     free(client);
-    client = NULL; /* 避免 deinit 后再次调用变成释放后使用 */
     ESP_LOGI(TAG, "UDP client deinitialized");
 }
 
@@ -466,12 +454,7 @@ int send_control_string(const char *str)
 void udp_test_task(void *pvParameters)
 {
     udp_client_config_t config = UDP_CLIENT_CONFIG_DEFAULT();
-    /*
-     * SERVER_IP 是运行时下发的配置，长度不可控且可能为 NULL，
-     * 必须用带长度限制的方式拷贝并保证字符串结尾。
-     */
-    snprintf(config.server_ip, sizeof(config.server_ip), "%s",
-             SERVER_IP != NULL ? SERVER_IP : "");
+    strcpy(config.server_ip, SERVER_IP);
     config.server_port = SERVER_UDP_Port;
     config.local_port = UDP_Port;
     config.timeout_sec = 5;
@@ -729,7 +712,7 @@ static void udp_rec_data(void *pvParameters)
     vTaskDelay(1000); // 等待时间同步
     while(1)
     {
-        char recv_buf[UDP_RECV_BUF_SIZE] = {0};
+        char recv_buf[400];
         int len = udp_client_receive((uint8_t *)recv_buf, sizeof(recv_buf), 5000);
         if (len > 0)
         {
@@ -765,12 +748,7 @@ int app_read_UDP_data(char *buffer, size_t buffer_size, int timeout_ms)
 int UDP_Init(void)
 {
     udp_client_config_t config = UDP_CLIENT_CONFIG_DEFAULT();
-    /*
-     * SERVER_IP 是运行时下发的配置，长度不可控且可能为 NULL，
-     * 必须用带长度限制的方式拷贝并保证字符串结尾。
-     */
-    snprintf(config.server_ip, sizeof(config.server_ip), "%s",
-             SERVER_IP != NULL ? SERVER_IP : "");
+    strcpy(config.server_ip, SERVER_IP);
     config.server_port = SERVER_UDP_Port;
     config.local_port = UDP_Port;
     config.timeout_sec = 5;
@@ -786,24 +764,14 @@ int UDP_Init(void)
 
     ESP_LOGI(TAG, "UDP client initialized, local port: %d", udp_client_get_local_port());
 
-    /*
-     * 队列项大小必须与入队缓冲区一致：原实现按 1024 字节拷贝 400 字节的栈缓冲，
-     * 会越界读栈内容。
-     */
-    s_udprdata_queue = xQueueCreate(UDP_DATA_QUEUE_LEN, UDP_RECV_BUF_SIZE);
+    s_udprdata_queue = xQueueCreate(10, 1024); // 创建UDP数据队列，长度10，每项1024字节
     if (s_udprdata_queue == NULL)
     {
         ESP_LOGE(TAG, "data queue create failed");
-        udp_client_deinit();
         return -1;
     }
-
-    if (xTaskCreate(udp_rec_data, "udp_rec_data", 4096, NULL, 5, NULL) != pdPASS)
-    {
-        ESP_LOGE(TAG, "udp_rec_data task create failed");
-        udp_client_deinit();
-        return -1;
-    }
+    
+    xTaskCreate(udp_rec_data, "udp_rec_data", 4096, NULL, 5, NULL);
 
     vTaskDelay(pdMS_TO_TICKS(10)); // 等待UDP初始化完成
 

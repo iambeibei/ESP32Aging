@@ -469,12 +469,6 @@ esp_err_t scpi_dynamic_import_json(const char *json_text, scpi_protocol_t **out_
         esp_err_t ret = parse_param_def(param_obj, cmd);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "parse param failed");
-            /*
-             * 当前槽位尚未写入 item_count，scpi_dynamic_free() 不会遍历到它，
-             * 必须先单独释放，否则每次导入失败都会泄漏该条目的全部字符串。
-             */
-            free_cmd_item(cmd);
-            memset(cmd, 0, sizeof(*cmd));
             scpi_dynamic_free(protocol);
             cJSON_Delete(root);
             return ret;

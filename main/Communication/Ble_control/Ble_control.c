@@ -29,26 +29,12 @@ static const char *TAG = "BLE_CTRL";
 #define PROFILE_NUM 1
 #define PROFILE_A_APP_ID 0
 
-/*
- * 发送缓冲区与单次发送负载上限。
- * 加密输出为“补齐到 16 字节倍数的密文 + 头部”，必须给加密留足余量。
- */
-#define BLE_SEND_BUF_SIZE 1024
-#define BLE_SEND_MAX_PAYLOAD_LEN 500
-
 bool ble_Scan_complate; // 扫描完成标志
 
 // 消息队列
 // static QueueHandle_t scan_result_queue;  //扫描结果队列
 static QueueHandle_t data_queue;         // 接收到的数据队列
 static QueueHandle_t data_forword_queue; // 转发的数据队列
-
-/*
- * 协商后的 MTU，只在 ESP_GATTC_CFG_MTU_EVT 中更新。
- * esp_ble_gattc_cb_param_t 是联合体，cfg_mtu 只在 CFG_MTU 事件里有效，
- * 在 NOTIFY 事件读 cfg_mtu.mtu 实际解释的是 notify 成员的内存（类型双关）。
- */
-static uint16_t s_gattc_mtu = 23;
 
 // BLE设备列表
 static ble_device_info_t s_scanned_devices[MAX_SCAN_DEVICES];
@@ -200,12 +186,8 @@ int app_ble_recv_data_form_remote(uint8_t *data, int max_len, uint32_t wait_time
     uint8_t id = ble_data.profile_id;
     if (id < PROFILE_NUM)
     {
-        /*
-         * 必须用钳位而不是取模：取模会在数据超长时拷贝一个“余数”长度，
-         * 既丢数据又返回错误长度，调用方无法察觉。
-         */
-        copy_len = (ble_data.data_len > max_len) ? max_len : ble_data.data_len;
-        memcpy(data, ble_data.data, (size_t)copy_len);
+        copy_len = ble_data.data_len % (max_len + 1);
+        memcpy(data, ble_data.data, copy_len);
     }
     else
     {
@@ -690,14 +672,17 @@ bool ble_get_connected_device_addr(uint8_t *bda)
 
 int ble_send_data(void *pdata, int len, uint32_t timeout)
 {
-    /*
-     * 长度与指针校验必须在任何拷贝/加密之前完成：
-     * 加密输出会比输入多出补齐字节，len 接近缓冲区上界时会写穿 sendBuf。
-     */
-    if (pdata == NULL || len <= 0 || len > BLE_SEND_MAX_PAYLOAD_LEN)
+    uint8_t sendBuf[1024] = {0};
+    uint16_t nlen = 0;
+    if (IsEnc)
     {
-        ESP_LOGE(TAG, "Invalid send length or buffer: len=%d (max=%d)", len, BLE_SEND_MAX_PAYLOAD_LEN);
-        return 0;
+        app_enc_process_Encrypt(pdata, len, sendBuf, &nlen);
+
+    }
+    else
+    {
+        memcpy(sendBuf, pdata, len);
+        nlen = len;
     }
 
     if (!s_is_connected)
@@ -712,27 +697,10 @@ int ble_send_data(void *pdata, int len, uint32_t timeout)
         return 0;
     }
 
-    uint8_t sendBuf[BLE_SEND_BUF_SIZE] = {0};
-    uint16_t nlen = 0;
-
-    if (IsEnc)
+    if (len > 500)
     {
-        if (app_enc_process_Encrypt(pdata, (uint16_t)len, sendBuf, &nlen) != ESP_OK)
-        {
-            ESP_LOGE(TAG, "Encrypt failed, len=%d", len);
-            return 0;
-        }
-
-        if (nlen == 0 || nlen > sizeof(sendBuf))
-        {
-            ESP_LOGE(TAG, "Encrypted length invalid: %u (buf=%u)", (unsigned)nlen, (unsigned)sizeof(sendBuf));
-            return 0;
-        }
-    }
-    else
-    {
-        memcpy(sendBuf, pdata, (size_t)len);
-        nlen = (uint16_t)len;
+        ESP_LOGE(TAG, "Data too long: %d > 500", len);
+        return 0;
     }
 
     esp_err_t ret = esp_ble_gattc_write_char(s_gattc_profile.gattc_if,
@@ -896,7 +864,6 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
 
     case ESP_GATTC_CFG_MTU_EVT:
         ESP_LOGI(TAG, "MTU exchange: %d", param->cfg_mtu.mtu);
-        s_gattc_mtu = param->cfg_mtu.mtu;
         break;
 
     case ESP_GATTC_SEARCH_RES_EVT:
@@ -1050,10 +1017,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         }
         recv.data_len = param->notify.value_len;
         memcpy(recv.data, param->notify.value, param->notify.value_len);
-
-        /* 用 CFG_MTU 事件中保存的 MTU 判断是否需要等待分包。 */
-        uint16_t mtu_payload = (s_gattc_mtu > 3) ? (uint16_t)(s_gattc_mtu - 3) : 0U;
-        if (recv.data_len < mtu_payload)
+        if (recv.data_len < (param->cfg_mtu.mtu - 3))
         {
             recv.wait_time = 0;
         }

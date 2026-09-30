@@ -14,9 +14,6 @@ static const char *TAG = "mesh_mqtt";
 
 static esp_mqtt_client_handle_t s_client = NULL;
 
-/* MQTT 遗嘱消息缓冲，由本模块持有，客户端销毁后才释放。 */
-static char *s_will_msg = NULL;
-
 static QueueHandle_t Topic_queue = NULL;
 static QueueHandle_t Data_queue = NULL;
 
@@ -344,8 +341,7 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
     case MQTT_EVENT_ERROR:
     {
         ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
-        if (event->error_handle != NULL &&
-            event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT)
+        if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT)
         {
             ESP_LOGE(TAG, "TCP transport error");
         }
@@ -377,16 +373,7 @@ esp_err_t mqtt_app_start(void)
         return ESP_OK;
     }
 
-    /*
-     * 遗嘱消息必须在客户端整个生命周期内保持有效，
-     * 因此由模块持有并在 stop 时释放，避免每次 start/restart 泄漏一块堆内存。
-     */
-    free(s_will_msg);
-    s_will_msg = create_up_line_json(0, DEVICE_ID);
-    if (s_will_msg == NULL)
-    {
-        ESP_LOGE(TAG, "Failed to build MQTT last will message");
-    }
+    char *json = create_up_line_json(0, DEVICE_ID);
 
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker = {
@@ -403,7 +390,7 @@ esp_err_t mqtt_app_start(void)
                     .protocol_ver = MQTT_PROTOCOL_V_3_1_1,
                     .last_will = {
                         .topic = "device/public/down_line",
-                        .msg = s_will_msg,
+                        .msg = json,
                         .qos = 1,
                         .retain = 0,
 
@@ -422,19 +409,10 @@ esp_err_t mqtt_app_start(void)
 
     ESP_LOGI(TAG, "Starting MQTT client...");
     s_client = esp_mqtt_client_init(&mqtt_cfg);
-    if (s_client == NULL)
-    {
-        ESP_LOGE(TAG, "esp_mqtt_client_init failed");
-        s_client = NULL;
-        return ESP_ERR_NO_MEM;
-    }
-
     esp_err_t ret = esp_mqtt_client_register_event(s_client, ESP_EVENT_ANY_ID, mqtt_event_handler, s_client);
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to register MQTT event handler: %s", esp_err_to_name(ret));
-        esp_mqtt_client_destroy(s_client);
-        s_client = NULL;
         return ret;
     }
 
@@ -442,8 +420,6 @@ esp_err_t mqtt_app_start(void)
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to start MQTT client: %s", esp_err_to_name(ret));
-        esp_mqtt_client_destroy(s_client);
-        s_client = NULL;
         return ret;
     }
 
@@ -458,10 +434,6 @@ void mqtt_app_stop(void)
         esp_mqtt_client_destroy(s_client);
         s_client = NULL;
     }
-
-    /* 客户端销毁后遗嘱消息才不再被引用，此时释放。 */
-    free(s_will_msg);
-    s_will_msg = NULL;
 }
 
 void mqtt_app_restart(void)
@@ -489,33 +461,16 @@ int app_mqtt_publish(char *topic_name, char *publish_string, char *DEVICE_ID)
         ESP_LOGW(TAG, "MQTT is not connected. Cannot publish message.");
         return -1;
     }
-    if (topic_name == NULL || publish_string == NULL)
-    {
-        ESP_LOGE(TAG, "Invalid publish parameter");
-        return -1;
-    }
+    char topic[64]; // 增大一点，确保空间足够
 
-    char topic[MQTT_TOPIC_ITEM_CAPACITY];
-
-    /*
-     * topic_name 带有 "%s" 占位符，这里仍然按格式化串使用（所有调用点都是字面量）。
-     * 一旦 topic_name 来自外部输入就会构成格式化串漏洞，
-     * 因此必须保证传入的是本模块内的字面量，并检查写入长度。
-     */
-    int written;
+    // DEVICE_ID 是整数，要用 %d 格式符
     if (DEVICE_ID != NULL)
     {
-        written = snprintf(topic, sizeof(topic), topic_name, DEVICE_ID);
+        snprintf(topic, sizeof(topic), topic_name, DEVICE_ID);
     }
     else
     {
-        written = snprintf(topic, sizeof(topic), "%s", topic_name);
-    }
-
-    if (written < 0 || written >= (int)sizeof(topic))
-    {
-        ESP_LOGE(TAG, "MQTT topic is truncated: %s", topic_name);
-        return -1;
+        snprintf(topic, sizeof(topic), topic_name);
     }
 
     return mqtt_app_publish(topic, publish_string);

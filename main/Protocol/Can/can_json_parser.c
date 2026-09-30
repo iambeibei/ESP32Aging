@@ -69,44 +69,6 @@ static int json_get_int(cJSON *obj, const char *key, int default_value)
     return default_value;
 }
 
-/*
- * 点表数值来自外部 JSON，直接强转 uint16_t/uint8_t 会把负值变成 65535、
- * 超范围值静默截断，导致访问错误的数据区。这里统一钳位。
- */
-static uint16_t json_get_u16_clamped(cJSON *obj, const char *key, int default_value)
-{
-    int v = json_get_int(obj, key, default_value);
-
-    if (v < 0)
-    {
-        return 0U;
-    }
-
-    if (v > 0xFFFF)
-    {
-        return 0xFFFFU;
-    }
-
-    return (uint16_t)v;
-}
-
-static uint8_t json_get_u8_clamped(cJSON *obj, const char *key, int default_value)
-{
-    int v = json_get_int(obj, key, default_value);
-
-    if (v < 0)
-    {
-        return 0U;
-    }
-
-    if (v > 0xFF)
-    {
-        return 0xFFU;
-    }
-
-    return (uint8_t)v;
-}
-
 static double json_get_double(cJSON *obj, const char *key, double default_value)
 {
     cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
@@ -234,13 +196,13 @@ bool CanJson_Parse(const char *json_text, CanProtocolInfo *out_info)
         item->rw = parse_rw(item->rw_str);
         item->value_type = parse_value_type(item->type_str);
 
-        item->data_type = json_get_u16_clamped(node, "数据类型", 0);
-        item->start = json_get_u16_clamped(node, "起始", 0);
-        item->len = json_get_u16_clamped(node, "长度", 1);
+        item->data_type = (uint16_t)json_get_int(node, "数据类型", 0);
+        item->start = (uint16_t)json_get_int(node, "起始", 0);
+        item->len = (uint16_t)json_get_int(node, "长度", 1);
         item->precision = json_get_double(node, "精度", 1.0);
         item->compensation = json_get_double(node, "补偿", 0.0);
-        item->is_unsigned = json_get_u8_clamped(node, "无符号", 1);
-        item->bit_state = json_get_u8_clamped(node, "位状态", 0);
+        item->is_unsigned = (uint8_t)json_get_int(node, "无符号", 1);
+        item->bit_state = (uint8_t)json_get_int(node, "位状态", 0);
 
         if (item->len == 0)
         {

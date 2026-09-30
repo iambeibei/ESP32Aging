@@ -5,8 +5,6 @@
 #include "esp_log.h"
 #include "nvs.h"
 #include "stdbool.h"
-#include "stdint.h"
-#include "stddef.h"
 
 typedef struct {
     uint16_t aging_valid;
