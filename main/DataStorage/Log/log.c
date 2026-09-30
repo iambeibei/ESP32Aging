@@ -35,9 +35,16 @@ void Get_Index_From_Flash(uint16_t index)
 }
 
 // 辅助函数：通过索引计算文件偏移
-uint16_t log_get_offset(uint16_t index)
+uint32_t log_get_offset(uint16_t index)
 {
-    return index * RECORD_SIZE;
+    /*
+     * index 取值为 0..(MAX_RECORDS-1)，最大 2999；2999 * RECORD_SIZE(128) = 383872 字节，
+     * 已远超 uint16_t 的 65535 上限。若返回 uint16_t，index >= 512 时偏移会被截断回绕
+     * （512 * 128 = 65536 -> 0，513 -> 128，...），第 512 条之后的日志会反复覆盖
+     * 0~511 号槽位，整个环形缓冲区实际退化为只有 512 条。
+     * 先显式提升再相乘，避免中间结果在窄类型上溢出。
+     */
+    return (uint32_t)index * RECORD_SIZE;
 }
 
 esp_err_t log_storage_mount(void)

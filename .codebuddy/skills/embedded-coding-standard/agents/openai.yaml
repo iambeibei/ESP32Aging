@@ -1,0 +1,4 @@
+interface:
+  display_name: "Embedded coding standard"
+  short_description: "Embedded C/C++ coding standard lookup and third-party standard code review."
+  default_prompt: "Use $embedded-coding-standard to look up the embedded coding standard or review embedded code with MISRA/CERT/BARR-C/FreeRTOS rules."

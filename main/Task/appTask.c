@@ -2982,20 +2982,30 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
             {
                 const int start_seq = Seq->valueint;
                 cJSON *Data_obj = cJSON_GetObjectItem(pRoot, "Data");
-                if (Data_obj == NULL || !cJSON_IsObject(Data_obj))
+                if (!cJSON_IsObject(Data_obj))
                 {
+                    /*
+                     * 必须终止本条命令：继续往下会在 NULL 的 Data_obj 上取字段，
+                     * 最终把 NULL 的 programId 解引用。
+                     */
                     device_response_publish_point(start_seq, 0, "Missing or invalid Data object in start_aging command");
                     ESP_LOGW(TAG, "start_aging command missing Data object, seq=%d", start_seq);
+                    goto cleanup;
                 }
                 cJSON *programId = cJSON_GetObjectItem(Data_obj, "ProgramId");
-                if (programId == NULL)
+                if (!cJSON_IsString(programId) || programId->valuestring == NULL)
                 {
+                    /*
+                     * 只判 NULL 不够：非字符串类型的 ProgramId 其 valuestring 同样为 NULL，
+                     * 直接取 valuestring 会崩溃。因此按类型 + 指针双重校验。
+                     */
                     device_response_publish_point(start_seq, 0, "Missing or invalid programId in start_aging command");
                     ESP_LOGW(TAG, "start_aging command missing programId, seq=%d", start_seq);
+                    goto cleanup;
                 }
                 aging_state_publish_ProgramId(programId->valuestring);
                 cJSON *recordId = cJSON_GetObjectItem(pRoot, "RecordId");
-                if (recordId)
+                if (cJSON_IsString(recordId) && recordId->valuestring != NULL)
                 {
                     // 清空RecordId
                     memset(RecordId, 0, sizeof(RecordId));
@@ -3303,6 +3313,11 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
         ESP_LOGW(TAG, "Invalid packet format");
     }
 
+/*
+ * 单一出口：命令解析中途因参数非法而提前退出时，
+ * 由 goto cleanup 跳转到这里统一释放，避免泄漏 pRoot / packet_copy。
+ */
+cleanup:
     cJSON_Delete(pRoot);
     free(packet_copy);
 }

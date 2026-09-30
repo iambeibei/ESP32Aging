@@ -206,3 +206,10 @@ AgingDeviceCheck → AgingAction → AgingComplete`，由 `Aging_Test_Task`
   在假定某段代码会运行、或动手"修复"它之前，先查 `SRCS`。
 - 大块内存分配优先使用 `heap_caps` / `app_malloc_prefer_psram`（见 `Tool/app_mem.c`）；
   此 ESP32-S3 带 PSRAM。
+
+<!-- embedded-coding-standard:init -->
+## Embedded Coding Standard
+
+- 本工程编码规范位于 `.ai/coding-standard.md`，这是项目本地规范权威。
+- 修改或审查嵌入式 C/C++ 代码前，先读取并遵守该文件；不要回退到 skill 内置模板。
+<!-- /embedded-coding-standard:init -->

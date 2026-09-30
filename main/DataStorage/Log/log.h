@@ -45,7 +45,12 @@ void storage_reset_cyclic_position(void);
 
 void print_logfatfs_usage(void);
 
-uint16_t log_get_offset(uint16_t index);
+/*
+ * 通过索引计算文件偏移。
+ * 返回类型必须是 uint32_t：index 最大为 MAX_RECORDS-1，乘以 RECORD_SIZE 后的
+ * 最大偏移已远超 uint16_t 上限，用 uint16_t 会在 index >= 512 处截断回绕。
+ */
+uint32_t log_get_offset(uint16_t index);
 
 void Get_Index_From_Flash(uint16_t index);//从flash中获取当前日志写入位置
 
