@@ -17,27 +17,10 @@ static esp_mqtt_client_handle_t s_client = NULL;
 static QueueHandle_t Topic_queue = NULL;
 static QueueHandle_t Data_queue = NULL;
 
-/*
- * ===== 老化指令(配方)可能很大，这里按"单条命令最大约16KB"来设计 =====
- * 数据流：esp-mqtt RX buffer ->(多次EVENT_DATA)-> Topic/Data 队列 -> 累积缓冲区
- * 任意一环太小，大命令都会被静默丢弃(现象：平台显示已下发，设备毫无反应)。
- *
- * 约束关系：
- *   1) MQTT_DATA_ITEM_CAPACITY 必须 <= 消费端 Databuf 大小 - 1(appTask.c 中的 char Databuf[1025])
- *   2) MQTT_DATA_QUEUE_LEN * MQTT_DATA_ITEM_CAPACITY 必须 > 单条命令大小
- *      (否则队列余量检查会判定为"放不下"而整条丢弃)
- *   3) MQTT_DATA_Cache(appTask.c) 必须 > 单条命令大小
- *   4) MQTT_BUFFER_SIZE 越大，一条命令被拆成的 EVENT_DATA 次数越少，队列压力越小
- * 当前配置：1024 * 24 = 24KB 队列容量，可容纳 1 条 ~23KB 的命令，或多条 1.5KB 命令并发。
- */
-#define MQTT_TOPIC_QUEUE_LEN 16
-#define MQTT_DATA_QUEUE_LEN 24
-#define MQTT_TOPIC_ITEM_CAPACITY 96
+#define MQTT_TOPIC_QUEUE_LEN 10
+#define MQTT_DATA_QUEUE_LEN 10
+#define MQTT_TOPIC_ITEM_CAPACITY 64
 #define MQTT_DATA_ITEM_CAPACITY 1024
-
-/* esp-mqtt 接收缓冲：要 >= 典型命令长度，避免一条命令被拆成太多次回调 */
-#define MQTT_BUFFER_SIZE 4096
-#define MQTT_OUT_BUFFER_SIZE 8192
 
 typedef struct
 {
@@ -293,61 +276,27 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
          * Only enqueue the topic for the first fragment; data fragments are
          * accumulated by app_MQTT_Rdata_handle().
          */
-        /*
-         * Topic 与 Data 分别放在两个队列里，必须严格 1:1 对齐。
-         * 原来 topic 超长/入队失败时直接 break，data 分片却照常入队，
-         * 消费端会拿"上一条消息的 topic"去解析这一条数据，造成命令错配。
-         * 现在的处理：topic 异常时也入队一个空 topic 占位，
-         * 让消费端明确丢弃这条消息，而不是错配。
-         */
-        /*
-         * 预检查队列余量：topic(1) + 本条消息的全部分片必须能一次全部放下，
-         * 否则整条消息都不要入队。放进一半会造成 topic/data 错位，
-         * 消费端会拿错 topic 去解析另一条命令的数据。
-         * 必须在 topic 入队之前检查，否则会留下一个没有 data 的孤立 topic。
-         */
-        int need_items = 1 + ((event->data_len + MQTT_DATA_ITEM_CAPACITY - 1) / MQTT_DATA_ITEM_CAPACITY);
-        if (event->current_data_offset == 0)
-        {
-            UBaseType_t avail_topic = uxQueueSpacesAvailable(Topic_queue);
-            UBaseType_t avail_data = uxQueueSpacesAvailable(Data_queue);
-            if (avail_topic < 1 || avail_data < (UBaseType_t)(need_items - 1))
-            {
-                ESP_LOGW(TAG,
-                         "MQTT RX queue nearly full, drop whole message: need=%d, avail_topic=%u, avail_data=%u",
-                         need_items, (unsigned)avail_topic, (unsigned)avail_data);
-                return ESP_OK;
-            }
-        }
-
-        if (event->current_data_offset == 0)
+        if (event->current_data_offset == 0 && event->topic != NULL && event->topic_len > 0)
         {
             mqtt_topic_msg_t topic_msg = {0};
             size_t topic_len = (size_t)event->topic_len;
 
-            if (event->topic == NULL || topic_len == 0)
-            {
-                ESP_LOGW(TAG, "MQTT publish without topic, enqueue empty topic placeholder");
-            }
-            else if (topic_len >= MQTT_TOPIC_ITEM_CAPACITY)
+            if (topic_len >= MQTT_TOPIC_ITEM_CAPACITY)
             {
                 ESP_LOGE(TAG,
-                         "MQTT topic is too long: %u, capacity=%u, drop this message",
+                         "MQTT topic is too long: %u, capacity=%u",
                          (unsigned)topic_len,
                          (unsigned)(MQTT_TOPIC_ITEM_CAPACITY - 1));
-                topic_len = 0;
+                break;
             }
-            else
-            {
-                memcpy(topic_msg.data, event->topic, topic_len);
-                topic_msg.data[topic_len] = '\0';
-                topic_msg.len = (uint16_t)topic_len;
-            }
+
+            memcpy(topic_msg.data, event->topic, topic_len);
+            topic_msg.data[topic_len] = '\0';
+            topic_msg.len = (uint16_t)topic_len;
 
             if (xQueueSend(Topic_queue, &topic_msg, pdMS_TO_TICKS(100)) != pdTRUE)
             {
-                ESP_LOGE(TAG, "Failed to enqueue MQTT topic, %u data fragment(s) will be dropped",
-                         (unsigned)((event->data_len + MQTT_DATA_ITEM_CAPACITY - 1) / MQTT_DATA_ITEM_CAPACITY));
+                ESP_LOGE(TAG, "Failed to enqueue MQTT topic");
                 break;
             }
         }
@@ -452,8 +401,8 @@ esp_err_t mqtt_app_start(void)
 
         },
         .buffer = {
-            .size = MQTT_BUFFER_SIZE,
-            .out_size = MQTT_OUT_BUFFER_SIZE,
+            .size = 1024,
+            .out_size = 8192,
         }
 
     };
@@ -512,7 +461,7 @@ int app_mqtt_publish(char *topic_name, char *publish_string, char *DEVICE_ID)
         ESP_LOGW(TAG, "MQTT is not connected. Cannot publish message.");
         return -1;
     }
-    char topic[128]; // topic 可能因 DeviceID/AgingNumber 变长，留足空间
+    char topic[64]; // 增大一点，确保空间足够
 
     // DEVICE_ID 是整数，要用 %d 格式符
     if (DEVICE_ID != NULL)
