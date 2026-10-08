@@ -14,6 +14,15 @@ idf.py -B build/mesh-lite -D SDKCONFIG=build/mesh-lite/sdkconfig build
 idf.py -B build/mesh-lite -D SDKCONFIG=build/mesh-lite/sdkconfig -p /dev/ttyUSB0 flash monitor
 ```
 
+若在 `ESP_MESH_LITE_DEFAULT_INIT()` 处报 `CONFIG_MESH_LITE_VENDOR_ID_0`、
+`CONFIG_MESH_LITE_ID` 或 `CONFIG_DEVICE_CATEGORY` 未定义，通常是当前编译配置未启用
+Mesh-Lite。这些宏由组件的 Kconfig 生成；`sdkconfig.defaults` 只在生成新配置时生效，
+不会覆盖另一台电脑上已有的 `sdkconfig`。先备份旧配置，再用上面的命令生成
+`build/mesh-lite/sdkconfig`；若该路径已经有旧配置，也需先备份它。检查新配置中有
+`CONFIG_BRIDGE_DATA_FORWARDING_NETIF_SOFTAP=y` 和 `CONFIG_MESH_LITE_ENABLE=y`。
+如果命令行编译成功而 VS Code 仍提示相同错误，应让 ESP-IDF 扩展重新使用该构建目录
+并刷新代码索引。
+
 如果独立 IDF worktree 中的子模块源码是从原 IDF 复制而来，且缺少子模块 Git 元数据，
 可在命令前加 `IDF_SKIP_CHECK_SUBMODULES=1`。这仅跳过元数据检查，子模块源码仍需齐全。
 `data/baseconfig.json` 会打包进 SPIFFS；修改它后必须执行完整 `flash`，

@@ -1,3 +1,10 @@
+if(NOT CMAKE_BUILD_EARLY_EXPANSION AND NOT CONFIG_MESH_LITE_ENABLE)
+    message(FATAL_ERROR
+        "Mesh-Lite is disabled in the active sdkconfig. Use ESP-IDF v5.4.4, "
+        "regenerate sdkconfig from sdkconfig.defaults, then rebuild. "
+        "See MESH_LITE_MIGRATION.md for the build command.")
+endif()
+
 idf_component_register(SRCS "main.c"
                             "Communication/Uart/Uart.c"
                             "Communication/RS485/RS485.c"
