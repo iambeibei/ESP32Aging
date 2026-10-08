@@ -20,6 +20,7 @@
 #include "ConfigData.h"
 #include "mesh.h"
 #include "esp_mac.h"
+#include "esp_random.h"
 #include "can_extended.h"
 #include "can_protocol_ext.h"
 #include "Externaldevice.h"
@@ -124,7 +125,7 @@ uint16_t s_new_pn_ready = 0;
  * AGING_CMD_RUNNING : PN和start_aging均已就绪，老化任务已经真正启动。
  *
  * 注意：PN_Code中即使残留旧PN，也不能据此判断下一轮是否可以启动；
- * 只有s_new_pn_ready == 1才表示PN_Code_Ready中存在“本轮新PN”。
+ * 只有s_new_pn_ready == 1才表示PN_Code_Ready中存在"本轮新PN"。
  */
 typedef enum
 {
@@ -173,7 +174,7 @@ const char *AgingDataName(const char *id);
 
 /*
  * 所有本项目业务任务统一固定到 CPU1。
- * ESP32-S3 双核调度器会自动启动 CPU1，不需要单独“开启”CPU1。
+ * ESP32-S3 双核调度器会自动启动 CPU1，不需要单独"开启"CPU1。
  */
 static BaseType_t create_cpu1_task(TaskFunction_t task_fn, const char *task_name, uint32_t stack_size, UBaseType_t priority, TaskHandle_t *task_handle)
 {
@@ -2224,7 +2225,29 @@ void app_ble_data_handle(void *arg)
 uint8_t CurentDevicenum = 0;
 uint8_t IsAgingDevice = 0; // 0表示不是老化设备，1表示是老化设备
 
-#define HTTP_DATA_Cache 1024 * 8
+#define HTTP_DATA_Cache (1024 * 32)
+
+/*
+ * 大包日志只看摘要：整包打印几十KB的JSON在115200波特率下要数秒，
+ * 期间接收任务无法继续消费队列，后面的命令会被挤掉。
+ */
+#define JSON_LOG_PREVIEW_LEN 192
+
+static void app_log_json_packet(const char *prefix, const char *json, int len)
+{
+    if (json == NULL || len <= 0)
+    {
+        return;
+    }
+    if (len <= JSON_LOG_PREVIEW_LEN)
+    {
+        ESP_LOGI(TAG, "%s (%d bytes): %s", prefix, len, json);
+    }
+    else
+    {
+        ESP_LOGI(TAG, "%s (%d bytes, truncated): %.*s ...", prefix, len, JSON_LOG_PREVIEW_LEN, json);
+    }
+}
 
 static esp_err_t import_scpi_protocol_to_device(Externaldevice *device, const char *json_text)
 {
@@ -2574,7 +2597,7 @@ static void app_HTTP_Rdata_handle(void *arg)
                     memset(json_str, 0, HTTP_DATA_Cache);
                 }
 
-                ESP_LOGI(TAG, "Complete JSON packet: %s", Databuf);
+                app_log_json_packet("Complete JSON packet", Databuf, datalen);
                 parse_jsonCommand_HTTP(Databuf, datalen);
             }
             else
@@ -2611,7 +2634,7 @@ static void app_HTTP_Rdata_handle(void *arg)
                     // 检查累积后是否完整
                     if (is_complete_packet(json_str, json_str_len))
                     {
-                        ESP_LOGI(TAG, "Accumulated complete JSON: %s", json_str);
+                        app_log_json_packet("Accumulated complete JSON", json_str, json_str_len);
                         parse_jsonCommand_HTTP(json_str, json_str_len);
                         json_str_len = 0;
                         memset(json_str, 0, HTTP_DATA_Cache);
@@ -2701,8 +2724,15 @@ static void app_HTTP_Auto_GetProtocol(void *arg)
 
 #pragma region MQTT命令与接收任务
 
-#define MQTT_DATA_Cache 1024 * 5
-#define MQTT_TOPIC_LEN 60
+/*
+ * ===== 下行命令缓冲容量 =====
+ * 老化配方 JSON 现已接近 1.5KB，且明确还会继续变大。
+ * 这里统一按"单条命令最大约16KB"留 2 倍余量，必须与 mqtt_app.c 中的
+ * MQTT_DATA_QUEUE_LEN / MQTT_DATA_ITEM_CAPACITY 配套调整，否则大命令会被截断丢弃。
+ * 注意 MQTT_DATA_Cache 由 app_malloc_prefer_psram() 分配，走 PSRAM，不占内部 SRAM。
+ */
+#define MQTT_DATA_Cache (1024 * 32)
+#define MQTT_TOPIC_LEN 96
 
 static const char *aging_cmd_state_name(AgingCommandState state)
 {
@@ -2782,7 +2812,7 @@ static void persist_ready_pn_state(void)
 }
 
 /*
- * 缓存一条“已经收到start_aging但还没有本轮新PN”的启动命令。
+ * 缓存一条"已经收到start_aging但还没有本轮新PN"的启动命令。
  * 这里只建立WAIT_PN状态，不把aging_valid写成1，也不主动上报agingStart。
  */
 static bool cache_pending_start_command(const char *aging_json, int start_seq)
@@ -2821,12 +2851,18 @@ static bool cache_pending_start_command(const char *aging_json, int start_seq)
     AgingLogActive = true;
     aging_runtime_log("Start aging command cached; waiting for a new PN, cmd_seq=%d", start_seq);
     ESP_LOGI(TAG, "start_aging cached, waiting for set_pn, seq=%d", start_seq);
+
+    /*
+     * 立刻上报"等待PN"状态：让平台第一次下发后就知道设备处于 WAIT_PN，
+     * 不必依赖 QoS1 重传来确认，避免大体积启动指令被反复重推。
+     */
+    aging_state_publish("agingWaitPn");
     return true;
 }
 
 /*
  * 使用PN_Code_Ready启动老化。
- * PN只有在aging_command_json_parse()成功创建老化任务后才被“消费”。
+ * PN只有在aging_command_json_parse()成功创建老化任务后才被"消费"。
  * 若初始化失败，PN_Code_Ready保持有效，服务器可以直接重发start_aging而无需重新扫码。
  */
 static bool start_aging_with_ready_pn(const char *aging_json, int start_seq)
@@ -3035,10 +3071,17 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                     {
                         /*
                          * QoS1或服务器重发可能带来相同Seq的重复消息。
-                         * 该命令仍处于WAIT_PN，不发送失败回复，避免服务器把“等待PN”误判为启动失败。
+                         * 该命令仍处于WAIT_PN，不发送失败回复，避免服务器把"等待PN"误判为启动失败。
                          * 真正启动后仍使用原始Seq只回复一次最终结果。
+                         *
+                         * 但也不能完全沉默：实测该场景下服务器收不到任何反馈，
+                         * 会持续按QoS1重传这条1.5KB的启动指令(现场日志里同一Seq被推了3次)，
+                         * 下行重传风暴又会反过来加剧mesh拥塞。
+                         * 这里补一条状态事件，明确告知"设备在线、正在等待PN"，
+                         * 服务器据此停止无限重传。
                          */
-                        ESP_LOGW(TAG, "Duplicate pending start_aging ignored, seq=%d", start_seq);
+                        ESP_LOGW(TAG, "Duplicate pending start_aging ignored, report WAIT_PN state, seq=%d", start_seq);
+                        aging_state_publish("agingWaitPn");
                     }
                     else
                     {
@@ -3337,7 +3380,11 @@ static void app_MQTT_Rdata_handle(void *arg)
     int json_str_len = 0; // 累积缓冲区长度
     char Databuf[1025] = {0};
     TickType_t last_recv_time = xTaskGetTickCount();      // 记录上次收到数据的时间
-    const TickType_t timeout_ticks = pdMS_TO_TICKS(2000); // 累积超时时间：2秒
+    /*
+     * 累积超时：原来2秒。大配方会被拆成多段，穿过mesh时每段都要经
+     * Root逐个节点P2P转发，2秒内收不全会被当作残包丢弃。这里放宽到8秒。
+     */
+    const TickType_t timeout_ticks = pdMS_TO_TICKS(8000); // 累积超时时间
 
     while (1)
     {
@@ -3361,7 +3408,7 @@ static void app_MQTT_Rdata_handle(void *arg)
                     memset(json_str, 0, MQTT_DATA_Cache);
                 }
 
-                ESP_LOGI(TAG, "Complete JSON packet: %s", Databuf);
+                app_log_json_packet("Complete JSON packet", Databuf, datalen);
                 parse_jsonCommand_MQTT(Databuf, datalen);
             }
             else
@@ -3399,7 +3446,7 @@ static void app_MQTT_Rdata_handle(void *arg)
                     if (is_complete_packet(json_str, json_str_len))
                     {
 
-                        ESP_LOGI(TAG, "Accumulated complete JSON: %s", json_str);
+                        app_log_json_packet("Accumulated complete JSON", json_str, json_str_len);
                         parse_jsonCommand_MQTT(json_str, json_str_len);
                         json_str_len = 0;
                         memset(json_str, 0, MQTT_DATA_Cache);
@@ -5407,7 +5454,7 @@ static void app_DataUpload_Functiong(const AgingUploadPacket *packet, int idnum)
      * 3) MQTT publish 被客户端接受后更新 pushed=1。
      *
      * 如果步骤2/3之间突然断电，SQLite仍保留 pushed=0，重启后最多重复补发一次，
-     * 不会出现“MQTT刚发出但SQLite还没来得及保存”的本地数据丢失窗口。
+     * 不会出现"MQTT刚发出但SQLite还没来得及保存"的本地数据丢失窗口。
      */
     int db_ret = InsertStructuredRecord(idnum,
                                         packet->pn,
@@ -5455,6 +5502,34 @@ static void app_DataUpload_Functiong(const AgingUploadPacket *packet, int idnum)
 }
 
 // 老化数据上传任务
+/*
+ * 上报错峰：
+ * 50个子节点如果按照完全相同的周期上报，会在同一时刻抢占Root的同一张radio，
+ * 上行队列瞬间堆积后又反过来拖垮下行(这是现场那种"全网一起掉"的诱因之一)。
+ * 这里给每台设备按MAC派生一个固定的错峰偏移(保证同一台设备的偏移稳定、可复现)，
+ * 再叠加一点随机抖动打散同构设备的相位。
+ */
+#define AGING_UPLOAD_SPREAD_MAX_MS 500U
+
+static void aging_upload_spread_delay(void)
+{
+    static uint16_t s_base_offset_ms = 0xFFFF;
+
+    if (s_base_offset_ms == 0xFFFF)
+    {
+        uint8_t mac[6] = {0};
+        uint16_t base = 0;
+        if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK)
+        {
+            base = (uint16_t)(((uint16_t)mac[4] << 8 | mac[5]) % (uint16_t)(AGING_UPLOAD_SPREAD_MAX_MS + 1U));
+        }
+        s_base_offset_ms = base;
+    }
+
+    uint32_t jitter = (uint32_t)(esp_random() % 100U); // 0~99ms 随机抖动
+    vTaskDelay(pdMS_TO_TICKS(s_base_offset_ms + jitter));
+}
+
 void app_AgingData_Upload_handle(void *arg)
 {
     int idnum = 0;
@@ -5499,6 +5574,9 @@ void app_AgingData_Upload_handle(void *arg)
                 ESP_LOGI(TAG, "New aging upload session: PN=%s, IDNUM starts from 0", packet->pn);
             }
         }
+
+        /* 上报前错峰，避免所有子节点同时抢占同一张radio */
+        aging_upload_spread_delay();
 
         app_DataUpload_Functiong(packet, idnum);
         idnum++;
@@ -5634,6 +5712,14 @@ void app_task_init(void)
 
     // 设置日志级别，后面注释掉
     esp_log_level_set("*", ESP_LOG_INFO);
+#if !MESH_QUEUE_LOG_ENABLE
+    /*
+     * 上面这句会把所有TAG重置成INFO，必须在这之后重新压制 ESP-MESH 内部的
+     * [TXQ]/[RXQ] 队列轮询日志；子节点越多打印越密，会白白吃掉Root的串口与CPU。
+     * 开关定义在 mesh.h 中的 MESH_QUEUE_LOG_ENABLE。
+     */
+    esp_log_level_set("mesh", ESP_LOG_WARN);
+#endif
 }
 
 #pragma endregion

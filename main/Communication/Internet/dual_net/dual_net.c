@@ -196,6 +196,16 @@ bool dual_net_is_mesh_switching(void)
 
 static void dual_net_start_wifi(void)
 {
+    /*
+     * Root 上不允许 dual_net 直接控制 WiFi：
+     * esp-mesh 的自组网本身就负责与外部router建链，外部再调 esp_wifi_connect()
+     * 会与之争抢扫描/连接状态机(现场日志里的 reason=106 scan fail 即由此而来)。
+     */
+    if (esp_mesh_is_root())
+    {
+        ESP_LOGD(TAG, "Root role active, skip esp_wifi_connect() (owned by esp-mesh)");
+        return;
+    }
 
     if (s_mesh_switching)
     {
@@ -356,7 +366,15 @@ static void dual_net_ip_event_handler(void *arg, esp_event_base_t event_base, in
     {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         wifi_up = true;
-        s_mesh_switching = false;
+        if (!esp_mesh_is_root())
+        {
+            /*
+             * 原来这里无条件清零抑制位，导致 Root 上 mesh 刚建立的
+             * "路由切换中"保护立刻失效，monitor任务随即又去 esp_wifi_connect()。
+             * Root 的抑制位只由 mesh 事件(PARENT_CONNECTED/DISCONNECTED)控制。
+             */
+            s_mesh_switching = false;
+        }
         wifi_connecting = false;
         wifi_auth_failed = false;
         s_wifi_state = WIFI_STATE_CONNECTED;
@@ -489,6 +507,16 @@ static void dual_net_monitor_task(void *arg)
     while (1)
     {
         check_counter++;
+
+        /*
+         * Root 上 WiFi 上行由 esp-mesh 自组网独占管理，
+         * 这里不要插手，否则会和 mesh 的 router 选举/扫描互相抢片。
+         */
+        if (esp_mesh_is_root())
+        {
+            vTaskDelay(10000 / portTICK_PERIOD_MS);
+            continue;
+        }
 
         // 只有当 Ethernet 还没有真正拿到 IP 时，WiFi 才作为 fallback 使用。
         // 注意：这里不能用 eth_link_up 判断，因为“插了网线但 DHCP 失败”时仍然需要 WiFi 继续兜底。
@@ -643,8 +671,13 @@ esp_err_t dual_net_init(void)
 
     s_wifi_state = WIFI_STATE_IDLE;
 
-    esp_err_t ret=ESP_FAIL;
-    ESP_LOGW(TAG, "Ethernet init failed, fallback to WiFi only");
+    /*
+     * 以太网初始化当前被整段注释掉，原来的 ret=ESP_FAIL 会让本函数恒定返回失败，
+     * 调用方(mesh.c)会误记一条 "dual_net_init failed"。
+     * 以太网未启用只应视为"降级到WiFi"，不算初始化失败。
+     */
+    esp_err_t ret = ESP_OK;
+    ESP_LOGW(TAG, "Ethernet disabled in current build, fallback to WiFi only");
     eth_up = false;
     eth_link_up = false;
     // 要改回来

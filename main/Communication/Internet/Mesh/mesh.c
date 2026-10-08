@@ -23,6 +23,7 @@
 #include "ConfigData.h"
 #include "esp_timer.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include "esp_netif_sntp.h"
 #include "esp_heap_caps.h"
@@ -30,6 +31,14 @@
 /*******************************************************
  *                Macros
  *******************************************************/
+
+/*
+ * esp_mesh_send() 的最长等待时间。
+ * 50个子节点场景下下行/上行都会出现瞬时拥塞，这个值越大，
+ * 单个不可达目标拖住整个发送链路的时间就越长。
+ * netif 的发送已经全部走 mesh_netif 里的独立 TX 任务，这里只需短等待。
+ */
+#define MESH_SEND_BLOCK_TIME_MS 500
 
 /*******************************************************
  *                Constants
@@ -166,15 +175,23 @@ static void recv_cb(mesh_addr_t *from, mesh_data_t *data)
     {
         // 原有路由表处理
         int size = data->size - 1;
-        if (s_route_table_lock == NULL || size % 6 != 0)
+        /*
+         * 必须校验长度上限：mesh单帧可携带近1.4KB数据，
+         * 而 s_route_table 只有 CONFIG_MESH_ROUTE_TABLE_SIZE*6 字节，
+         * 不校验会直接踩穿相邻全局变量，造成随机崩溃。
+         */
+        if (s_route_table_lock == NULL || size % 6 != 0 ||
+            size > (int)(CONFIG_MESH_ROUTE_TABLE_SIZE * 6))
         {
-            ESP_LOGE(MESH_TAG, "Error in receiving raw mesh data: Unexpected size");
+            ESP_LOGE(MESH_TAG,
+                     "Error in receiving raw mesh data: Unexpected size=%d, max=%d",
+                     size, (int)(CONFIG_MESH_ROUTE_TABLE_SIZE * 6));
             return;
         }
         xSemaphoreTake(s_route_table_lock, portMAX_DELAY);
         s_route_table_size = size / 6;
         // 获取当前路由表
-        memcpy(&s_route_table, data->data + 1, size); //
+        memcpy(s_route_table, data->data + 1, size); //
         xSemaphoreGive(s_route_table_lock);
         break;
     }
@@ -571,26 +588,51 @@ void cmd_broadcast(const char *message)
     data.data = data_to_send;
 
     int sent_count = 0;
-    xSemaphoreTake(s_route_table_lock, portMAX_DELAY);
 
-    for (int i = 0; i < s_route_table_size; i++)
+    /*
+     * 不能持锁做阻塞发送：esp_mesh_send() 最长可阻塞 esp_mesh_send_block_time()，
+     * 50个子节点里只要有几个不可达，这里就会锁住路由表数百秒，
+     * 期间 recv_cb(路由表更新) 与 Mesh_cmd_list() 全部挂死。
+     * 做法：先把路由表快照到本地，释放锁后再逐个发送。
+     */
+    mesh_addr_t *snapshot = calloc(CONFIG_MESH_ROUTE_TABLE_SIZE, sizeof(mesh_addr_t));
+    if (snapshot == NULL)
+    {
+        ESP_LOGE(MESH_TAG, "广播失败: 内存不足");
+        free(data_to_send);
+        return;
+    }
+
+    xSemaphoreTake(s_route_table_lock, portMAX_DELAY);
+    int snapshot_size = (s_route_table_size > CONFIG_MESH_ROUTE_TABLE_SIZE)
+                            ? CONFIG_MESH_ROUTE_TABLE_SIZE
+                            : s_route_table_size;
+    memcpy(snapshot, s_route_table, (size_t)snapshot_size * sizeof(mesh_addr_t));
+    xSemaphoreGive(s_route_table_lock);
+
+    for (int i = 0; i < snapshot_size; i++)
     {
         // 不给自己发送
-        if (MAC_ADDR_EQUAL(s_route_table[i].addr, my_mac))
+        if (MAC_ADDR_EQUAL(snapshot[i].addr, my_mac))
         {
             continue;
         }
 
-        esp_err_t err = esp_mesh_send(&s_route_table[i], &data, MESH_DATA_P2P, NULL, 0);
+        esp_err_t err = esp_mesh_send(&snapshot[i], &data, MESH_DATA_P2P, NULL, 0);
         if (err == ESP_OK)
         {
             sent_count++;
             ESP_LOGI("CMD", "广播到 [%d] " MACSTR " 成功",
-                     i, MAC2STR(s_route_table[i].addr));
+                     i, MAC2STR(snapshot[i].addr));
+        }
+        else
+        {
+            ESP_LOGW("CMD", "广播到 [%d] " MACSTR " 失败: %s",
+                     i, MAC2STR(snapshot[i].addr), esp_err_to_name(err));
         }
     }
 
-    xSemaphoreGive(s_route_table_lock);
+    free(snapshot);
 
     printf("广播完成: 已发送给 %d 个节点\n", sent_count);
     free(data_to_send);
@@ -722,14 +764,24 @@ static void refresh_root_ap_gateway(uint32_t gw_addr)
         return;
     }
 
-    // if (s_last_root_ap_gw == gw_addr)// 网关地址没有变化，不更新
-    // {
-    //     ESP_LOGI(MESH_TAG, "Root AP gateway unchanged, skip mesh_netif_start_root_ap");
-    //     return;
-    // }
+    /*
+     * 网关地址没有变化时不重建AP口。
+     * 重建会 destroy+create netif_ap，连同 DHCP 租约表和 NAPT 会话一起清空，
+     * 使所有子节点已经建立的 TCP 连接变成黑洞连接(只能等TCP RTO或MQTT keepalive)。
+     * 50个子节点时这个代价是全网级别的。
+     */
+    if (s_last_root_ap_gw == gw_addr && mesh_netif_root_ap_ready())
+    {
+        ESP_LOGD(MESH_TAG, "Root AP gateway unchanged (0x%08" PRIx32 "), keep existing netif", gw_addr);
+        return;
+    }
+
+    ESP_LOGI(MESH_TAG, "Root AP gateway changed: 0x%08" PRIx32 " -> 0x%08" PRIx32,
+             (uint32_t)s_last_root_ap_gw, (uint32_t)gw_addr);
 
     s_last_root_ap_gw = gw_addr;
-    esp_err_t ret = mesh_netif_start_root_ap(true, gw_addr);
+    /* 能走到这里说明网关确实变了，允许重建；平时一律复用，见上面的提前返回 */
+    esp_err_t ret = mesh_netif_start_root_ap(true, gw_addr, true);
     if (ret == ESP_OK)
     {
         start_sntp_sync_task();
@@ -754,6 +806,16 @@ static int router_switch_attempted = 1;
 static int noparentfountnum = 0;
 // 设备已经连接过标志
 static int RouterIsConnected = 0;
+
+/*
+ * Root外网链路(router)连续失败计数。
+ * 之前 Root 只要收到一次 PARENT_DISCONNECTED(reason=1 beacon timeout)就
+ * 立刻关闭自组网 + 断开WiFi + 换SSID，导致全网子节点在20多秒内全部掉线重连
+ * (日志：[IO]disable self-organizing<stop reconnect> ... 23s后 adaptive)。
+ * 50个子节点时这等于一次全网重启，且重连风暴会再次把Root打满。
+ * 现在的策略：先让 esp-mesh 自组网自己重试，累计到阈值才切换备用SSID。
+ */
+static uint8_t s_root_uplink_fail_count = 0;
 
 static void mesh_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
@@ -844,7 +906,8 @@ static void mesh_event_handler(void *arg, esp_event_base_t event_base, int32_t e
                 mesh_router_t router = {0};
                 router.ssid_len = list_router[wifinum].ssid_len;
                 memcpy((uint8_t *)&router.ssid, &list_router[wifinum].ssid, router.ssid_len);
-                memcpy((uint8_t *)&router.password, &list_router[wifinum].password, 8);
+                // 原来固定拷8字节：密码长度不是8时会截断或越界，改为按目标缓冲区大小拷贝
+                memcpy((uint8_t *)&router.password, &list_router[wifinum].password, sizeof(router.password));
                 esp_mesh_set_router(&router);
                 esp_mesh_set_self_organized(true, true);
             }
@@ -872,7 +935,8 @@ static void mesh_event_handler(void *arg, esp_event_base_t event_base, int32_t e
                 mesh_router_t router = {0};
                 router.ssid_len = list_router[wifinum].ssid_len;
                 memcpy((uint8_t *)&router.ssid, &list_router[wifinum].ssid, router.ssid_len);
-                memcpy((uint8_t *)&router.password, &list_router[wifinum].password, 8);
+                // 原来固定拷8字节：密码长度不是8时会截断或越界，改为按目标缓冲区大小拷贝
+                memcpy((uint8_t *)&router.password, &list_router[wifinum].password, sizeof(router.password));
                 esp_mesh_set_router(&router);
                 esp_mesh_set_self_organized(true, true);
             }
@@ -903,6 +967,7 @@ static void mesh_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         if (esp_mesh_is_root())
         {
             RouterIsConnected = 1;
+            s_root_uplink_fail_count = 0; // 外网链路恢复，重置失败计数
             dual_net_set_mesh_switching(true); // dual网卡WiFi关闭
 
             // 获取当前连接的WiFi
@@ -989,7 +1054,21 @@ static void mesh_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             mesh_layer = esp_mesh_get_layer();
             s_last_root_ap_gw = 0;
 
-            ESP_LOGW(MESH_TAG, "Root parent disconnected, switch to backup router but keep root mesh AP alive");
+            /*
+             * 关键改动：单次链路抖动不再触发"核选项"。
+             * 只要还没到阈值，就保持 self-organized=true，
+             * 让 esp-mesh 自己重连外部router —— 这段时间子树完全不受影响。
+             */
+            if (s_root_uplink_fail_count < ROOT_UPLINK_FAIL_BEFORE_SWITCH)
+            {
+                s_root_uplink_fail_count++;
+                ESP_LOGW(MESH_TAG,
+                         "Root uplink lost (%u/%d), keep self-organizing so children stay connected",
+                         (unsigned)s_root_uplink_fail_count, ROOT_UPLINK_FAIL_BEFORE_SWITCH);
+                break;
+            }
+
+            ESP_LOGW(MESH_TAG, "Root uplink retry limit reached, switch to backup router but keep root mesh AP alive");
 
             dual_net_set_mesh_switching(false);
 
@@ -1007,7 +1086,7 @@ static void mesh_event_handler(void *arg, esp_event_base_t event_base, int32_t e
                 },
             };
             memcpy(parent_config.sta.ssid, list_router[wifinum].ssid, list_router[wifinum].ssid_len);
-            memcpy(parent_config.sta.password, list_router[wifinum].password, 8);
+            memcpy(parent_config.sta.password, list_router[wifinum].password, sizeof(parent_config.sta.password));
 
             printf("Switching to backup WiFi #%d: %s\n", wifinum, list_router[wifinum].ssid);
 
@@ -1018,6 +1097,9 @@ static void mesh_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             {
                 wifinum = 0;
             }
+
+            // 已经换了SSID，重新从0开始累计失败次数
+            s_root_uplink_fail_count = 0;
         }
     }
     break;
@@ -1219,6 +1301,14 @@ static void show_free_heap(const char *tag)
 void mesh_init_Custom(void)
 {
     // 启动时设置日志级别
+#if !MESH_QUEUE_LOG_ENABLE
+    /*
+     * ESP-MESH 内部会以 INFO 级别周期性打印 [TXQ]/[RXQ] 队列状态，
+     * 子节点越多打印越密，白白占用Root的串口带宽与CPU时间。
+     * 业务代码自身的日志TAG不受影响。
+     */
+    esp_log_level_set("mesh", ESP_LOG_WARN);
+#endif
 
     // 获取flash配置中的wifi信息
 
@@ -1262,13 +1352,23 @@ void mesh_init_Custom(void)
     }
     else
     {
+#if MESH_ALLOW_BACKUP_ROOT
+        /* 允许本单位在Root失效时接管，避免全网单点故障 */
+        ESP_ERROR_CHECK(esp_mesh_fix_root(false));
+        ESP_LOGW(MESH_TAG, "This node is a backup MESH_ROOT candidate");
+#else
         ESP_ERROR_CHECK(esp_mesh_fix_root(true));
         ESP_LOGW(MESH_TAG, "This node is normal MESH_NODE");
+#endif
     }
 
     ESP_ERROR_CHECK(esp_mesh_set_ap_assoc_expire(10)); // 设置AP关联超时时间
-    /* set blocking time of esp_mesh_send() to 30s, to prevent the esp_mesh_send() from permanently for some reason */
-    ESP_ERROR_CHECK(esp_mesh_send_block_time(30000)); // 设置mesh_send()阻塞时间
+    /*
+     * 原来是 30000ms。现在所有经由 netif 的 mesh 发送都已改到独立的 TX 任务里执行，
+     * lwIP 线程不再直接发送，因此不需要这么长的阻塞；保留较短的等待时间即可，
+     * 既能容忍瞬时拥塞，又不会让 TX 任务被单个不可达目标长期拖住。
+     */
+    ESP_ERROR_CHECK(esp_mesh_send_block_time(MESH_SEND_BLOCK_TIME_MS)); // 设置mesh_send()阻塞时间
     mesh_cfg_t cfg = MESH_INIT_CONFIG_DEFAULT();
 #if !MESH_IE_ENCRYPTED
     cfg.crypto_funcs = NULL;
