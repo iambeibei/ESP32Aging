@@ -6,7 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 电池**老化（老化）测试网关**的 ESP-IDF 固件 —— "Light_Gateway"。设备驱动被测电池包执行多步充放电老化程序，
 从电池包及外接仪表采集测量值，将采样数据缓存到 flash 上的 SQLite，并通过 MQTT 上传。
-同时运行 ESP-WIFI-MESH 网络，由根节点将子节点桥接到云端。
+同时运行 ESP-Mesh-Lite 网络，每个取得 STA IP 的节点独立连接 MQTT。迁移与联调见
+`MESH_LITE_MIGRATION.md`。
 
 - **目标芯片：** ESP32-S3（8 MB flash），ESP-IDF **v5.4.4**
 - **CMake 工程名：** `Light_Gateway_UDP`（历史遗留名称；当前上行主链路是 MQTT）
@@ -20,15 +21,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 必须先 source ESP-IDF 环境（它会设置 `IDF_PATH`、工具链、Python 环境）：
 
 ```bash
-cd /home/wbb/espidf/esp-idf && . ./export.sh        # 或：get_idf
-cd /home/wbb/espidfProject/Light_Gateway_sqlite_fixed_v4
+cd /home/wbb/espidf/esp-idf-mesh-lite && . ./export.sh
+cd /home/wbb/espidfProject/ESP32Aging
 ```
 
 `IDF_PATH` 在普通 shell 中**未设置** —— 跳过 `export.sh` 这一步，`idf.py` 会直接失败。
 
 | 操作 | 命令 |
 |---|---|
-| 编译 | `idf.py build` |
+| 编译 | `IDF_SKIP_CHECK_SUBMODULES=1 idf.py -B build/mesh-lite -D SDKCONFIG=build/mesh-lite/sdkconfig build` |
 | 全量清理重编译 | `idf.py fullclean && idf.py build` |
 | 编译 + 烧录 | `idf.py -p /dev/ttyUSB0 flash` |
 | 仅烧录 app（保留数据） | `idf.py -p /dev/ttyUSB0 app-flash` |
@@ -200,10 +201,7 @@ AgingDeviceCheck → AgingAction → AgingComplete`，由 `Aging_Test_Task`
   请贴合所在文件的局部风格，而不是强行统一。
 - `main.c` 刻意保持近乎空白；初始化逻辑应放在 `app_task_init()` 中。
 - 栈大小与优先级应以 `LG_*` 常量形式放在 `task_config.h` 中。
-- 部分代码虽已失效但仍有上下文价值：`mesh_UartCommand`
-  （[appTask.c:1092](main/Task/appTask.c#L1092)）被标注为未使用（"现在不使用"），`udp_client.c`
-  **不在** `SRCS` 中（因此活跃的 uplink 是 `GetProto.c`/MQTT），`unmount_fatfs_storage()` 没有调用方。
-  在假定某段代码会运行、或动手"修复"它之前，先查 `SRCS`。
+- 在假定某段代码会运行、或动手"修复"它之前，先查 `SRCS`。
 - 大块内存分配优先使用 `heap_caps` / `app_malloc_prefer_psram`（见 `Tool/app_mem.c`）；
   此 ESP32-S3 带 PSRAM。
 

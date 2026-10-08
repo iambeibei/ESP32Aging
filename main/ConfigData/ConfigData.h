@@ -24,9 +24,7 @@ extern char *Chanel_R;
 extern char *UDP_Port_R;
 extern char *SERVER_UDP_Port_R;
 extern  char *AgingNumber;
-extern uint8_t MESH_ID[6];
-
-extern uint8_t Network_Flag;
+extern volatile uint8_t Network_Flag;
 
 
 #ifdef __cplusplus

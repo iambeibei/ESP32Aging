@@ -1,0 +1,3 @@
+dependencies:
+  espressif/mesh_lite: "==1.0.2"
+  espressif/iot_bridge: "==1.0.1"

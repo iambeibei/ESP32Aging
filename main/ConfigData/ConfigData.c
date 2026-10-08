@@ -24,7 +24,7 @@ char *SSID1=NULL;
 char *WIFI_PS=NULL;
 char *WIFI_PS1=NULL;
 
-/// @brief Mesh网络ID，必须是6字节的十六进制字符串，如 "11:22:33:44:55:66"
+/// @brief Mesh-Lite 网络ID，两位十六进制字符串，如 "66"
 char *Mesh_ID=NULL;
 
 /// @brief Mesh网络密码
@@ -46,8 +46,6 @@ char *Chanel_R= NULL;
 char *UDP_Port_R=NULL;
 char *SERVER_UDP_Port_R=NULL;
 
-uint8_t MESH_ID[6]; // 6字节的Mesh ID，所有节点必须相同才能加入同一个网络
-
 
 
 
@@ -59,4 +57,4 @@ uint8_t MESH_ID[6]; // 6字节的Mesh ID，所有节点必须相同才能加入�
 
 
 // 网络标志位
-uint8_t Network_Flag = 0; // 0=未连接，1=已连接
+volatile uint8_t Network_Flag = 0; // 0=本机无 STA IP，1=本机已取得 STA IP

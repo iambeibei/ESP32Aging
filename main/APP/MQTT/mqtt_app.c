@@ -409,10 +409,18 @@ esp_err_t mqtt_app_start(void)
 
     ESP_LOGI(TAG, "Starting MQTT client...");
     s_client = esp_mqtt_client_init(&mqtt_cfg);
+    free(json);
+    if (s_client == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to initialize MQTT client");
+        return ESP_ERR_NO_MEM;
+    }
     esp_err_t ret = esp_mqtt_client_register_event(s_client, ESP_EVENT_ANY_ID, mqtt_event_handler, s_client);
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to register MQTT event handler: %s", esp_err_to_name(ret));
+        esp_mqtt_client_destroy(s_client);
+        s_client = NULL;
         return ret;
     }
 
@@ -420,6 +428,8 @@ esp_err_t mqtt_app_start(void)
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to start MQTT client: %s", esp_err_to_name(ret));
+        esp_mqtt_client_destroy(s_client);
+        s_client = NULL;
         return ret;
     }
 
@@ -428,6 +438,7 @@ esp_err_t mqtt_app_start(void)
 
 void mqtt_app_stop(void)
 {
+    s_mqtt_connected = false;
     if (s_client)
     {
         esp_mqtt_client_stop(s_client);

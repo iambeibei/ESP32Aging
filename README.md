@@ -8,7 +8,7 @@
 
 
 
-{"Cmd":"ChangeConfig","Value":{"IsRoot":"1","SSID":"wbb","WIFI_PS":"88888888","SSID1":"de-dev-2.4","WIFI_PS1":"88888888","Chanel":"0","Mesh_ID":"11:22:33:44:55:66","Mesh_PS":"123456789","UDP_ID":"100000000","UDP_Port":"50000","SERVER_IP":"10.189.204.56","SERVER_UDP_Port":"8080"},"ExternalDevices":[{"Name":"device0","ID":12,"Communication":"RS485","Proto":"SCPI"},{"Name":"","ID":0,"Communication":"Bluetooth","Proto":"ModBus"}]}
+{"Cmd":"ChangeConfig","Value":{"IsRoot":"1","SSID":"wbb","WIFI_PS":"88888888","SSID1":"de-dev-2.4","WIFI_PS1":"88888888","Chanel":"0","Mesh_ID":"66","Mesh_PS":"123456789","UDP_ID":"100000000","UDP_Port":"1","SERVER_IP":"10.189.204.56","SERVER_UDP_Port":"8080"},"ExternalDevices":[{"Name":"device0","ID":12,"Communication":"RS485","Proto":"SCPI"},{"Name":"","ID":0,"Communication":"Bluetooth","Proto":"ModBus"}]}
 
 
 

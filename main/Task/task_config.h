@@ -30,9 +30,6 @@
 #define LG_STACK_CAN_RX            3072
 #define LG_PRIO_CAN_RX             11
 
-#define LG_STACK_MESH_RX           3072
-#define LG_PRIO_MESH_RX            11
-
 /* ---------------- 老化及应用业务任务 ---------------- */
 #define LG_STACK_AGING_CTRL        8192
 #define LG_PRIO_AGING_CTRL         8
@@ -55,9 +52,6 @@
 #define LG_STACK_NET_INIT          8192
 #define LG_PRIO_NET_INIT           6
 
-#define LG_STACK_UDP_RX            3072
-#define LG_PRIO_UDP_RX             6
-
 #define LG_STACK_HTTP_AUTO         3072
 #define LG_PRIO_HTTP_AUTO          4
 
@@ -66,6 +60,9 @@
 
 #define LG_STACK_SNTP              4096
 #define LG_PRIO_SNTP               4
+
+#define LG_STACK_MESH_FAILOVER     4096
+#define LG_PRIO_MESH_FAILOVER      5
 
 #define LG_STACK_NET_MONITOR       3072
 #define LG_PRIO_NET_MONITOR        3

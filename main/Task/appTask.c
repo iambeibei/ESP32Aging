@@ -907,45 +907,6 @@ static bool copy_string_checked(char *dst, size_t dst_size, const char *src)
     return true;
 }
 
-/**
- * 将MAC地址字符串转换为字节数组
- * @param mac_str 输入字符串，格式如 "11:22:33:44:55:66" 或 "11-22-33-44-55-66"
- * @param mac_bytes 输出字节数组，至少6字节
- * @return true=成功, false=失败
- */
-int mac_string_to_bytes(const char *mac_str)
-{
-    if (mac_str == NULL)
-    {
-
-        return 0;
-    }
-    // 临时存储解析的值
-    unsigned int bytes[6];
-    // 使用sscanf解析，支持冒号或短横线分隔
-    int result = sscanf(mac_str, "%02x:%02x:%02x:%02x:%02x:%02x",
-                        &bytes[0], &bytes[1], &bytes[2],
-                        &bytes[3], &bytes[4], &bytes[5]);
-    if (result != 6)
-    {
-        // 尝试用短横线格式
-        result = sscanf(mac_str, "%02x-%02x-%02x-%02x-%02x-%02x",
-                        &bytes[0], &bytes[1], &bytes[2],
-                        &bytes[3], &bytes[4], &bytes[5]);
-    }
-    if (result != 6)
-    {
-        printf("Failed to parse MAC address: %s", mac_str);
-        return 0;
-    }
-    // 转换为uint8_t
-    for (int i = 0; i < 6; i++)
-    {
-        MESH_ID[i] = (uint8_t)bytes[i];
-    }
-    return 1;
-}
-
 static void json_get_string_to_buf(cJSON *root,
                                    const char *key,
                                    char *buf,
@@ -1002,7 +963,7 @@ static esp_err_t load_baseconfig_json(void)
     json_get_string_to_buf(root, "SSID1", cfg_SSID1, sizeof(cfg_SSID1), "default");
     json_get_string_to_buf(root, "WIFI_PS1", cfg_WIFI_PS1, sizeof(cfg_WIFI_PS1), "default");
     json_get_string_to_buf(root, "Chanel", cfg_Chanel, sizeof(cfg_Chanel), "0");
-    json_get_string_to_buf(root, "Mesh_ID", cfg_Mesh_ID, sizeof(cfg_Mesh_ID), "11:22:33:44:55:66");
+    json_get_string_to_buf(root, "Mesh_ID", cfg_Mesh_ID, sizeof(cfg_Mesh_ID), "66");
     json_get_string_to_buf(root, "Mesh_PS", cfg_Mesh_PS, sizeof(cfg_Mesh_PS), "123456789");
 
     // 新配置字段叫 DEVICE_ID，兼容读取旧字段 UDP_ID 作为兜底。
@@ -1033,7 +994,6 @@ static esp_err_t load_baseconfig_json(void)
     Chanel_R = cfg_Chanel;
 
     Mesh_ID = cfg_Mesh_ID;
-    mac_string_to_bytes(Mesh_ID);
 
     Mesh_PS = cfg_Mesh_PS;
     DEVICE_ID = cfg_DEVICE_ID;
@@ -1195,433 +1155,6 @@ static esp_err_t readconfig()
 #pragma endregion
 
 #pragma region UART配置命令与接收任务
-// 命令处理任务，现在不使用
-static void mesh_UartCommand(char *line)
-{
-
-    uint8_t target_mac[6];
-
-    esp_mesh_get_routing_table((mesh_addr_t *)&s_route_table, CONFIG_MESH_ROUTE_TABLE_SIZE * 6, &s_route_table_size);
-
-    // 1. 创建本地缓冲区，复制原始数据
-    char local_line[256]; // 根据最大命令长度调整
-    if (strlen(line) >= sizeof(local_line))
-    {
-        printf("错误: 命令太长\n");
-
-        return;
-    }
-    strcpy(local_line, line); // 复制到本地缓冲区
-
-    // 解析命令
-    char *cmd = strtok(local_line, " ");
-    char *arg1 = strtok(NULL, " ");
-    char *arg2 = strtok(NULL, "");
-
-    if (cmd == NULL)
-    {
-        // 空命令
-    }
-    // === 原有命令 ===
-    else if (strcmp(cmd, "list") == 0)
-    {
-        Mesh_cmd_list();
-    }
-    else if (strcmp(cmd, "info") == 0)
-    {
-        Mesh_cmd_info();
-    }
-    else if (strcmp(cmd, "send") == 0)
-    {
-        if (arg1 && arg2)
-        {
-            if (Mesh_parse_mac_address(arg1, target_mac))
-            {
-                cmd_send(target_mac, arg2);
-            }
-            else
-            {
-                printf("错误: MAC地址格式无效\n");
-            }
-        }
-        else
-        {
-            printf("用法: send <MAC> <消息>\n");
-            printf("示例: send 64:e8:33:46:20:2c hello\n");
-        }
-    }
-    else if (strcmp(cmd, "broadcast") == 0)
-    {
-        if (arg1)
-        {
-            cmd_broadcast(arg1);
-        }
-        else
-        {
-            printf("用法: broadcast <消息>\n");
-        }
-    }
-
-    // === 蓝牙本地命令 ===
-    else if (strcmp(cmd, "ble_scan") == 0)
-    {
-        int scan_time = 10; // 默认10秒
-        if (arg1 != NULL)
-        {
-            scan_time = atoi(arg1);
-            if (scan_time <= 0 || scan_time > 30)
-            {
-                scan_time = 10;
-            }
-        }
-        printf("开始BLE扫描 %d 秒...\n", scan_time);
-        ble_start_scan(scan_time);
-    }
-    else if (strcmp(cmd, "ble_list") == 0)
-    {
-        ble_device_info_t devices[20];
-        int count = ble_get_scanned_devices(devices, 20);
-
-        if (count == 0)
-        {
-            printf("没有扫描到BLE设备，请先执行 ble_scan\n");
-        }
-        else
-        {
-            printf("\n=== BLE设备列表 (%d个) ===\n", count);
-            for (int i = 0; i < count; i++)
-            {
-                printf("[%d] %s\n", i + 1, devices[i].name);
-                printf("    地址: " ESP_BD_ADDR_STR "\n",
-                       ESP_BD_ADDR_HEX(devices[i].bda));
-                printf("    信号: %d dBm\n", devices[i].rssi);
-                printf("    状态: %s\n\n",
-                       devices[i].is_connected ? "已连接" : "可用");
-            }
-        }
-    }
-    else if (strcmp(cmd, "ble_connect") == 0)
-    {
-        if (arg1 == NULL)
-        {
-            printf("用法: ble_connect <设备名称>\n");
-            printf("示例: ble_connect TemperatureSensor\n");
-        }
-        else
-        {
-            printf("正在连接BLE设备: %s\n", arg1);
-            ble_connect_by_name(arg1);
-        }
-    }
-    else if (strcmp(cmd, "ble_send") == 0)
-    {
-        if (arg1 == NULL)
-        {
-            printf("用法: ble_send_hex <十六进制数据>\n");
-            printf("示例: ble_send_hex 010607DB00013945\n");
-            printf("       ble_send_hex 0102030405\n");
-        }
-        else if (!ble_is_connected())
-        {
-            printf("错误: 没有连接到任何BLE设备\n");
-        }
-        else
-        {
-            // 将十六进制字符串转换为二进制数据
-            uint8_t hex_data[128];
-            int hex_len = 0;
-            char *hex_str = arg1;
-            char full_hex[256];
-
-            // 如果还有arg2，组合完整的十六进制字符串
-            if (arg2 != NULL)
-            {
-                snprintf(full_hex, sizeof(full_hex), "%s%s", arg1, arg2);
-                hex_str = full_hex;
-            }
-
-            // 移除空格
-            char clean_hex[256];
-            int clean_idx = 0;
-            for (int i = 0; hex_str[i] != '\0' && i < 256; i++)
-            {
-                if (hex_str[i] != ' ' && hex_str[i] != '-')
-                {
-                    clean_hex[clean_idx++] = hex_str[i];
-                }
-            }
-            clean_hex[clean_idx] = '\0';
-
-            // 检查长度是否为偶数
-            int str_len = strlen(clean_hex);
-            if (str_len % 2 != 0)
-
-            {
-                printf("错误: 十六进制字符串长度必须为偶数\n");
-            }
-            else
-            {
-                // 转换十六进制字符串到字节数组
-                for (int i = 0; i < str_len && hex_len < sizeof(hex_data); i += 2)
-                {
-                    char byte_str[3] = {clean_hex[i], clean_hex[i + 1], 0};
-                    hex_data[hex_len++] = strtol(byte_str, NULL, 16);
-                }
-
-                if (hex_len > 0)
-                {
-                    printf("发送十六进制数据 (%d 字节): ", hex_len);
-                    for (int i = 0; i < hex_len; i++)
-                    {
-                        printf("%02x ", hex_data[i]);
-                    }
-                    printf("\n");
-                    ble_send_data(hex_data, hex_len, 0);
-                }
-            }
-        }
-    }
-    else if (strcmp(cmd, "ble_status") == 0)
-    {
-        printf("\n=== BLE状态 ===\n");
-        printf("扫描状态: %s\n", ble_is_scanning() ? "扫描中" : "空闲");
-        printf("连接状态: %s\n", ble_is_connected() ? "已连接" : "未连接");
-
-        if (ble_is_connected())
-        {
-            printf("连接的设备: %s\n", ble_get_connected_device_name());
-            uint8_t bda[6];
-            if (ble_get_connected_device_addr(bda))
-            {
-                printf("设备地址: " ESP_BD_ADDR_STR "\n",
-                       ESP_BD_ADDR_HEX(bda));
-            }
-        }
-
-        ble_device_info_t devices[20];
-        int count = ble_get_scanned_devices(devices, 20);
-        printf("已扫描设备: %d个\n", count);
-    }
-    else if (strcmp(cmd, "ble_disconnect") == 0)
-    {
-        if (ble_is_connected())
-        {
-            printf("正在断开BLE连接...\n");
-            ble_disconnect();
-        }
-        else
-        {
-            printf("当前没有连接的BLE设备\n");
-        }
-    }
-    // === 远程蓝牙命令 ===
-    else if (strcmp(cmd, "rble_scan") == 0)
-    {
-        if (arg1 == NULL)
-        {
-            printf("用法: rble_scan <目标MAC>\n");
-            printf("示例: rble_scan 64:e8:33:46:20:78\n");
-        }
-        else if (parse_mac_address(arg1, target_mac))
-        {
-            uint8_t msg[2] = {CMD_BLE_SCAN_START, 10};
-            send_mesh_message(target_mac, msg, sizeof(msg));
-            printf("已发送BLE扫描命令到 " MACSTR "\n", MAC2STR(target_mac));
-        }
-        else
-        {
-            printf("错误: MAC地址格式无效\n");
-        }
-    }
-    else if (strcmp(cmd, "rble_connect") == 0)
-    {
-        if (arg1 == NULL || arg2 == NULL)
-        {
-            printf("用法: rble_connect <目标MAC> <设备名称>\n");
-            printf("示例: rble_connect 64:e8:33:46:20:78 TemperatureSensor\n");
-        }
-        else
-        {
-            // arg1是MAC，arg2是设备名
-            char *mac_str = arg1;
-            char *dev_name = arg2;
-
-            if (parse_mac_address(mac_str, target_mac))
-            {
-                uint8_t msg[64];
-                int name_len = strlen(dev_name);
-                msg[0] = CMD_BLE_CONNECT;
-                msg[1] = name_len;
-                memcpy(msg + 2, dev_name, name_len);
-
-                send_mesh_message(target_mac, msg, 2 + name_len);
-                printf("已发送BLE连接命令到 " MACSTR " 设备: %s\n",
-                       MAC2STR(target_mac), dev_name);
-            }
-            else
-            {
-                printf("错误: MAC地址格式无效\n");
-            }
-        }
-    }
-    else if (strcmp(cmd, "rble_send") == 0)
-    {
-        if (arg1 == NULL || arg2 == NULL)
-        {
-            printf("用法: rble_send_hex <目标MAC> <十六进制数据>\n");
-            printf("示例: rble_send_hex 64:e8:33:46:20:78 010607DB00013945\n");
-        }
-        else
-        {
-            // arg1是MAC，arg2是十六进制数据
-            char *mac_str = arg1;
-            char *hex_str = arg2;
-
-            if (parse_mac_address(mac_str, target_mac))
-            {
-                // 转换十六进制字符串为二进制数据
-                uint8_t hex_data[128];
-                int hex_len = 0;
-                int str_len = strlen(hex_str);
-
-                // 移除空格
-                char clean_hex[256];
-                int clean_idx = 0;
-                for (int i = 0; hex_str[i] != '\0' && i < 256; i++)
-                {
-                    if (hex_str[i] != ' ' && hex_str[i] != '-')
-                    {
-                        clean_hex[clean_idx++] = hex_str[i];
-                    }
-                }
-                clean_hex[clean_idx] = '\0';
-
-                // 转换
-                str_len = strlen(clean_hex);
-                if (str_len % 2 == 0)
-                {
-                    for (int i = 0; i < str_len && hex_len < sizeof(hex_data); i += 2)
-                    {
-                        char byte_str[3] = {clean_hex[i], clean_hex[i + 1], 0};
-                        hex_data[hex_len++] = strtol(byte_str, NULL, 16);
-                    }
-
-                    uint8_t msg[256];
-                    msg[0] = CMD_BLE_SEND_DATA;
-                    msg[1] = hex_len;
-                    memcpy(msg + 2, hex_data, hex_len);
-
-                    send_mesh_message(target_mac, msg, 2 + hex_len);
-                    printf("已发送BLE十六进制命令到 " MACSTR ", %d 字节\n",
-                           MAC2STR(target_mac), hex_len);
-                }
-                else
-                {
-                    printf("错误: 十六进制字符串长度必须为偶数\n");
-                }
-            }
-            else
-            {
-                printf("错误: MAC地址格式无效\n");
-            }
-        }
-    }
-    else if (strcmp(cmd, "rble_status") == 0)
-    {
-        if (arg1 == NULL)
-        {
-            printf("用法: rble_status <目标MAC>\n");
-            printf("示例: rble_status 64:e8:33:46:20:78\n");
-        }
-        else if (parse_mac_address(arg1, target_mac))
-        {
-            uint8_t msg[1] = {CMD_BLE_STATUS};
-            send_mesh_message(target_mac, msg, sizeof(msg));
-            printf("已发送BLE状态查询命令到 " MACSTR "\n", MAC2STR(target_mac));
-        }
-        else
-        {
-            printf("错误: MAC地址格式无效\n");
-        }
-    }
-    // === 帮助命令 ===
-    else if (strcmp(cmd, "help") == 0)
-    {
-        printf("\n╔══════════════════════════════════════════════════════════════════╗\n");
-        printf("║                    Mesh网络控制台命令手册                          ║\n");
-        printf("╚══════════════════════════════════════════════════════════════════╝\n");
-
-        printf("\n📡 【Mesh网络命令】\n");
-        printf("  ┌─────────────────────────────────────────────────────────────────┐\n");
-        printf("  │ list                    - 显示Mesh路由表                        │\n");
-        printf("  │ info                    - 显示本机Mesh节点信息                  │\n");
-        printf("  │ send <MAC> <消息>       - 向指定MAC地址节点发送消息              │\n");
-        printf("  │ broadcast <消息>        - 向所有Mesh节点广播消息                │\n");
-        printf("  │ netstat                 - 显示网络状态（以太网/WiFi）           │\n");
-        printf("  └─────────────────────────────────────────────────────────────────┘\n");
-
-        printf("\n🔵 【本地蓝牙(BLE)命令】\n");
-        printf("  ┌─────────────────────────────────────────────────────────────────┐\n");
-        printf("  │ ble_scan [秒数]         - 扫描BLE设备（默认10秒，最大30秒）     │\n");
-        printf("  │ ble_list                - 列出已扫描到的BLE设备                 │\n");
-        printf("  │ ble_connect <设备名>    - 连接指定名称的BLE设备                 │\n");
-        printf("  │ ble_send <十六进制数据> - 向已连接的BLE设备发送数据              │\n");
-        printf("  │ ble_status              - 显示本地BLE状态（扫描/连接/设备）      │\n");
-        printf("  │ ble_disconnect          - 断开当前BLE连接                       │\n");
-        printf("  └─────────────────────────────────────────────────────────────────┘\n");
-
-        printf("\n🌐 【远程蓝牙命令（通过Mesh网络控制其他节点）】\n");
-        printf("  ┌─────────────────────────────────────────────────────────────────┐\n");
-        printf("  │ rble_scan <目标MAC>     - 让指定节点扫描BLE设备                 │\n");
-        printf("  │ rble_connect <目标MAC> <设备名> - 让指定节点连接BLE设备         │\n");
-        printf("  │ rble_send <目标MAC> <十六进制数据> - 让指定节点发送BLE数据      │\n");
-        printf("  │ rble_status <目标MAC>   - 查询指定节点的BLE状态                 │\n");
-        printf("  └─────────────────────────────────────────────────────────────────┘\n");
-
-        printf("\n⚙️ 【配置命令（通过串口JSON）】\n");
-        printf("  ┌─────────────────────────────────────────────────────────────────┐\n");
-        printf("  │ Readconfig              - 读取并返回当前配置（JSON格式）        │\n");
-        printf("  │ Change{...}             - 修改配置（JSON格式，需完整包）        │\n");
-        printf("  └─────────────────────────────────────────────────────────────────┘\n");
-
-        printf("\n💡 【使用示例】\n");
-        printf("  ┌─────────────────────────────────────────────────────────────────┐\n");
-        printf("  │ 1. 查看路由表:              list                                │\n");
-        printf("  │ 2. 广播消息:                broadcast hello                     │\n");
-        printf("  │ 3. 单播消息:                send 64:e8:33:46:20:2c hello        │\n");
-        printf("  │ 4. 本地扫描BLE:             ble_scan 15                         │\n");
-        printf("  │ 5. 列出BLE设备:             ble_list                            │\n");
-        printf("  │ 6. 连接BLE设备:             ble_connect TempSensor              │\n");
-        printf("  │ 7. 发送BLE数据:             ble_send 010607DB00013945           │\n");
-        printf("  │ 8. 远程控制扫描:            rble_scan 64:e8:33:46:20:78        │\n");
-        printf("  │ 9. 远程查询状态:            rble_status 64:e8:33:46:20:78      │\n");
-        printf("  │10. 查看网络状态:            netstat                             │\n");
-        printf("  └─────────────────────────────────────────────────────────────────┘\n");
-
-        printf("\n📝 【注意事项】\n");
-        printf("  • MAC地址格式: XX:XX:XX:XX:XX:XX (十六进制，不区分大小写)\n");
-        printf("  • 十六进制数据: 连续字符串如 010203AABB，支持空格分隔\n");
-        printf("  • 远程命令需要目标节点在线且Mesh网络连通\n");
-        printf("  • BLE扫描时间建议5-15秒，过长会占用较多资源\n");
-        printf("  • 发送JSON配置时需保证数据包完整\n");
-
-        printf("\n═══════════════════════════════════════════════════════════════════\n");
-    }
-
-    else if (strcmp(cmd, "netstat") == 0)
-    {
-        printf("\n=== 网络状态 ===\n");
-        printf("活跃接口: %s\n", dual_net_get_active_interface());
-        printf("以太网: %s\n", dual_net_is_ethernet_active() ? "已连接" : "断开");
-        printf("WiFi: %s\n", wifi_up ? "已连接" : "断开");
-        printf("WiFi认证失败: %s\n", wifi_auth_failed ? "是" : "否");
-    }
-    else
-    {
-        printf("未知命令: %s (输入 help 查看可用命令)\n", cmd);
-    }
-}
-
 static void send_read_config_to_uart(void)
 {
     char *json_str = CreateReadConfigJsonFromFiles();
@@ -3440,7 +2973,7 @@ static void app_MQTT_Rdata_handle(void *arg)
 
 #pragma region 网络就绪与断电恢复
 
-// 根据网络状态初始化MQTT和HTTP数据处理任务(子节点启动)
+// 本机取得 STA IP 后启动 MQTT；仅子节点再启动 HTTP 与老化业务。
 void Init_ByNetwork_Flag(void *arg)
 {
     while (1)
@@ -3448,31 +2981,41 @@ void Init_ByNetwork_Flag(void *arg)
         if (Network_Flag == 1)
         {
             esp_err_t err = mqtt_init();
-            if (err == ESP_ERR_NO_MEM)
+            if (err != ESP_OK)
             {
                 storage_write_record_cyclic(current_log_pn(), "Failed to initialize MQTT");
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
             }
-            else
+            err = mqtt_app_start();
+            if (err != ESP_OK)
             {
-                err = mqtt_app_start();
-                if (err != ESP_OK)
-                {
-                    storage_write_record_cyclic(current_log_pn(), "Failed to start MQTT");
-                }
-                else
-                {
-                    create_cpu1_task(app_MQTT_Rdata_handle,
-                                     "mqtt_rx",
-                                     LG_STACK_MQTT_RX,
-                                     LG_PRIO_MQTT_RX,
-                                     &s_mqtt_rx_task_handle);
-                }
+                storage_write_record_cyclic(current_log_pn(), "Failed to start MQTT");
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+            if (create_cpu1_task(app_MQTT_Rdata_handle,
+                                 "mqtt_rx",
+                                 LG_STACK_MQTT_RX,
+                                 LG_PRIO_MQTT_RX,
+                                 &s_mqtt_rx_task_handle) != pdPASS)
+            {
+                storage_write_record_cyclic(current_log_pn(), "Failed to create MQTT receive task");
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+
+            if (IsRoot == 1)
+            {
+                break;
             }
 
             err = Http_init();
-            if (err == ESP_ERR_NO_MEM)
+            if (err != ESP_OK)
             {
                 storage_write_record_cyclic(current_log_pn(), "Failed to initialize HTTP");
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
             }
             else
             {
@@ -5562,20 +5105,17 @@ void app_task_init(void)
     ESP_LOGI(TAG, "Configuration loaded successfully");
     Device_Init(&read_devices, read_device_count); // 初始化设备
 
-    // UDP_Port作为一个开关，配置上位机修改之后才启动
+    // UDP_Port 是历史配置键，目前仍作为联网功能开关。
     if (UDP_Port == 1)
     {
-        mesh_init_Custom(); // 重新初始化Mesh网络以应用新的配置
-        if (IsRoot == 0)    // 子节点才运行MQTT/HTTP/老化相关业务任务
+        esp_err_t mesh_err = mesh_init_Custom();
+        if (mesh_err != ESP_OK)
         {
-            // printf("我是子节点\n");
-            //  初始化上传数据队列
-            Upload_data_queue = xQueueCreate(3, sizeof(AgingUploadPacket *));
-            if (Upload_data_queue == NULL)
-            {
-                // ESP_LOGE(TAG, "data queue create failed");
-                storage_write_record_cyclic(current_log_pn(), "Upload_data_queue create failed!");
-            }
+            ESP_LOGE(TAG, "Mesh-Lite init failed: %s", esp_err_to_name(mesh_err));
+            storage_write_record_cyclic(current_log_pn(), "Mesh-Lite init failed");
+        }
+        else
+        {
             ret1 = create_cpu1_task(Init_ByNetwork_Flag,
                                     "net_init",
                                     LG_STACK_NET_INIT,
@@ -5585,39 +5125,22 @@ void app_task_init(void)
             {
                 storage_write_record_cyclic(current_log_pn(), "Init_ByNetwork_Flag create failed!");
             }
-            ret1 = create_cpu1_task(app_AgingData_Upload_handle,
-                                    "aging_upload",
-                                    LG_STACK_AGING_UPLOAD,
-                                    LG_PRIO_AGING_UPLOAD,
-                                    &s_aging_upload_task_handle);
-            if (ret1 != pdPASS)
+
+            if (IsRoot == 0)
             {
-                // ESP_LOGE(TAG, "app_AgingData_Upload_handle create failed");
-                storage_write_record_cyclic(current_log_pn(), "app_AgingData_Upload_handle create failed!");
-            }
-        }
-        else if (IsRoot == 1)
-        {
-            vTaskDelay(pdMS_TO_TICKS(5000)); // 等待网络初始化完成
-            esp_err_t err = mqtt_init();
-            if (err == ESP_ERR_NO_MEM)
-            {
-                storage_write_record_cyclic(current_log_pn(), "Failed to initialize MQTT");
-            }
-            else
-            {
-                err = mqtt_app_start();
-                if (err != ESP_OK)
+                Upload_data_queue = xQueueCreate(3, sizeof(AgingUploadPacket *));
+                if (Upload_data_queue == NULL)
                 {
-                    storage_write_record_cyclic(current_log_pn(), "Failed to start MQTT");
+                    storage_write_record_cyclic(current_log_pn(), "Upload_data_queue create failed!");
                 }
-                else
+                ret1 = create_cpu1_task(app_AgingData_Upload_handle,
+                                        "aging_upload",
+                                        LG_STACK_AGING_UPLOAD,
+                                        LG_PRIO_AGING_UPLOAD,
+                                        &s_aging_upload_task_handle);
+                if (ret1 != pdPASS)
                 {
-                    create_cpu1_task(app_MQTT_Rdata_handle,
-                                     "mqtt_rx",
-                                     LG_STACK_MQTT_RX,
-                                     LG_PRIO_MQTT_RX,
-                                     &s_mqtt_rx_task_handle);
+                    storage_write_record_cyclic(current_log_pn(), "app_AgingData_Upload_handle create failed!");
                 }
             }
         }
