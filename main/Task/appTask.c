@@ -19,6 +19,7 @@
 #include "app_enc.h"
 #include "ConfigData.h"
 #include "mesh.h"
+#include "dual_net.h"
 #include "esp_mac.h"
 #include "can_extended.h"
 #include "can_protocol_ext.h"
@@ -5116,6 +5117,21 @@ void app_task_init(void)
         }
         else
         {
+            /*
+             * dual_net 仅根节点需要：只有根节点才有「外部路由器 / 网线」这类真实上行，
+             * 子节点的上行由 mesh 父节点经 NAPT 提供。必须在 mesh_init_Custom() 成功之后调用，
+             * 否则取不到 esp_bridge 创建的 WIFI_STA_DEF 句柄。
+             */
+            if (IsRoot == 1)
+            {
+                esp_err_t dn_err = dual_net_init();
+                if (dn_err != ESP_OK)
+                {
+                    ESP_LOGE(TAG, "dual_net init failed: %s", esp_err_to_name(dn_err));
+                    storage_write_record_cyclic(current_log_pn(), "dual_net_init failed");
+                }
+            }
+
             ret1 = create_cpu1_task(Init_ByNetwork_Flag,
                                     "net_init",
                                     LG_STACK_NET_INIT,

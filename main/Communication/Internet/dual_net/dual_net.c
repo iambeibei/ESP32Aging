@@ -4,11 +4,16 @@
 #include "esp_log.h"
 #include "esp_event.h"
 #include "esp_netif.h"
-#include "esp_eth.h"
 #include "esp_wifi.h"
-#include "esp_mesh.h"
+/* esp_eth.h / esp_eth_netif_glue.h 只提供类型与 glue 声明，不产生硬件占用，常驻包含 */
+#include "esp_eth.h"
+#include "esp_eth_netif_glue.h"
+#if DUAL_NET_ETH_HW_ENABLE
+/* 以下头文件只有真正初始化 KSZ8851SNL 硬件时才需要 */
+#include "esp_eth_mac_spi.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
+#endif
 #include "dual_net.h"
 #include "task_config.h"
 // 添加这些头文件来解决 IP4_ADDR 错误
@@ -20,7 +25,9 @@
 static const char *TAG = "dual_net";
 static const char *UART = "Uart";
 
+#if DUAL_NET_ETH_HW_ENABLE
 static esp_eth_handle_t eth_handle = NULL;
+#endif
 static esp_netif_t *eth_netif = NULL;
 static esp_netif_t *wifi_netif = NULL;
 
@@ -39,6 +46,9 @@ static bool s_dual_net_initialized = false;
 // 网络就绪回调
 static network_ready_cb_t s_network_ready_callback = NULL;
 
+// 上行变化回调（预留，供后续接管网卡切换的业务订阅）
+static dual_net_uplink_cb_t s_uplink_change_callback = NULL;
+
 typedef enum
 {
     WIFI_STATE_IDLE,
@@ -50,7 +60,9 @@ typedef enum
 
 static wifi_state_t s_wifi_state = WIFI_STATE_IDLE; // 当前 WiFi 状态
 
+#if DUAL_NET_ETH_HW_ENABLE
 static esp_eth_netif_glue_handle_t s_eth_glue = NULL; // 以太网网桥句柄
+#endif
 
 /// @brief 打印以太网 IP 地址
 /// @param prefix
@@ -77,6 +89,7 @@ static void dump_eth_ip(const char *prefix)
     }
 }
 
+#if DUAL_NET_ETH_HW_ENABLE
 static void dual_net_set_valid_eth_mac(void)
 {
     uint8_t wifi_sta_mac[6];
@@ -103,6 +116,7 @@ static void dual_net_set_valid_eth_mac(void)
 
     ESP_LOGI(TAG, "Forced ETH MAC: " MACSTR, MAC2STR(readback));
 }
+#endif /* DUAL_NET_ETH_HW_ENABLE */
 
 /// @brief 检查网络是否就绪
 /// @param
@@ -116,20 +130,36 @@ static void check_network_ready(void)
     }
 }
 
+/// @brief 上行发生变化时通知订阅者（预留回调，可能在事件上下文调用）
+/// @param uplink 变化后的上行类型
+static void dual_net_notify_uplink_change(dual_net_uplink_t uplink)
+{
+    if (s_uplink_change_callback != NULL)
+    {
+        s_uplink_change_callback(uplink);
+    }
+}
+
 /// @brief 更新默认路由
 /// @param
 static void dual_net_update_route(void)
 {
-    static const char *s_last_active = "NONE";
+    static dual_net_uplink_t s_last_uplink = DUAL_NET_UPLINK_NONE;
+    dual_net_uplink_t new_uplink = DUAL_NET_UPLINK_NONE;
     const char *new_active = "NONE";
+
     if (eth_up && eth_netif)
     {
+#if DUAL_NET_ENABLE_ROUTE_CONTROL
         esp_netif_set_default_netif(eth_netif); // 设置默认网卡
+#endif
+        new_uplink = DUAL_NET_UPLINK_ETH;
         new_active = "ETHERNET";
-        if (strcmp(s_last_active, new_active) != 0)
+        if (s_last_uplink != new_uplink)
         {
-            ESP_LOGI(TAG, "✓ Default route -> Ethernet (Priority 1)");
-            s_last_active = new_active;
+            ESP_LOGI(TAG, "✓ Default route -> Ethernet (Priority 1), active=%s", new_active);
+            s_last_uplink = new_uplink;
+            dual_net_notify_uplink_change(new_uplink);
         }
         check_network_ready();
         return;
@@ -137,12 +167,16 @@ static void dual_net_update_route(void)
 
     if (wifi_up && wifi_netif)
     {
+#if DUAL_NET_ENABLE_ROUTE_CONTROL
         esp_netif_set_default_netif(wifi_netif); // 设置默认网卡
+#endif
+        new_uplink = DUAL_NET_UPLINK_WIFI;
         new_active = "WIFI";
-        if (strcmp(s_last_active, new_active) != 0)
+        if (s_last_uplink != new_uplink)
         {
-            ESP_LOGI(TAG, "⚠ Default route -> WiFi (Priority 2 - Fallback)");
-            s_last_active = new_active;
+            ESP_LOGI(TAG, "⚠ Default route -> WiFi (Priority 2 - Fallback), active=%s", new_active);
+            s_last_uplink = new_uplink;
+            dual_net_notify_uplink_change(new_uplink);
         }
         check_network_ready();
         return;
@@ -157,10 +191,11 @@ static void dual_net_update_route(void)
         ESP_LOGW(TAG, "WiFi is up but wifi_netif is NULL");
     }
 
-    if (strcmp(s_last_active, "NONE") != 0)
+    if (s_last_uplink != DUAL_NET_UPLINK_NONE)
     {
         ESP_LOGW(TAG, "✗ No available uplink");
-        s_last_active = "NONE";
+        s_last_uplink = DUAL_NET_UPLINK_NONE;
+        dual_net_notify_uplink_change(DUAL_NET_UPLINK_NONE);
     }
 }
 
@@ -214,18 +249,27 @@ static void dual_net_start_wifi(void)
     {
         return;
     }
+
+#if !DUAL_NET_ENABLE_WIFI_FALLBACK
+    /*
+     * 默认不主动 esp_wifi_connect()：Mesh-Lite 自行管理 STA 与父节点选择，
+     * 外部强连会打断自组织入网流程。打开 DUAL_NET_ENABLE_WIFI_FALLBACK 后才允许。
+     */
+    ESP_LOGD(TAG, "WiFi 兜底连接未开启，跳过 esp_wifi_connect()");
+    return;
+#else
     ESP_LOGI(TAG, "Starting WiFi uplink connection...");
     esp_err_t err = esp_wifi_connect();
     if (err == ESP_OK)
     {
         wifi_connecting = true;
         s_wifi_state = WIFI_STATE_CONNECTING;
-        // esp_mesh_set_self_organized(true, true);
     }
     else
     {
         ESP_LOGW(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(err));
     }
+#endif
 }
 
 static void dual_net_refresh_wifi_ip_state(void)
@@ -283,11 +327,7 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base, int32_t ev
         ESP_LOGI(TAG, "Ethernet Link Down");
         eth_link_up = false;
         eth_up = false;
-        if (!wifi_up)
-        {
-            Network_Flag = 0;
-            esp_mesh_post_toDS_state(false);
-        }
+        /* Network_Flag 的唯一写入者是 mesh.c:network_event_handler()，此处不再改写它 */
 
         dual_net_update_route();
         if (!wifi_up && !wifi_connecting && !wifi_auth_failed)
@@ -316,19 +356,21 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base, int32_t ev
     }
 }
 
-// dual_net.c 新增
+/*
+ * 通知全局网络状态。
+ *
+ * Network_Flag 的唯一权威写入者是 mesh.c:network_event_handler()（STA 取得/丢失 IP 时置位）。
+ * 为杜绝两个写者竞争同一全局量，这里默认不再写 Network_Flag；只有显式打开
+ * DUAL_NET_ENABLE_ROUTE_CONTROL 后，dual_net 才接管该标志。
+ */
 static void dual_net_notify_network_state(bool any_up)
 {
-    Network_Flag = any_up ? 1 : 0;
-    if (any_up)
-    {
-        esp_mesh_post_toDS_state(true);
-    }
-
-    if (any_up)
-    {
-        // 也可以在这里请求重新连接 UDP / MQTT 等
-    }
+#if DUAL_NET_ENABLE_ROUTE_CONTROL
+    Network_Flag = any_up ? 1U : 0U;
+    ESP_LOGI(TAG, "Network_Flag <- %u (dual_net 接管路由控制)", (unsigned)Network_Flag);
+#else
+    ESP_LOGD(TAG, "网络状态变化 any_up=%d，路由控制未开启，不改写 Network_Flag", (int)any_up);
+#endif
 }
 
 static void dual_net_ip_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
@@ -420,11 +462,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
 
         wifi_connecting = false;
         wifi_up = false;
-        if (!eth_up)
-        {
-            Network_Flag = 0;
-            esp_mesh_post_toDS_state(false);
-        }
+        /* Network_Flag 的唯一写入者是 mesh.c:network_event_handler()，此处不再改写它 */
 
         // Ethernet 已经工作时，WiFi 对 mesh 的扫描失败不应该刷屏
         if (eth_up && disconn->reason == WIFI_REASON_NO_AP_FOUND)
@@ -494,18 +532,18 @@ static void dual_net_monitor_task(void *arg)
         // 注意：这里不能用 eth_link_up 判断，因为“插了网线但 DHCP 失败”时仍然需要 WiFi 继续兜底。
         if (!eth_up && !wifi_up && !wifi_connecting && !wifi_auth_failed && s_wifi_state == WIFI_STATE_IDLE)
         {
-            if (check_counter % 3 == 0)
-            { // 每 30 秒尝试一次
+            if (check_counter % LG_DUAL_NET_WIFI_RETRY_INTERVAL == 0)
+            {
                 ESP_LOGI(TAG, "No Ethernet IP, attempting WiFi connection...");
                 dual_net_start_wifi();
             }
         }
 
-        // 认证失败时，5分钟后重试
+        // 认证失败后按轮询次数重试，达到上限才复位标志（有退出条件，不会无限等待）
         if (wifi_auth_failed)
         {
             auth_fail_counter++;
-            if (auth_fail_counter >= 30)
+            if (auth_fail_counter >= LG_DUAL_NET_AUTH_RETRY_MAX_COUNT)
             {
                 ESP_LOGI(TAG, "Retrying WiFi connection (previous auth failure)");
                 wifi_auth_failed = false;
@@ -521,11 +559,24 @@ static void dual_net_monitor_task(void *arg)
             auth_fail_counter = 0;
         }
 
-        vTaskDelay(10000 / portTICK_PERIOD_MS); // 每 10 秒检查一次网络状态
+#if DUAL_NET_ENABLE_WIFI_FALLBACK
+        vTaskDelay(LG_DUAL_NET_MONITOR_ACTIVE_PERIOD_MS / portTICK_PERIOD_MS);
+#else
+        /* 仅观察模式下无实际动作，降频到 60 秒一次，避免日志刷屏 */
+        vTaskDelay(LG_DUAL_NET_MONITOR_IDLE_PERIOD_MS / portTICK_PERIOD_MS);
+#endif
     }
 }
 
-/// @brief 初始化 Ethernet
+#if DUAL_NET_ETH_HW_ENABLE
+/*
+ * 初始化 Ethernet（KSZ8851SNL over SPI2）。
+ *
+ * 注意：此处用 esp_netif_new(ESP_NETIF_DEFAULT_ETH()) 自建 netif，绕过了 IoT-Bridge 的
+ * NAPT/DHCP 注册，仅适用于「本机当终端」场景。若要让以太网承担根节点上行并转发子节点流量，
+ * 需改为 esp_bridge_create_eth_netif() + esp_bridge_netif_list_add()，
+ * 详见 DUAL_NET_DESIGN.md 的「有线接入改造清单」。
+ */
 /// @param
 /// @return
 static esp_err_t dual_net_eth_init(void)
@@ -556,9 +607,9 @@ static esp_err_t dual_net_eth_init(void)
 
     spi_device_interface_config_t devcfg = {
         .mode = 0,
-        .clock_speed_hz = 5 * 1000 * 1000,
-        .spics_io_num = 16,
-        .queue_size = 20,
+        .clock_speed_hz = LG_DUAL_NET_ETH_SPI_CLK_HZ,
+        .spics_io_num = SPI_CSPIN,
+        .queue_size = LG_DUAL_NET_ETH_SPI_QUEUE_SIZE,
     };
 
     eth_ksz8851snl_config_t ksz_config =
@@ -619,77 +670,109 @@ static esp_err_t dual_net_eth_init(void)
     ESP_LOGI(TAG, "Ethernet prepared successfully");
     return ESP_OK;
 }
+#endif /* DUAL_NET_ETH_HW_ENABLE */
 
 esp_err_t dual_net_init(void)
 {
+#if !DUAL_NET_ENABLE
+    ESP_LOGI(TAG, "dual_net 总开关关闭，不初始化");
+    return ESP_OK;
+#endif
+
+#if DUAL_NET_ROOT_ONLY
+    /*
+     * 根节点专属模块：只有根节点才有「外部路由器 / 网线」这类真实上行。
+     * 子节点的上行由 mesh 父节点经 NAPT 提供，dual_net 对它无意义，
+     * 必须零代码运行——不注册事件处理器、不创建监控任务、不触碰 ETH。
+     * 此处为兜底判断，主防线在 appTask.c 的调用点。
+     */
+    if (IsRoot != 1)
+    {
+        ESP_LOGI(TAG, "非根节点，dual_net 不启用（上行由 mesh 父节点提供）");
+        return ESP_OK;
+    }
+#endif
+
     if (s_dual_net_initialized)
     {
         ESP_LOGW(TAG, "dual_net_init already done, skip");
         return ESP_OK;
     }
-    s_dual_net_initialized = true;
 
-    ESP_LOGI(TAG, "=== Dual Network Init (Ethernet Priority Mode) ===");
+    ESP_LOGI(TAG, "=== Dual Network Init (Ethernet Priority Mode, root only) ===");
 
-    // 获取 WiFi STA netif 句柄
+    // 获取 WiFi STA netif 句柄；必须在 esp_bridge_create_all_netif() 之后才能取到
     wifi_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    if (wifi_netif==NULL)
+    if (wifi_netif == NULL)
     {
-        //ESP_LOGW(TAG, "Failed to get WiFi_STA_DEF netif");
         storage_write_record_cyclic("", "Failed to get WiFi_STA_DEF netif");
         return ESP_FAIL;
     }
 
-
+    s_dual_net_initialized = true;
     s_wifi_state = WIFI_STATE_IDLE;
-
-    esp_err_t ret=ESP_FAIL;
-    ESP_LOGW(TAG, "Ethernet init failed, fallback to WiFi only");
     eth_up = false;
     eth_link_up = false;
-    // 要改回来
 
-    // ret = dual_net_eth_init();
-    // if (ret != ESP_OK)
-    // {
-    //     //ESP_LOGW(TAG, "Ethernet init failed, fallback to WiFi only");
-    //     storage_write_record_cyclic("", "Ethernet init failed, fallback to WiFi only");
-    //     eth_up = false;
-    //     eth_link_up = false;
-    // }
+#if DUAL_NET_ETH_HW_ENABLE
+    esp_err_t ret = dual_net_eth_init();
+    if (ret != ESP_OK)
+    {
+        storage_write_record_cyclic("", "Ethernet init failed, fallback to WiFi only");
+        eth_up = false;
+        eth_link_up = false;
+    }
+#endif
 
     // 注册以太网事件处理器
-    ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT,
-                                               ESP_EVENT_ANY_ID,
-                                               &eth_event_handler,
-                                               NULL));
+    esp_err_t reg_err = esp_event_handler_register(ETH_EVENT,
+                                                   ESP_EVENT_ANY_ID,
+                                                   &eth_event_handler,
+                                                   NULL);
+    if (reg_err != ESP_OK)
+    {
+        storage_write_record_cyclic("", "dual_net register ETH_EVENT handler failed");
+        return reg_err;
+    }
 
     // 注册 IP 事件处理器，监听以太网和 WiFi 的 IP 获取和丢失事件
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT,
-                                               ESP_EVENT_ANY_ID,
-                                               &dual_net_ip_event_handler,
-                                               NULL));
+    reg_err = esp_event_handler_register(IP_EVENT,
+                                         ESP_EVENT_ANY_ID,
+                                         &dual_net_ip_event_handler,
+                                         NULL);
+    if (reg_err != ESP_OK)
+    {
+        storage_write_record_cyclic("", "dual_net register IP_EVENT handler failed");
+        return reg_err;
+    }
 
     // 注册 WiFi 事件处理器，监控连接状态和认证失败等事件
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT,
-                                               ESP_EVENT_ANY_ID,
-                                               &wifi_event_handler,
-                                               NULL));
+    reg_err = esp_event_handler_register(WIFI_EVENT,
+                                         ESP_EVENT_ANY_ID,
+                                         &wifi_event_handler,
+                                         NULL);
+    if (reg_err != ESP_OK)
+    {
+        storage_write_record_cyclic("", "dual_net register WIFI_EVENT handler failed");
+        return reg_err;
+    }
 
-    // if (eth_handle)
-    // {
-    //     ret = esp_eth_start(eth_handle);
-    //     if (ret != ESP_OK)
-    //     {
-    //         //ESP_LOGE(TAG, "esp_eth_start failed: %s", esp_err_to_name(ret));
-    //         storage_write_record_cyclic("","esp_eth_start failed");
-    //         return ret;
-    //     }
-    //     else
-    //     {
-    //         ESP_LOGI(TAG, "Ethernet started");
-    //     }
-    // }
+#if DUAL_NET_ETH_HW_ENABLE
+    if (eth_handle != NULL)
+    {
+        esp_err_t start_err = esp_eth_start(eth_handle);
+        if (start_err != ESP_OK)
+        {
+            storage_write_record_cyclic("", "esp_eth_start failed");
+        }
+        else
+        {
+            ESP_LOGI(TAG, "Ethernet started");
+        }
+    }
+#else
+    ESP_LOGI(TAG, "以太网硬件未启用（DUAL_NET_ETH_HW_ENABLE=0），仅观察 WiFi 上行");
+#endif
 
     BaseType_t ret1 = xTaskCreatePinnedToCore(dual_net_monitor_task,
                                                "net_monitor",
@@ -698,9 +781,8 @@ esp_err_t dual_net_init(void)
                                                LG_PRIO_NET_MONITOR,
                                                NULL,
                                                LG_APP_CPU_CORE);
-    if (ret1!=pdPASS)
+    if (ret1 != pdPASS)
     {
-        //ESP_LOGE(TAG, "Failed to create dual_net_monitor_task");
         storage_write_record_cyclic("", "Failed to create dual_net_monitor_task");
         return ESP_FAIL;
     }
@@ -712,7 +794,7 @@ esp_err_t dual_net_init(void)
         check_network_ready();
     }
 
-    return ret;
+    return ESP_OK;
 }
 
 void dual_net_notify_wifi_up(void)
@@ -791,4 +873,67 @@ void dual_net_register_ready_callback(network_ready_cb_t callback)
         callback();
         s_network_ready_callback = NULL;
     }
+}
+
+dual_net_uplink_t dual_net_get_active_uplink(void)
+{
+    /* 以太网优先、WiFi 兜底：同一时刻只承认一条上行 */
+    if (eth_up)
+    {
+        return DUAL_NET_UPLINK_ETH;
+    }
+    if (wifi_up)
+    {
+        return DUAL_NET_UPLINK_WIFI;
+    }
+    return DUAL_NET_UPLINK_NONE;
+}
+
+esp_netif_t *dual_net_get_uplink_netif(dual_net_uplink_t uplink)
+{
+    switch (uplink)
+    {
+    case DUAL_NET_UPLINK_ETH:
+        return eth_up ? eth_netif : NULL;
+    case DUAL_NET_UPLINK_WIFI:
+        return wifi_up ? wifi_netif : NULL;
+    case DUAL_NET_UPLINK_NONE:
+    default:
+        return NULL;
+    }
+}
+
+/*
+ * 预留：手动选择上行链路。
+ * 当前以太网硬件默认不启用，且路由控制默认关闭，因此不具备切换条件；
+ * 打开 DUAL_NET_ENABLE_ROUTE_CONTROL 后在此实现真正的网卡切换。
+ */
+esp_err_t dual_net_select_uplink(dual_net_uplink_t uplink)
+{
+#if !DUAL_NET_ENABLE_ROUTE_CONTROL
+    (void)uplink;
+    ESP_LOGW(TAG, "路由控制未开启，不支持手动切换上行");
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    esp_netif_t *target = dual_net_get_uplink_netif(uplink);
+    if (target == NULL)
+    {
+        ESP_LOGW(TAG, "目标上行不可用或尚未就绪：uplink=%d", (int)uplink);
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t err = esp_netif_set_default_netif(target);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "切换默认网卡失败：%s", esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGI(TAG, "上行已切换为 %s", dual_net_get_active_interface());
+    return ESP_OK;
+#endif
+}
+
+void dual_net_register_uplink_change_cb(dual_net_uplink_cb_t callback)
+{
+    s_uplink_change_callback = callback;
+    ESP_LOGI(TAG, "上行变化回调已%s", callback != NULL ? "注册" : "取消");
 }

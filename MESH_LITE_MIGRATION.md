@@ -44,14 +44,28 @@ Mesh-Lite。这些宏由组件的 Kconfig 生成；`sdkconfig.defaults` 只在�
   重启试连，取得 IP 才保存所选路由器并再次重启。若连接失败，最多试连两次，随后等待 5 分钟再尝试，
   避免持续重启。本地 Mesh-Lite 在上游离线时继续组网。
 
-## 以太网上行状态
+## 以太网上行状态（已改造）
 
-`main/Communication/Internet/dual_net/dual_net.c/h` 保留了原有 KSZ8851SNL
-硬件初始化和网卡切换代码，当前不参与编译。旧实现中的 Ethernet 初始化与启动原本就被注释，
-且含 `esp_mesh_post_toDS_state()` 等 ESP-WIFI-MESH API，不能直接加入 Mesh-Lite 构建。
-当前固件只使用 Wi-Fi STA 上行，`Network_Flag` 也只跟踪 STA IP。
-IoT-Bridge 1.0.1 提供 Ethernet 作为外网接口的配置；后续启用时需要改造
-Ethernet 驱动初始化、桥接接口选择、ETH IP 事件和根节点路由切换，并在硬件上验证。
+`main/Communication/Internet/dual_net/dual_net.c/h` 已剔除 `esp_mesh.h` 与
+`esp_mesh_post_toDS_state()` 等 ESP-WIFI-MESH 遗留依赖，改造为 Mesh-Lite 兼容版本，
+并已加入 `main/CMakeLists.txt` 参与编译。
+
+**作用范围：仅根节点。** `appTask.c` 中 `mesh_init_Custom()` 成功之后，只有 `IsRoot == 1`
+才调用 `dual_net_init()`；`dual_net_init()` 内部还有一道 `IsRoot != 1` 兜底判断。
+子节点**零代码运行**——不注册事件处理器、不创建监控任务、不触碰 ETH。
+（这与历史 ESP-WIFI-MESH 版本的 `if (mesh_layer == 1)` 判定一致。）
+
+**默认行为：只观察、不改路由。** 三级能力门控全部默认关闭副作用
+（`DUAL_NET_ETH_HW_ENABLE=0`、`DUAL_NET_ENABLE_ROUTE_CONTROL=0`、
+`DUAL_NET_ENABLE_WIFI_FALLBACK=0`）。因此：
+
+- 不初始化 KSZ8851SNL 硬件，不占用 SPI2_HOST 与 GPIO；
+- 不调用 `esp_netif_set_default_netif()`，不破坏 IoT-Bridge 的 NAPT 转发链；
+- 不主动 `esp_wifi_connect()`，不打断 Mesh-Lite 自组织的父节点选择；
+- **不写 `Network_Flag`** —— 该标志的唯一写入者仍是 `mesh.c` 的 `network_event_handler()`。
+
+当前固件仍只使用 Wi-Fi STA 上行，子节点入网与 MQTT 行为不变。
+设计细节、配置项与后续有线接入改造清单见 `DUAL_NET_DESIGN.md`。
 
 ## 实机验收
 
