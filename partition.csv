@@ -7,4 +7,7 @@ ota_0,  app,  ota_0, 0x10000, 0x240000,
 ota_1,  app,  ota_1,        , 0x240000,
 storage,  data, spiffs,  ,     0x40000,
 data_storage, data, fat, ,     0x260000,
-log_storage, data, fat, ,      0x50000,
+log_storage, data, fat, ,      0x40000,
+# Diagnostics: core dump partition for the LoadProhibited crash on mesh scan retry.
+# Appended at the end so all existing partition offsets stay unchanged.
+coredump,    data, coredump, , 0x10000,

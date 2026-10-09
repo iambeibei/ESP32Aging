@@ -11,6 +11,7 @@
 #include "esp_check.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_mesh_lite.h"
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
@@ -24,6 +25,14 @@
 #include "mesh.h"
 #include "task_config.h"
 
+/*
+ * Allow this file to emit ESP_LOGD without raising the global
+ * CONFIG_LOG_MAXIMUM_LEVEL: there is not enough free space in the OTA partitions
+ * to recompile every component with DEBUG/VERBOSE. The runtime filter still
+ * applies, so mesh_lite_diag_log_enable() must promote TAG too.
+ */
+#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
+
 #define MESH_MAX_LEVEL 6
 #define MESH_MAX_CHILDREN 5
 #define FAILOVER_LOST_IP_MS 30000
@@ -34,6 +43,8 @@
 static const char *TAG = "mesh_lite_app";
 static char s_softap_prefix[16];
 static char s_softap_ssid[33];
+/* Returned by lg_mesh_get_ssid_by_mac(); has to outlive the callback. */
+static uint8_t s_parent_ssid[33];
 static uint8_t s_uplink_index;
 static volatile bool s_scan_requested;
 static volatile bool s_scan_active;
@@ -244,6 +255,101 @@ static void root_failover_task(void *arg)
     }
 }
 
+/*
+ * Fallback used when Mesh-Lite cannot derive the parent SSID from the scan record.
+ * Registered through esp_mesh_lite_get_ssid_by_mac_cb_register().
+ *
+ * Every node publishes the SoftAP name built by mesh_init_Custom(), so the parent
+ * name can always be reconstructed from the candidate BSSID. This must mirror that
+ * construction exactly, including the MAC suffix mode, otherwise the node would
+ * hand an unknown SSID to esp_wifi_connect().
+ *
+ * whitelist=false: the callback answers for any BSSID that already passed the
+ * mesh_id/vendor filter, and is only consulted when the SSID cannot be read from
+ * the scan result.
+ */
+static const uint8_t *lg_mesh_get_ssid_by_mac(const uint8_t *bssid)
+{
+    if (!bssid) {
+        return NULL;
+    }
+
+    memset(s_parent_ssid, 0, sizeof(s_parent_ssid));
+#ifdef CONFIG_BRIDGE_SOFTAP_SSID_END_WITH_THE_MAC
+    snprintf((char *)s_parent_ssid, sizeof(s_parent_ssid), "%s_%02x%02x%02x",
+             s_softap_prefix, bssid[3], bssid[4], bssid[5]);
+#else
+    snprintf((char *)s_parent_ssid, sizeof(s_parent_ssid), "%s", s_softap_prefix);
+#endif
+    ESP_LOGD(TAG, "ssid by mac " MACSTR ": %s", MAC2STR(bssid), (char *)s_parent_ssid);
+    return s_parent_ssid;
+}
+
+/*
+ * Diagnostic anchor for the join failure: shows what the STA interface actually
+ * holds. Once a parent has been selected this must no longer be empty.
+ */
+static void lg_mesh_dump_sta_config(const char *when)
+{
+    wifi_config_t cfg = {0};
+    if (esp_wifi_get_config(WIFI_IF_STA, &cfg) != ESP_OK) {
+        ESP_LOGW(TAG, "[%s] STA config read failed", when);
+        return;
+    }
+    ESP_LOGD(TAG, "[%s] sta ssid=\"%s\" len=%u bssid_set=%d password_set=%d level=%u",
+             when, (const char *)cfg.sta.ssid, (unsigned)strlen((const char *)cfg.sta.ssid),
+             cfg.sta.bssid_set, cfg.sta.password[0] != '\0',
+             (unsigned)esp_mesh_lite_get_level());
+}
+
+static void lg_mesh_node_scan_done_handler(void *arg, esp_event_base_t base,
+                                           int32_t event_id, void *event_data)
+{
+    lg_mesh_dump_sta_config("node scan done");
+}
+
+/*
+ * Diagnostic helper for the mesh join failure.
+ *
+ * The parent-selection and esp_wifi_connect decision tree (the "Test Log ..."
+ * lines) lives in the closed-source esp-mesh-lite library. Those logs do not go
+ * through ESP_LOGD directly: they use ESP_MESH_LITE_LOGx(), which is gated by the
+ * fixed ESP_MESH_LITE_LOG_LEVEL=ESP_LOG_DEBUG in esp_mesh_lite_log.h and finally
+ * reaches esp_log_writev(). Since esp_log_writev() filters by the runtime level of
+ * the tag, esp_log_level_set() alone is enough to reveal them - DEBUG is the
+ * effective maximum for that library, so VERBOSE buys nothing.
+ *
+ * Set LG_MESH_DIAG_LOG to 0 to disable, or to 2 to also promote the per-packet
+ * communication and espnow tags (very noisy, only for targeted debugging).
+ */
+#ifndef LG_MESH_DIAG_LOG
+#define LG_MESH_DIAG_LOG 1
+#endif
+
+#if LG_MESH_DIAG_LOG
+static const char *const s_mesh_diag_tags[] = {
+    "mesh_lite_app", /* TAG itself; promoting it exposes this file's own ESP_LOGD lines */
+    "vendor_ie",
+    "Mesh-Lite",
+#if LG_MESH_DIAG_LOG > 1
+    "ESP_Mesh_Lite_Comm",
+    "mesh-lite-espnow",
+#endif
+};
+
+static void mesh_lite_diag_log_enable(void)
+{
+    for (size_t i = 0; i < sizeof(s_mesh_diag_tags) / sizeof(s_mesh_diag_tags[0]); ++i) {
+        esp_log_level_set(s_mesh_diag_tags[i], ESP_LOG_DEBUG);
+    }
+    ESP_LOGI(TAG, "Mesh-Lite diagnostic logging enabled (level=%d)", LG_MESH_DIAG_LOG);
+}
+#else
+static void mesh_lite_diag_log_enable(void)
+{
+}
+#endif
+
 esp_err_t mesh_init_Custom(void)
 {
     uint8_t mesh_id;
@@ -300,18 +406,21 @@ esp_err_t mesh_init_Custom(void)
     uint8_t ap_mac[6];
     ESP_RETURN_ON_ERROR(esp_wifi_get_mac(WIFI_IF_AP, ap_mac), TAG, "AP MAC read failed");
     snprintf(s_softap_prefix, sizeof(s_softap_prefix), "LGMesh_%02X", mesh_id);
+#ifdef CONFIG_BRIDGE_SOFTAP_SSID_END_WITH_THE_MAC
     snprintf(s_softap_ssid, sizeof(s_softap_ssid), "LGMesh_%02X_%02x%02x%02x",
              mesh_id, ap_mac[3], ap_mac[4], ap_mac[5]);
-    wifi_config_t ap_config = {0};
-#ifdef CONFIG_BRIDGE_SOFTAP_SSID_END_WITH_THE_MAC
-    /* IoT-Bridge appends the MAC when this menuconfig option is enabled. */
-    memcpy(ap_config.ap.ssid, s_softap_prefix, strlen(s_softap_prefix));
 #else
-    memcpy(ap_config.ap.ssid, s_softap_ssid, strlen(s_softap_ssid));
+    snprintf(s_softap_ssid, sizeof(s_softap_ssid), "%s", s_softap_prefix);
 #endif
+    wifi_config_t ap_config = {0};
+    /* Match the SSID format used by IoT-Bridge and Mesh-Lite for this build. */
+    memcpy(ap_config.ap.ssid, s_softap_prefix, strlen(s_softap_prefix));
     memcpy(ap_config.ap.password, Mesh_PS, strlen(Mesh_PS));
     ap_config.ap.max_connection = MESH_MAX_CHILDREN;
     ESP_RETURN_ON_ERROR(esp_bridge_wifi_set_config(WIFI_IF_AP, &ap_config), TAG, "AP config failed");
+
+    /* Run before esp_mesh_lite_init() so the vendor_ie startup logs are captured. */
+    mesh_lite_diag_log_enable();
 
     esp_mesh_lite_config_t config = ESP_MESH_LITE_DEFAULT_INIT();
     config.mesh_id = mesh_id;
@@ -341,6 +450,14 @@ esp_err_t mesh_init_Custom(void)
         ESP_RETURN_ON_ERROR(esp_mesh_lite_set_disallowed_level(1), TAG, "node level failed");
     }
 
+    /*
+     * Give Mesh-Lite a way to resolve the parent SSID from the BSSID even when the
+     * scan record cannot supply it. Without this, the STA keeps an empty SSID and
+     * esp_wifi_connect() only answers "Haven't to connect to a suitable AP now!".
+     */
+    ESP_RETURN_ON_ERROR(esp_mesh_lite_get_ssid_by_mac_cb_register(lg_mesh_get_ssid_by_mac, false),
+                        TAG, "ssid-by-mac callback failed");
+
     ESP_RETURN_ON_ERROR(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                                     network_event_handler, NULL), TAG, "IP handler failed");
     ESP_RETURN_ON_ERROR(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP,
@@ -356,8 +473,15 @@ esp_err_t mesh_init_Custom(void)
         ESP_RETURN_ON_ERROR(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE,
                                                         scan_done_handler, NULL), TAG, "scan handler failed");
     }
+    if (!IsRoot) {
+        /* Anchor: shows whether Mesh-Lite ever writes the parent into the STA config. */
+        ESP_RETURN_ON_ERROR(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE,
+                                                        lg_mesh_node_scan_done_handler, NULL),
+                            TAG, "node scan handler failed");
+    }
 
     esp_mesh_lite_start();
+    lg_mesh_dump_sta_config("after start");
     if (IsRoot && valid_router(SSID1, WIFI_PS1)) {
         if (xTaskCreatePinnedToCore(root_failover_task, "mesh_failover", LG_STACK_MESH_FAILOVER,
                                     NULL, LG_PRIO_MESH_FAILOVER,
