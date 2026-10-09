@@ -113,14 +113,6 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
 
         char topic[64] = {0};
 
-        // 订阅全员OTA升级主题
-        memset(topic, 0, sizeof(topic));
-        snprintf(topic, sizeof(topic), "server/public/cmd/ota");
-        if (esp_mqtt_client_subscribe(s_client, topic, 0) < 0)
-        {
-            ESP_LOGE(TAG, "Failed to subscribe to server/public/ota");
-        }
-
         // 订阅定点OTA升级主题
         memset(topic, 0, sizeof(topic));
         snprintf(topic, sizeof(topic), "server/%s/cmd/ota", DEVICE_ID);
@@ -157,6 +149,14 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
         }
         else if (IsRoot == 0)
         {
+            // 订阅全员OTA升级主题
+            memset(topic, 0, sizeof(topic));
+            snprintf(topic, sizeof(topic), "server/public/cmd/ota");
+            if (esp_mqtt_client_subscribe(s_client, topic, 0) < 0)
+            {
+                ESP_LOGE(TAG, "Failed to subscribe to server/public/ota");
+            }
+
             // 订阅老化开始主题
             memset(topic, 0, sizeof(topic));
             snprintf(topic, sizeof(topic), "server/%s/cmd/start_aging", DEVICE_ID);
@@ -215,7 +215,7 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
 
             // 订阅服务器下发的下一步操作主题，群控模式下才会有这个主题
             memset(topic, 0, sizeof(topic));
-            snprintf(topic, sizeof(topic), "server/rack/%s/CanNextstep",AgingNumber);
+            snprintf(topic, sizeof(topic), "server/rack/%s/CanNextstep", AgingNumber);
             if (esp_mqtt_client_subscribe(s_client, topic, 0) < 0)
             {
                 ESP_LOGE(TAG, "Failed to subscribe to Cannextstep");
