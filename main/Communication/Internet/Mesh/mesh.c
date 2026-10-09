@@ -32,6 +32,7 @@
 #define FAILOVER_RTC_MAGIC 0x4D4C4657U
 
 static const char *TAG = "mesh_lite_app";
+static char s_softap_prefix[16];
 static char s_softap_ssid[33];
 static uint8_t s_uplink_index;
 static volatile bool s_scan_requested;
@@ -296,9 +297,18 @@ esp_err_t mesh_init_Custom(void)
     }
     ESP_RETURN_ON_ERROR(esp_bridge_wifi_set_config(WIFI_IF_STA, &sta_config), TAG, "STA config failed");
 
-    snprintf(s_softap_ssid, sizeof(s_softap_ssid), "LGMesh_%02X", mesh_id);
+    uint8_t ap_mac[6];
+    ESP_RETURN_ON_ERROR(esp_wifi_get_mac(WIFI_IF_AP, ap_mac), TAG, "AP MAC read failed");
+    snprintf(s_softap_prefix, sizeof(s_softap_prefix), "LGMesh_%02X", mesh_id);
+    snprintf(s_softap_ssid, sizeof(s_softap_ssid), "LGMesh_%02X_%02x%02x%02x",
+             mesh_id, ap_mac[3], ap_mac[4], ap_mac[5]);
     wifi_config_t ap_config = {0};
+#ifdef CONFIG_BRIDGE_SOFTAP_SSID_END_WITH_THE_MAC
+    /* IoT-Bridge appends the MAC when this menuconfig option is enabled. */
+    memcpy(ap_config.ap.ssid, s_softap_prefix, strlen(s_softap_prefix));
+#else
     memcpy(ap_config.ap.ssid, s_softap_ssid, strlen(s_softap_ssid));
+#endif
     memcpy(ap_config.ap.password, Mesh_PS, strlen(Mesh_PS));
     ap_config.ap.max_connection = MESH_MAX_CHILDREN;
     ESP_RETURN_ON_ERROR(esp_bridge_wifi_set_config(WIFI_IF_AP, &ap_config), TAG, "AP config failed");
@@ -309,7 +319,7 @@ esp_err_t mesh_init_Custom(void)
     config.max_connect_number = MESH_MAX_CHILDREN;
     config.join_mesh_ignore_router_status = true;
     config.join_mesh_without_configured_wifi = !IsRoot;
-    config.softap_ssid = s_softap_ssid;
+    config.softap_ssid = s_softap_prefix;
     config.softap_password = Mesh_PS;
     esp_mesh_lite_init(&config);
     if (esp_mesh_lite_get_mesh_id() != mesh_id) {
@@ -317,6 +327,14 @@ esp_err_t mesh_init_Custom(void)
         esp_mesh_lite_set_mesh_id(mesh_id, true);
     }
     ESP_RETURN_ON_ERROR(esp_mesh_lite_set_softap_info(s_softap_ssid, Mesh_PS), TAG, "SoftAP info failed");
+    wifi_config_t applied_ap = {0};
+    ESP_RETURN_ON_ERROR(esp_wifi_get_config(WIFI_IF_AP, &applied_ap), TAG, "AP config read failed");
+    if (strncmp((const char *)applied_ap.ap.ssid, s_softap_ssid,
+                sizeof(applied_ap.ap.ssid)) != 0) {
+        ESP_LOGE(TAG, "SoftAP SSID mismatch: expected=%s, actual=%.*s",
+                 s_softap_ssid, (int)sizeof(applied_ap.ap.ssid), applied_ap.ap.ssid);
+        return ESP_ERR_INVALID_STATE;
+    }
     if (IsRoot) {
         ESP_RETURN_ON_ERROR(esp_mesh_lite_set_allowed_level(1), TAG, "root level failed");
     } else {
@@ -347,7 +365,7 @@ esp_err_t mesh_init_Custom(void)
             ESP_LOGE(TAG, "Failed to create failover task");
         }
     }
-    ESP_LOGI(TAG, "Mesh-Lite started: ID=%02X, role=%s, uplink=%u",
-             mesh_id, IsRoot ? "root" : "node", s_uplink_index);
+    ESP_LOGI(TAG, "Mesh-Lite started: ID=%02X, role=%s, AP=%s, uplink=%u",
+             mesh_id, IsRoot ? "root" : "node", s_softap_ssid, s_uplink_index);
     return ESP_OK;
 }

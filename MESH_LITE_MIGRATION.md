@@ -34,6 +34,8 @@ Mesh-Lite。这些宏由组件的 Kconfig 生成；`sdkconfig.defaults` 只在�
 - `IsRoot` 为 `"1"` 的节点固定在第 1 层；`"0"` 的节点禁止成为第 1 层。
 - `Mesh_ID` 是恰好两位十六进制字符串，范围 `"01"` 至 `"FF"`，例如 `"66"`。
   同一网络所有节点使用相同 `Mesh_ID` 与 `Mesh_PS`；相邻网络使用不同 `Mesh_ID`。
+  各节点的 Mesh-Lite SoftAP 名称会带有本机 MAC 后缀，例如 `LGMesh_66_a1b2c3`。
+  代码兼容 `BRIDGE_SOFTAP_SSID_END_WITH_THE_MAC` 选项开启或关闭，并在启动时核对实际 SSID。
   旧的 6 字节 MAC 格式会被拒绝，需要统一更新配置并重刷所有节点。
 - 根节点用 `SSID`/`WIFI_PS` 连接主路由器，用 `SSID1`/`WIFI_PS1` 连接备用路由器。
   两者 SSID 必须不同，且两个网络都应能访问同一个 `SERVER_IP`/`SERVER_UDP_Port`。
