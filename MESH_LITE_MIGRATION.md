@@ -44,7 +44,26 @@ Mesh-Lite。这些宏由组件的 Kconfig 生成；`sdkconfig.defaults` 只在�
   重启试连，取得 IP 才保存所选路由器并再次重启。若连接失败，最多试连两次，随后等待 5 分钟再尝试，
   避免持续重启。本地 Mesh-Lite 在上游离线时继续组网。
 
-## 以太网上行状态（已改造）
+## 以太网上行状态（已启用，L1）
+
+**当前状态：以太网已正式接入。** 硬件（KSZ8851SNL over SPI）由 iot_bridge 的 `bridge_eth.c` 初始化，
+`dual_net` 只接管 `ETH_WAN` netif 并做上行裁决。固件**仍只在根节点**启用 dual_net。
+
+关键行为：
+
+- 以太网与 WiFi STA 同时作为 external netif；注意 STA 的 `route_prio` 为 100、ETH_WAN 为 50，
+  自动选择偏向 STA，「以太网优先」由 dual_net 显式 `esp_netif_set_default_netif()` 覆盖实现；
+- 以太网需通过连通性探测才被认定可用，避免「有 IP 却上不了网」；
+- 以太网可用时 `root_failover_task` 暂停扫描与 `esp_restart()`，即插着网线不会因 WiFi 断而重启；
+- `Network_Flag` 在根节点由 dual_net 裁决（以太网或 WiFi 任一可用），子节点仍由 `mesh.c` 维护；
+- 硬件缺失不会 abort，降级为纯 WiFi。
+
+引脚与 CONFIG 见 `DUAL_NET_DESIGN.md` 第 5.2 节；设计、容错矩阵与验收步骤见第 6、7 节。
+已知限制：以太网 MAC 由 iot_bridge 写死为 `02:00:00:12:34:56`（见 6.6）。
+
+---
+
+## 以太网上行状态（L0 阶段的历史说明，已被上一节取代）
 
 `main/Communication/Internet/dual_net/dual_net.c/h` 已剔除 `esp_mesh.h` 与
 `esp_mesh_post_toDS_state()` 等 ESP-WIFI-MESH 遗留依赖，改造为 Mesh-Lite 兼容版本，

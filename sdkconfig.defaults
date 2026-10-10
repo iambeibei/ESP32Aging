@@ -3,6 +3,23 @@ CONFIG_MESH_LITE_ENABLE=y
 CONFIG_MESH_LITE_MAXIMUM_LEVEL_ALLOWED=6
 CONFIG_BRIDGE_SOFTAP_MAX_CONNECT_NUMBER=5
 
+# --- 有线以太网（KSZ8851SNL over SPI）作为根节点上行 ---
+# 以太网与 WiFi STA 同时作为 external netif（二者可并存）。
+# 注意：WIFI_STA_DEF 的 route_prio=100 高于 ETH_WAN 的 50，自动选择反而偏向 STA；
+# 「以太网优先」由 dual_net 显式 esp_netif_set_default_netif() 覆盖实现，
+# 因此 dual_net.h 的 DUAL_NET_ENABLE_ROUTE_CONTROL 必须保持为 1。
+# 另注：CONFIG_BRIDGE_EXTERNAL_NETIF_ETHERNET 与 CONFIG_BRIDGE_DATA_FORWARDING_NETIF_ETHERNET
+# 互斥，此处取前者（以太网作 WAN 出口，SoftAP 仍是数据转发口）。
+CONFIG_BRIDGE_EXTERNAL_NETIF_ETHERNET=y
+
+# SPI 引脚沿用原硬件接线（iot_bridge 的 S3 默认值为 SCLK 12 / MOSI 11 / MISO 13 / CS0 10）
+CONFIG_BRIDGE_ETH_SPI_HOST=1
+CONFIG_BRIDGE_ETH_SPI_SCLK_GPIO=6
+CONFIG_BRIDGE_ETH_SPI_MOSI_GPIO=15
+CONFIG_BRIDGE_ETH_SPI_MISO_GPIO=7
+CONFIG_BRIDGE_ETH_SPI_CS0_GPIO=16
+CONFIG_BRIDGE_ETH_SPI_INT0_GPIO=4
+
 # Note: do NOT raise CONFIG_LOG_MAXIMUM_LEVEL here. The closed-source esp-mesh-lite
 # library logs through its own esp_mesh_lite_log_write(), guarded by the fixed
 # ESP_MESH_LITE_LOG_LEVEL=ESP_LOG_DEBUG in esp_mesh_lite_log.h, so its DEBUG lines are

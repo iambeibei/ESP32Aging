@@ -7,16 +7,13 @@
 #include "esp_netif.h"
 
 /*
- * 以太网（KSZ8851SNL，SPI 接口）引脚定义。
- * 只在打开 DUAL_NET_ETH_HW_ENABLE 时才会真正占用这些引脚与 SPI2_HOST。
- * 注意：iot_bridge 组件自带的 SPI 以太网路径同样使用 SPI2_HOST 与 GPIO4 中断脚，
- * 与本模块硬件路径互斥，详见 DUAL_NET_DESIGN.md。
+ * 以太网硬件（KSZ8851SNL over SPI）由 iot_bridge 组件负责初始化，
+ * 引脚通过 menuconfig 配置，不在本模块内定义：
+ *   CONFIG_BRIDGE_ETH_SPI_HOST / _SCLK_GPIO / _MOSI_GPIO / _MISO_GPIO / _CS0_GPIO / _INT0_GPIO
+ * 本模块只接管 iot_bridge 创建好的 "ETH_WAN" netif，不再自行 spi_bus_initialize()，
+ * 以避免与 bridge_eth.c 中的 ESP_ERROR_CHECK(spi_bus_initialize(...)) 争用 SPI2_HOST 而 abort。
+ * 详见 DUAL_NET_DESIGN.md。
  */
-#define SPI_MOSIPIN 15
-#define SPI_MISOPIN 7
-#define SPI_SCLKPIN 6
-#define SPI_CSPIN   16
-#define ETH_INT     4
 
 /*
  * 能力门控：默认只保留「状态观察」，所有会产生副作用的动作都默认关闭，
@@ -31,11 +28,11 @@
 #endif
 
 #ifndef DUAL_NET_ETH_HW_ENABLE
-#define DUAL_NET_ETH_HW_ENABLE          0   /**< 1=初始化 KSZ8851SNL 硬件并 esp_eth_start() */
+#define DUAL_NET_ETH_HW_ENABLE          1   /**< 1=接管 iot_bridge 创建的 ETH_WAN netif 并参与上行裁决 */
 #endif
 
 #ifndef DUAL_NET_ENABLE_ROUTE_CONTROL
-#define DUAL_NET_ENABLE_ROUTE_CONTROL   0   /**< 1=允许 esp_netif_set_default_netif() 并写 Network_Flag */
+#define DUAL_NET_ENABLE_ROUTE_CONTROL   1   /**< 1=允许 esp_netif_set_default_netif() 并写 Network_Flag（以太网接入后需为 1） */
 #endif
 
 #ifndef DUAL_NET_ENABLE_WIFI_FALLBACK
@@ -62,13 +59,29 @@
 #define LG_DUAL_NET_WIFI_RETRY_INTERVAL     3
 #endif
 
-/* KSZ8851SNL 的 SPI 时钟频率与传输队列长度（仅在 DUAL_NET_ETH_HW_ENABLE=1 时使用） */
-#ifndef LG_DUAL_NET_ETH_SPI_CLK_HZ
-#define LG_DUAL_NET_ETH_SPI_CLK_HZ          5000000
+/*
+ * 上行可用性判定参数。
+ * 只拿到 IP 不足以认定上行可用（网线可能接到一台不通的设备），
+ * 必须叠加「业务服务器可达」探测，避免锁死在「有 IP 却上不了网」的僵局。
+ */
+#ifndef LG_DUAL_NET_ETH_LINK_UP_DEBOUNCE_MS
+#define LG_DUAL_NET_ETH_LINK_UP_DEBOUNCE_MS      3000  /**< 网线插入后的去抖确认时间 */
 #endif
 
-#ifndef LG_DUAL_NET_ETH_SPI_QUEUE_SIZE
-#define LG_DUAL_NET_ETH_SPI_QUEUE_SIZE      20
+#ifndef LG_DUAL_NET_ETH_LINK_DOWN_DEBOUNCE_MS
+#define LG_DUAL_NET_ETH_LINK_DOWN_DEBOUNCE_MS    1000  /**< 网线拔出后的去抖确认时间 */
+#endif
+
+#ifndef LG_DUAL_NET_UPLINK_PROBE_TIMEOUT_MS
+#define LG_DUAL_NET_UPLINK_PROBE_TIMEOUT_MS      2000  /**< 单次连通性探测超时 */
+#endif
+
+#ifndef LG_DUAL_NET_UPLINK_PROBE_OK_COUNT
+#define LG_DUAL_NET_UPLINK_PROBE_OK_COUNT        2     /**< 连续成功次数达到后才认定可用 */
+#endif
+
+#ifndef LG_DUAL_NET_UPLINK_PROBE_FAIL_COUNT
+#define LG_DUAL_NET_UPLINK_PROBE_FAIL_COUNT      3     /**< 连续失败次数达到后才认定不可用 */
 #endif
 
 /** 上行链路类型：为后续有线接入与并行分流预留 */
@@ -77,6 +90,14 @@ typedef enum {
     DUAL_NET_UPLINK_ETH,        /**< 有线以太网 */
     DUAL_NET_UPLINK_WIFI,       /**< WiFi STA */
 } dual_net_uplink_t;
+
+/** 上行可用性状态（叠加连通性探测结果，而非仅有 IP） */
+typedef enum {
+    DUAL_NET_UPLINK_STATE_NONE = 0,  /**< 无可用上行 */
+    DUAL_NET_UPLINK_STATE_PROBING,   /**< 已取得 IP，正在探测连通性 */
+    DUAL_NET_UPLINK_STATE_READY,     /**< IP 与业务服务器均可达 */
+    DUAL_NET_UPLINK_STATE_STALE,     /**< 曾可用但探测连续失败，等待回落 */
+} dual_net_uplink_state_t;
 
 /** 上行变化回调；在事件上下文调用，回调内不得阻塞 */
 typedef void (*dual_net_uplink_cb_t)(dual_net_uplink_t uplink);
@@ -145,5 +166,28 @@ esp_err_t dual_net_select_uplink(dual_net_uplink_t uplink);
 /// @brief 预留：注册上行变化回调
 /// @param callback 回调，NULL 表示取消注册
 void dual_net_register_uplink_change_cb(dual_net_uplink_cb_t callback);
+
+/// @brief 获取上行可用性状态（已叠加连通性探测结果）
+/// @return 见 dual_net_uplink_state_t
+dual_net_uplink_state_t dual_net_get_uplink_state(void);
+
+/// @brief 以太网是否已确认为可用上行（取得 IP + 连通性探测通过）
+/// @note 这是「以太网优先」的唯一依据，也是抑制 root_failover 重启的判据。
+/// @return true=以太网可承担上行
+bool dual_net_is_eth_uplink_ready(void);
+
+/// @brief 根节点上行是否真正可用（以太网已确认，或 WiFi STA 已取得 IP）
+/// @note 供 Network_Flag 裁决使用；可在任务上下文调用。
+/// @return true=有可用上行
+bool dual_net_is_uplink_ready(void);
+
+/// @brief Network_Flag 的统一裁决入口（mesh.c 的两处写点已改为调用本函数）
+/// @note 在事件上下文调用，内部只做轻量赋值与日志，不阻塞。
+void dual_net_arbitrate_network_flag(void);
+
+/// @brief 以太网成为出口后，把它的 DNS 重新下发给 SoftAP（修复 iot_bridge 固定用 STA 覆盖的问题）
+/// @note 内部使用 esp_bridge_update_dns_info()，对 NULL 参数安全，不要求 netif 已 up。
+/// @return ESP_OK 成功；ESP_ERR_INVALID_STATE 当前无可用以太网 netif
+esp_err_t dual_net_refresh_dns_to_softap(void);
 
 #endif // DUAL_NET_H

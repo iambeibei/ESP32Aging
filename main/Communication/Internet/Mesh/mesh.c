@@ -23,6 +23,7 @@
 
 #include "ConfigData.h"
 #include "mesh.h"
+#include "dual_net.h"
 #include "task_config.h"
 
 
@@ -120,7 +121,19 @@ static void network_event_handler(void *arg, esp_event_base_t base,
             s_trial_success = true;
             return;
         }
-        Network_Flag = 1;
+        /*
+         * Network_Flag 的写入权按角色划分，避免两个写者竞争同一全局量：
+         * 根节点由 dual_net 综合「以太网 + WiFi」裁决（以太网可用时不会被判为断网）；
+         * 子节点上行由 mesh 父节点提供，dual_net 不运行，沿用原判据。
+         */
+        if (IsRoot == 1)
+        {
+            dual_net_arbitrate_network_flag();
+        }
+        else
+        {
+            Network_Flag = 1;
+        }
         s_failover_attempts = 0;
         ESP_LOGI(TAG, "STA IP " IPSTR ", level=%u, role=%s",
                  IP2STR(&event->ip_info.ip), esp_mesh_lite_get_level(),
@@ -133,7 +146,15 @@ static void network_event_handler(void *arg, esp_event_base_t base,
         }
     } else if ((base == IP_EVENT && event_id == IP_EVENT_STA_LOST_IP) ||
                (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)) {
-        Network_Flag = 0;
+        /* 与上面 STA_GOT_IP 对称：根节点交给 dual_net 裁决，子节点沿用原判据 */
+        if (IsRoot == 1)
+        {
+            dual_net_arbitrate_network_flag();
+        }
+        else
+        {
+            Network_Flag = 0;
+        }
         if (s_trial_active) s_trial_success = false;
         ESP_LOGW(TAG, "STA uplink lost; local Mesh-Lite remains active");
     }
@@ -188,6 +209,21 @@ static void root_failover_task(void *arg)
     TickType_t last_scan = 0;
     for (;;) {
         TickType_t now = xTaskGetTickCount();
+        /*
+         * 以太网守卫：上行已由有线承担时，WiFi STA 没有 IP 属于正常情况。
+         * 此时不应按「上行故障」处理，否则会扫描备用路由器并 esp_restart()，
+         * 导致插着网线的根节点被无谓重启（本任务只在根节点创建）。
+         */
+        if (dual_net_is_eth_uplink_ready()) {
+            if (lost_since != 0 || s_scan_requested) {
+                ESP_LOGI(TAG, "以太网上行可用，暂停主备路由器切换（WiFi 侧无 IP 属正常）");
+            }
+            lost_since = 0;
+            s_scan_requested = false;
+            s_restart_for_failover = false;
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
         if (s_trial_active) {
             if (s_trial_success) {
                 esp_err_t err = save_uplink_index(s_uplink_index);
