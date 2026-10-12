@@ -159,6 +159,7 @@ static unsigned ulTaskNotifyTake(int clear, TickType_t timeout) {
     return 1;
 }
 static void storage_write_record_cyclic(const char *pn, const char *message) { (void)pn; (void)message; }
+static void mqtt_app_process_uplink_reconnect(void) {}
 static unsigned tcp_attempts, mesh_pause_count, mesh_resume_count;
 static int mesh_disconnect_error;
 static esp_err_t esp_mesh_lite_disconnect(void) { assert(!lock_depth); mesh_pause_count++; return mesh_disconnect_error; }
@@ -362,7 +363,7 @@ def main():
         (temp / 'mocks.h').write_text(MOCKS)
         for header in ['esp_log.h', 'esp_event.h', 'esp_netif.h', 'esp_wifi.h',
                        'esp_bridge.h', 'esp_eth.h', 'esp_timer.h', 'esp_err.h',
-                       'mesh.h', 'task_config.h', 'ConfigData.h', 'log.h',
+                       'mesh.h', 'mqtt_app.h', 'task_config.h', 'ConfigData.h', 'log.h',
                        'freertos/FreeRTOS.h', 'freertos/task.h', 'lwip/sockets.h', 'lwip/inet.h']:
             path = temp / header
             path.parent.mkdir(parents=True, exist_ok=True)

@@ -15,6 +15,7 @@
 #include "lwip/inet.h"
 #include "dual_net.h"
 #include "mesh.h"
+#include "mqtt_app.h"
 #include "task_config.h"
 #include "ConfigData.h"
 #include "log.h"
@@ -597,6 +598,8 @@ static void dual_net_monitor_task(void *arg)
                 if (dns_updated) applied_revision = reconcile_revision;
             }
         }
+        /* 非阻塞服务延后的MQTT请求；同一出口的周期探测不产生新重连请求。 */
+        mqtt_app_process_uplink_reconnect();
         dual_net_check_ready_callback();
         state = dual_net_snapshot();
         int64_t now_us = esp_timer_get_time();

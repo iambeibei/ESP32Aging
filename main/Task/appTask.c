@@ -5129,6 +5129,8 @@ void app_task_init(void)
              */
             if (IsRoot == 1)
             {
+                /* 注册早于监控任务创建，避免遗漏有线已插入时的首次路由提交。 */
+                dual_net_register_uplink_change_cb(mqtt_app_on_uplink_changed);
                 esp_err_t dn_err = dual_net_init();
                 if (dn_err != ESP_OK)
                 {
