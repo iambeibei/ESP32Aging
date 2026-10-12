@@ -1,7 +1,9 @@
 #include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -9,7 +11,9 @@
 #include "esp_bridge.h"
 /* esp_eth.h 提供 ETH_EVENT / ETHERNET_EVENT_* 事件声明，只是常量，不产生硬件占用 */
 #include "esp_eth.h"
-#include "ping/ping_sock.h"
+#include "esp_timer.h"
+#include "lwip/sockets.h"
+#include "lwip/inet.h"
 #include "dual_net.h"
 #include "task_config.h"
 // 添加这些头文件来解决 IP4_ADDR 错误
@@ -141,63 +145,11 @@ esp_err_t dual_net_refresh_dns_to_softap(void)
 }
 
 /*
- * 连通性探测：向业务服务器发起一次 TCP 连接。
- *
- * 只拿到 IP 不能认定上行可用（网线可能插在一台不通的设备上），
- * 必须验证业务路径真的可达，否则会锁死在「有 IP 却上不了网、又不回落 WiFi」的僵局。
- * 这里刻意探测 SERVER_IP:SERVER_UDP_Port（MQTT 服务器）而非网关，
- * 因为它才是业务真正依赖的目标。
- *
- * 注意：本函数会阻塞最多 LG_DUAL_NET_UPLINK_PROBE_TIMEOUT_MS，
- * 只能在任务上下文调用，禁止在事件回调中调用。
- */
-/* 探测同步：由 ping 内部任务在「收到应答 / 超时 / 会话结束」时释放 */
-static SemaphoreHandle_t s_ping_done_sem = NULL;
-static volatile bool s_ping_got_reply = false;
-
-static void dual_net_ping_on_success(esp_ping_handle_t hdl, void *args)
-{
-    (void)hdl;
-    (void)args;
-    s_ping_got_reply = true;
-    if (s_ping_done_sem != NULL)
-    {
-        xSemaphoreGive(s_ping_done_sem);
-    }
-}
-
-static void dual_net_ping_on_timeout(esp_ping_handle_t hdl, void *args)
-{
-    (void)hdl;
-    (void)args;
-    if (s_ping_done_sem != NULL)
-    {
-        xSemaphoreGive(s_ping_done_sem);
-    }
-}
-
-static void dual_net_ping_on_end(esp_ping_handle_t hdl, void *args)
-{
-    (void)hdl;
-    (void)args;
-    if (s_ping_done_sem != NULL)
-    {
-        xSemaphoreGive(s_ping_done_sem);
-    }
-}
-
-/*
- * 以太网连通性探测：向「以太网自己的 DNS 服务器」发一个 ICMP echo，
- * 并通过 esp_ping 的 interface 字段强制从以太网网卡发出。
- *
- * 两个刻意的设计：
- *   1. 探测目标不用 MQTT 服务器——服务器宕机时回落 WiFi 毫无意义（WiFi 也连不上同一个服务器），
- *      而且每次探测都会往 broker 建一条只握手不发 MQTT 报文的 TCP 连接；
- *   2. 必须绑定网卡——探测发生在切换默认路由「之前」，若不绑定，
- *      探测包会从当前默认路由（WiFi）出去，等于验证了 WiFi 却据此切到以太网。
- *
- * 注意：本函数会阻塞等待探测结果（最多 timeout + margin），
- * 只能在任务上下文调用，禁止在事件回调中调用。
+ * 探测配置中的 MQTT IPv4 地址 SERVER_IP:SERVER_UDP_Port（历史键名，实际为 TCP）。
+ * 同时绑定指定网卡与其源 IP，避免尚未切换默认路由时误探测到 WiFi。
+ * 只验证 TCP 建连，不发送 MQTT 报文；端口拒绝连接也算失败。
+ * 使用非阻塞 connect + select，将建连等待限制在探测超时内。
+ * 只在监控任务调用，不可在 ISR/事件回调调用；每轮独占并关闭自己的 socket。
  */
 static bool dual_net_probe_uplink_reachable(esp_netif_t *netif)
 {
@@ -206,85 +158,127 @@ static bool dual_net_probe_uplink_reachable(esp_netif_t *netif)
         return false;
     }
 
-    if (s_ping_done_sem == NULL)
+    if (SERVER_IP == NULL || SERVER_UDP_Port <= 0 || SERVER_UDP_Port > UINT16_MAX)
     {
-        ESP_LOGW(TAG, "探测信号量未初始化，跳过连通性探测");
+        ESP_LOGW(TAG, "MQTT 探测地址或端口无效，检查 SERVER_IP/SERVER_UDP_Port");
         return false;
     }
 
-    ip4_addr_t target = {0};
-    esp_netif_dns_info_t dns = {0};
-
-    if (esp_netif_get_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK &&
-        dns.ip.type == IPADDR_TYPE_V4 && dns.ip.u_addr.ip4.addr != 0)
+    struct sockaddr_in target_addr = {0};
+    target_addr.sin_family = AF_INET;
+    target_addr.sin_port = htons((uint16_t)SERVER_UDP_Port);
+    if (inet_pton(AF_INET, SERVER_IP, &target_addr.sin_addr) != 1)
     {
-        target.addr = dns.ip.u_addr.ip4.addr;
-    }
-    else
-    {
-        /*
-         * 网络没有下发 DNS 时退回探测网关，否则以太网将永远无法被认定可用。
-         * 这种情况只表示「链路通」，不代表能出外网。
-         */
-        esp_netif_ip_info_t ip_info = {0};
-        if (esp_netif_get_ip_info(netif, &ip_info) != ESP_OK || ip_info.gw.addr == 0)
-        {
-            ESP_LOGW(TAG, "以太网既无 DNS 也无网关，跳过连通性探测");
-            return false;
-        }
-        target.addr = ip_info.gw.addr;
+        ESP_LOGW(TAG, "MQTT 探测需要 IPv4 地址，SERVER_IP=%s", SERVER_IP);
+        return false;
     }
 
-    /* 清空上一次可能残留的信号量，避免读到过期结果 */
-    while (xSemaphoreTake(s_ping_done_sem, 0) == pdTRUE)
+    esp_netif_ip_info_t ip_info = {0};
+    struct ifreq iface = {0};
+    if (esp_netif_get_ip_info(netif, &ip_info) != ESP_OK || ip_info.ip.addr == 0 ||
+        esp_netif_get_netif_impl_name(netif, iface.ifr_name) != ESP_OK)
     {
-        ;
+        ESP_LOGW(TAG, "MQTT 探测网卡未就绪：%s", esp_netif_get_ifkey(netif));
+        return false;
     }
-    s_ping_got_reply = false;
 
-    esp_ping_config_t ping_config = ESP_PING_DEFAULT_CONFIG();
-    ping_config.target_addr.type = IPADDR_TYPE_V4;
-    ping_config.target_addr.u_addr.ip4.addr = target.addr;
-    ping_config.count = 1U;
-    ping_config.timeout_ms = (uint32_t)LG_DUAL_NET_UPLINK_PROBE_TIMEOUT_MS;
-    ping_config.interface = (uint32_t)esp_netif_get_netif_impl_index(netif);
-
-    esp_ping_callbacks_t cbs = {
-        .cb_args = NULL,
-        .on_ping_success = dual_net_ping_on_success,
-        .on_ping_timeout = dual_net_ping_on_timeout,
-        .on_ping_end = dual_net_ping_on_end,
-    };
-
-    esp_ping_handle_t ping = NULL;
-    if (esp_ping_new_session(&ping_config, &cbs, &ping) != ESP_OK || ping == NULL)
+    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock < 0)
     {
-        ESP_LOGW(TAG, "创建 ping 会话失败");
+        ESP_LOGW(TAG, "MQTT 探测 socket 创建失败：errno=%d", errno);
         return false;
     }
 
     bool reachable = false;
-    if (esp_ping_start(ping) == ESP_OK)
+    int probe_errno = 0;
+    const char *stage = "绑定网卡";
+    if (setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE, &iface, sizeof(iface)) != 0)
     {
-        TickType_t wait_ticks = pdMS_TO_TICKS((uint32_t)LG_DUAL_NET_UPLINK_PROBE_TIMEOUT_MS +
-                                              (uint32_t)LG_DUAL_NET_UPLINK_PROBE_WAIT_MARGIN_MS);
-        if (xSemaphoreTake(s_ping_done_sem, wait_ticks) == pdTRUE)
-        {
-            reachable = s_ping_got_reply;
-        }
-        else
-        {
-            ESP_LOGD(TAG, "连通性探测等待超时");
-        }
+        probe_errno = errno;
+        goto cleanup;
     }
 
-    if (esp_ping_delete_session(ping) != ESP_OK)
+    struct sockaddr_in source_addr = {0};
+    source_addr.sin_family = AF_INET;
+    source_addr.sin_addr.s_addr = ip_info.ip.addr;
+    stage = "绑定源地址";
+    if (bind(sock, (struct sockaddr *)&source_addr, sizeof(source_addr)) != 0)
     {
-        ESP_LOGD(TAG, "删除 ping 会话失败");
+        probe_errno = errno;
+        goto cleanup;
     }
 
-    ESP_LOGI(TAG, "探测 %s -> " IPSTR " 结果：%s",
-             esp_netif_get_ifkey(netif), IP2STR(&target), reachable ? "通" : "不通");
+    stage = "设置非阻塞";
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags < 0 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) != 0)
+    {
+        probe_errno = errno;
+        goto cleanup;
+    }
+
+    stage = "TCP 建连";
+    int64_t deadline_us = esp_timer_get_time() + (int64_t)LG_DUAL_NET_UPLINK_PROBE_TIMEOUT_MS * 1000;
+    if (connect(sock, (struct sockaddr *)&target_addr, sizeof(target_addr)) == 0)
+    {
+        reachable = true;
+        goto cleanup;
+    }
+    probe_errno = errno;
+    if (probe_errno != EINPROGRESS)
+    {
+        goto cleanup;
+    }
+
+    for (;;)
+    {
+        int64_t remaining_us = deadline_us - esp_timer_get_time();
+        stage = "等待 TCP 建连";
+        if (remaining_us <= 0)
+        {
+            probe_errno = ETIMEDOUT;
+            break;
+        }
+        struct timeval timeout = {
+            .tv_sec = remaining_us / 1000000,
+            .tv_usec = remaining_us % 1000000,
+        };
+        fd_set write_fds;
+        FD_ZERO(&write_fds);
+        FD_SET(sock, &write_fds);
+        int selected = select(sock + 1, NULL, &write_fds, NULL, &timeout);
+        if (selected < 0)
+        {
+            probe_errno = errno;
+            if (probe_errno == EINTR)
+            {
+                continue; // 使用原截止时间重试，不延长总等待时间。
+            }
+            break;
+        }
+        if (selected == 0)
+        {
+            probe_errno = ETIMEDOUT;
+            break;
+        }
+        stage = "TCP 建连结果";
+        socklen_t error_len = sizeof(probe_errno);
+        if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &probe_errno, &error_len) != 0)
+        {
+            probe_errno = errno;
+            break;
+        }
+        reachable = (probe_errno == 0);
+        break;
+    }
+
+cleanup:
+    if (close(sock) != 0)
+    {
+        ESP_LOGW(TAG, "关闭 MQTT 探测 socket 失败：errno=%d", errno);
+    }
+    ESP_LOGI(TAG, "探测 %s(%s) -> MQTT %s:%d（源 IP=" IPSTR "）结果：%s，阶段=%s errno=%d",
+             esp_netif_get_ifkey(netif), iface.ifr_name, SERVER_IP, SERVER_UDP_Port,
+             IP2STR(&ip_info.ip), reachable ? "通" : "不通", stage, probe_errno);
     return reachable;
 }
 
@@ -962,17 +956,6 @@ esp_err_t dual_net_init(void)
     {
         storage_write_record_cyclic("", "Failed to get WiFi_STA_DEF netif");
         return ESP_FAIL;
-    }
-
-    /* 探测用信号量：ping 内部任务与监控任务之间的同步，只需创建一次 */
-    if (s_ping_done_sem == NULL)
-    {
-        s_ping_done_sem = xSemaphoreCreateBinary();
-        if (s_ping_done_sem == NULL)
-        {
-            storage_write_record_cyclic("", "Failed to create ping semaphore");
-            ESP_LOGW(TAG, "探测信号量创建失败，以太网将不参与上行裁决");
-        }
     }
 
     s_dual_net_initialized = true;

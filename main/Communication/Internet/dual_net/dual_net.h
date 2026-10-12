@@ -62,7 +62,7 @@
 /*
  * 上行可用性判定参数。
  * 只拿到 IP 不足以认定上行可用（网线可能接到一台不通的设备），
- * 必须叠加「业务服务器可达」探测，避免锁死在「有 IP 却上不了网」的僵局。
+ * 必须叠加「配置的 MQTT IPv4 地址与 TCP 端口可建连」探测。
  */
 #ifndef LG_DUAL_NET_ETH_LINK_UP_DEBOUNCE_MS
 #define LG_DUAL_NET_ETH_LINK_UP_DEBOUNCE_MS 3000 /**< 网线插入后的去抖确认时间 */
@@ -73,12 +73,7 @@
 #endif
 
 #ifndef LG_DUAL_NET_UPLINK_PROBE_TIMEOUT_MS
-#define LG_DUAL_NET_UPLINK_PROBE_TIMEOUT_MS 2000 /**< 单次连通性探测超时 */
-#endif
-
-/* 等待探测结果的额外余量（在超时之上再加，用于容纳 ping 会话启停开销） */
-#ifndef LG_DUAL_NET_UPLINK_PROBE_WAIT_MARGIN_MS
-#define LG_DUAL_NET_UPLINK_PROBE_WAIT_MARGIN_MS 1500
+#define LG_DUAL_NET_UPLINK_PROBE_TIMEOUT_MS 2000 /**< 单次 MQTT TCP 建连等待超时 */
 #endif
 
 #ifndef LG_DUAL_NET_UPLINK_PROBE_OK_COUNT
@@ -102,7 +97,7 @@ typedef enum
 {
     DUAL_NET_UPLINK_STATE_NONE = 0, /**< 无可用上行 */
     DUAL_NET_UPLINK_STATE_PROBING,  /**< 已取得 IP，正在探测连通性 */
-    DUAL_NET_UPLINK_STATE_READY,    /**< IP 与业务服务器均可达 */
+    DUAL_NET_UPLINK_STATE_READY,    /**< 有线已通过 MQTT TCP 探测，或 WiFi STA 已取得 IP */
     DUAL_NET_UPLINK_STATE_STALE,    /**< 曾可用但探测连续失败，等待回落 */
 } dual_net_uplink_state_t;
 
