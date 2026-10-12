@@ -131,11 +131,36 @@ if (IsRoot == 1) {
 | `LG_DUAL_NET_ETH_LINK_UP_DEBOUNCE_MS` | 3000 | 网线插入去抖确认时间 |
 | `LG_DUAL_NET_ETH_LINK_DOWN_DEBOUNCE_MS` | 1000 | 网线拔出去抖确认时间 |
 | `LG_DUAL_NET_UPLINK_PROBE_TIMEOUT_MS` | 2000 | 单次连通性探测超时（探测会阻塞，仅可在任务上下文调用） |
+| `LG_DUAL_NET_UPLINK_PROBE_WAIT_MARGIN_MS` | 1500 | 等待探测结果的额外余量（在超时之上再加，容纳 ping 会话启停开销） |
 | `LG_DUAL_NET_UPLINK_PROBE_OK_COUNT` | 2 | 连续探测成功达到该次数才认定上行可用 |
 | `LG_DUAL_NET_UPLINK_PROBE_FAIL_COUNT` | 3 | 连续探测失败达到该次数才取消以太网优先 |
 
-> 连通性探测目标是 `SERVER_IP:SERVER_UDP_Port`（MQTT 服务器），
-> 而非网关——因为它才是业务真正依赖的目标；「网关通但服务器不通」同样应判定为上行不可用。
+**连通性探测的实现要点（三处刻意设计）：**
+
+1. **目标是业务服务器**（`SERVER_IP:SERVER_UDP_Port`，即 MQTT），不是网关或公网 DNS。
+   判据是「切过去业务会不会断」：以太网即使能上外网，只要到不了业务服务器，
+   就不该抢占一个正常工作的 WiFi。用 TCP 连接而非 ICMP，避免服务器禁 ping 导致误判。
+2. **探测期间临时把默认路由切到以太网，探完立即还原**（约 2 秒窗口）。
+   探测发生在切换路由**之前**，若直接 `connect()`，包会从当前默认路由（WiFi）出去，
+   等于验证了 WiFi 却据此切到以太网——这是最初的実装错误，已修正。
+   另外，绑定网卡的 ICMP（`SO_BINDTODEVICE`）在以太网不是默认路由时
+   会因 lwIP 无可用路由而失败（`raw.c:365-385`），故不能只依赖绑定网卡。
+3. 判定：连接成功，或被对端显式拒绝（`ECONNREFUSED` / `EISCONN`）都算可达。
+
+**「以太网可用」有两个层次，不要混用：**
+
+| 概念 | 判据 | 用途 |
+|---|---|---|
+| 以太网**保底可用** | `eth_up`（取得 IP） | 抑制 `root_failover_task` 的扫描与 `esp_restart()`；WiFi 断了也要靠它保住根节点身份 |
+| 以太网**优于 WiFi** | `s_eth_ready`（业务探测通过） | 决定是否在 WiFi 正常时抢占默认路由 |
+
+### 5.1.1 切换策略：分级
+
+| 场景 | 判据 | 行为 |
+|---|---|---|
+| WiFi 正常 + 以太网到不了业务服务器 | 探测失败 → `s_eth_ready=false` | **不切换**，继续 WiFi，保业务 |
+| WiFi 正常 + 以太网可达业务服务器 | 探测连续成功 → `s_eth_ready=true` | 切换到以太网（以太网优先） |
+| **WiFi 断开 + 以太网有 IP** | `!wifi_up` | **立即切换**到以太网，不重启、保住根节点身份、子节点不脱网；MQTT 暂时连不上时数据本地缓存 |
 
 ### 5.2 以太网引脚与硬件（menuconfig / `sdkconfig.defaults`）
 
@@ -222,7 +247,7 @@ dual_net 综合以太网与 STA 的**真实连通性**得出上行是否可用�
 | 2 | `Network_Flag` 只认 STA | `mesh.c:123/136`（原） | 以太网在线仍判为 0，触发因素 1 | **已修**：根节点改由 dual_net 裁决 |
 | 3 | NAPT 出口固定 STA | `CONFIG_BRIDGE_EXTERNAL_NETIF_STATION=y`；NAPT 在 `bridge_wifi.c:246` 基于 SoftAP IP 开启；STA 的 `route_prio=100` 高于 ETH_WAN 的 50 | 子节点流量不走以太网，且以太网不会自动接管 | **已修**：以太网就绪后显式 `esp_netif_set_default_netif(eth_netif)` 覆盖默认路由 |
 | 4 | DNS 下发被 STA 覆盖 | `bridge_wifi.c:232-241` 固定 `#if` 顺序，`WIFI_STA_DEF` 写在 `ETH_WAN` 之后并覆盖之 | 出口已是以太网，子节点仍拿 STA 的 DNS | **已修**：以太网生效后显式 `esp_bridge_update_dns_info()` |
-| 5 | 假连通（有 IP 但服务器不通） | — | 误判上行可用 → 不回落 WiFi → 业务卡死 | **已修**：连通性探测 + 连续计数 |
+| 5 | 假连通（有 IP 但业务不通） | — | 误判上行可用 → 抢占 WiFi → 业务中断 | **已修**：探测业务服务器（临时切路由保证走以太网）+ 连续计数 |
 | 6 | 网线热插拔抖动 | `ETHERNET_EVENT_*` | 频繁切路由、日志刷屏 | **已修**：上下沿分别去抖 3s / 1s |
 | 7 | SPI 总线双初始化 | `bridge_eth.c:323` `ESP_ERROR_CHECK(spi_bus_initialize)` | 与旧 `dual_net_eth_init()` 争用 SPI2_HOST 会 abort | **已修**：删除 dual_net 的 SPI 初始化 |
 | 8 | 硬件缺失 | — | 芯片不响应时 iot_bridge 只留下拿不到 IP 的 netif，不 abort | 已确认安全，降级纯 WiFi |
@@ -249,7 +274,7 @@ dual_net 的两处写点仅在根节点（dual_net 只在根节点初始化）�
 | SPI 总线冲突 | 已消除（dual_net 不再 `spi_bus_initialize`） | — |
 | 网线反复插拔 | link up/down 去抖计时（3s / 1s） | 抖动期间不改路由、不改 `Network_Flag` |
 | DHCP 失败/慢 | 未收到 `IP_EVENT_ETH_GOT_IP` | 保持 WiFi 上行 |
-| 有 IP 但服务器不通 | 探测连续失败 `LG_DUAL_NET_UPLINK_PROBE_FAIL_COUNT` 次 | 取消以太网优先，回落 WiFi，DNS 改回 WiFi 侧 |
+| 有 IP 但到不了业务服务器（含「能上外网但到不了 MQTT」） | TCP 探测连续失败 `LG_DUAL_NET_UPLINK_PROBE_FAIL_COUNT` 次 | 不抢占 WiFi；WiFi 断时仍作为保底上行且不重启 |
 | 以太网中途断开 | `ETHERNET_EVENT_DISCONNECTED` / `IP_EVENT_ETH_LOST_IP` | 清 `s_eth_ready`，路由切回 STA，failover 恢复工作 |
 | dual_net 初始化失败 | `s_dual_net_initialized == false` | 裁决入口退化为「STA 是否取得 IP」，根节点不会丢 `Network_Flag` |
 | WiFi 仍在但网线不通 | 路由切换要求 `s_eth_ready \|\| !wifi_up` | 不把可用上行换成不可用上行 |

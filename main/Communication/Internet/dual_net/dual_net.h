@@ -20,28 +20,28 @@
  * 以保证现有 Mesh-Lite 子节点入网链路不受影响。
  */
 #ifndef DUAL_NET_ENABLE
-#define DUAL_NET_ENABLE                 1   /**< 模块总开关；0 时 dual_net_init() 直接返回 */
+#define DUAL_NET_ENABLE 1 /**< 模块总开关；0 时 dual_net_init() 直接返回 */
 #endif
 
 #ifndef DUAL_NET_ROOT_ONLY
-#define DUAL_NET_ROOT_ONLY              1   /**< 1=仅根节点(IsRoot==1)运行；子节点入口直接返回，零代码运行 */
+#define DUAL_NET_ROOT_ONLY 1 /**< 1=仅根节点(IsRoot==1)运行；子节点入口直接返回，零代码运行 */
 #endif
 
 #ifndef DUAL_NET_ETH_HW_ENABLE
-#define DUAL_NET_ETH_HW_ENABLE          1   /**< 1=接管 iot_bridge 创建的 ETH_WAN netif 并参与上行裁决 */
+#define DUAL_NET_ETH_HW_ENABLE 1 /**< 1=接管 iot_bridge 创建的 ETH_WAN netif 并参与上行裁决 */
 #endif
 
 #ifndef DUAL_NET_ENABLE_ROUTE_CONTROL
-#define DUAL_NET_ENABLE_ROUTE_CONTROL   1   /**< 1=允许 esp_netif_set_default_netif() 并写 Network_Flag（以太网接入后需为 1） */
+#define DUAL_NET_ENABLE_ROUTE_CONTROL 1 /**< 1=允许 esp_netif_set_default_netif() 并写 Network_Flag（以太网接入后需为 1） */
 #endif
 
 #ifndef DUAL_NET_ENABLE_WIFI_FALLBACK
-#define DUAL_NET_ENABLE_WIFI_FALLBACK   0   /**< 1=允许 dual_net 主动调用 esp_wifi_connect() */
+#define DUAL_NET_ENABLE_WIFI_FALLBACK 0 /**< 1=允许 dual_net 主动调用 esp_wifi_connect() */
 #endif
 
 /* 监控任务在「仅观察」模式下的轮询周期；带单位，避免魔法数 */
 #ifndef LG_DUAL_NET_MONITOR_IDLE_PERIOD_MS
-#define LG_DUAL_NET_MONITOR_IDLE_PERIOD_MS  60000
+#define LG_DUAL_NET_MONITOR_IDLE_PERIOD_MS 60000
 #endif
 
 /* 监控任务在「允许主动连接」模式下的轮询周期 */
@@ -51,12 +51,12 @@
 
 /* 认证失败后的重试次数上限（每次轮询周期计一次） */
 #ifndef LG_DUAL_NET_AUTH_RETRY_MAX_COUNT
-#define LG_DUAL_NET_AUTH_RETRY_MAX_COUNT    30
+#define LG_DUAL_NET_AUTH_RETRY_MAX_COUNT 30
 #endif
 
 /* 无网络时每 N 次轮询才尝试一次 WiFi 连接 */
 #ifndef LG_DUAL_NET_WIFI_RETRY_INTERVAL
-#define LG_DUAL_NET_WIFI_RETRY_INTERVAL     3
+#define LG_DUAL_NET_WIFI_RETRY_INTERVAL 3
 #endif
 
 /*
@@ -65,38 +65,45 @@
  * 必须叠加「业务服务器可达」探测，避免锁死在「有 IP 却上不了网」的僵局。
  */
 #ifndef LG_DUAL_NET_ETH_LINK_UP_DEBOUNCE_MS
-#define LG_DUAL_NET_ETH_LINK_UP_DEBOUNCE_MS      3000  /**< 网线插入后的去抖确认时间 */
+#define LG_DUAL_NET_ETH_LINK_UP_DEBOUNCE_MS 3000 /**< 网线插入后的去抖确认时间 */
 #endif
 
 #ifndef LG_DUAL_NET_ETH_LINK_DOWN_DEBOUNCE_MS
-#define LG_DUAL_NET_ETH_LINK_DOWN_DEBOUNCE_MS    1000  /**< 网线拔出后的去抖确认时间 */
+#define LG_DUAL_NET_ETH_LINK_DOWN_DEBOUNCE_MS 1000 /**< 网线拔出后的去抖确认时间 */
 #endif
 
 #ifndef LG_DUAL_NET_UPLINK_PROBE_TIMEOUT_MS
-#define LG_DUAL_NET_UPLINK_PROBE_TIMEOUT_MS      2000  /**< 单次连通性探测超时 */
+#define LG_DUAL_NET_UPLINK_PROBE_TIMEOUT_MS 2000 /**< 单次连通性探测超时 */
+#endif
+
+/* 等待探测结果的额外余量（在超时之上再加，用于容纳 ping 会话启停开销） */
+#ifndef LG_DUAL_NET_UPLINK_PROBE_WAIT_MARGIN_MS
+#define LG_DUAL_NET_UPLINK_PROBE_WAIT_MARGIN_MS 1500
 #endif
 
 #ifndef LG_DUAL_NET_UPLINK_PROBE_OK_COUNT
-#define LG_DUAL_NET_UPLINK_PROBE_OK_COUNT        2     /**< 连续成功次数达到后才认定可用 */
+#define LG_DUAL_NET_UPLINK_PROBE_OK_COUNT 2 /**< 连续成功次数达到后才认定可用 */
 #endif
 
 #ifndef LG_DUAL_NET_UPLINK_PROBE_FAIL_COUNT
-#define LG_DUAL_NET_UPLINK_PROBE_FAIL_COUNT      3     /**< 连续失败次数达到后才认定不可用 */
+#define LG_DUAL_NET_UPLINK_PROBE_FAIL_COUNT 3 /**< 连续失败次数达到后才认定不可用 */
 #endif
 
 /** 上行链路类型：为后续有线接入与并行分流预留 */
-typedef enum {
-    DUAL_NET_UPLINK_NONE = 0,   /**< 无可用上行 */
-    DUAL_NET_UPLINK_ETH,        /**< 有线以太网 */
-    DUAL_NET_UPLINK_WIFI,       /**< WiFi STA */
+typedef enum
+{
+    DUAL_NET_UPLINK_NONE = 0, /**< 无可用上行 */
+    DUAL_NET_UPLINK_ETH,      /**< 有线以太网 */
+    DUAL_NET_UPLINK_WIFI,     /**< WiFi STA */
 } dual_net_uplink_t;
 
 /** 上行可用性状态（叠加连通性探测结果，而非仅有 IP） */
-typedef enum {
-    DUAL_NET_UPLINK_STATE_NONE = 0,  /**< 无可用上行 */
-    DUAL_NET_UPLINK_STATE_PROBING,   /**< 已取得 IP，正在探测连通性 */
-    DUAL_NET_UPLINK_STATE_READY,     /**< IP 与业务服务器均可达 */
-    DUAL_NET_UPLINK_STATE_STALE,     /**< 曾可用但探测连续失败，等待回落 */
+typedef enum
+{
+    DUAL_NET_UPLINK_STATE_NONE = 0, /**< 无可用上行 */
+    DUAL_NET_UPLINK_STATE_PROBING,  /**< 已取得 IP，正在探测连通性 */
+    DUAL_NET_UPLINK_STATE_READY,    /**< IP 与业务服务器均可达 */
+    DUAL_NET_UPLINK_STATE_STALE,    /**< 曾可用但探测连续失败，等待回落 */
 } dual_net_uplink_state_t;
 
 /** 上行变化回调；在事件上下文调用，回调内不得阻塞 */
@@ -112,21 +119,21 @@ extern bool wifi_auth_failed;
 esp_err_t dual_net_init(void);
 
 /// @brief 通知WiFi连接成功
-/// @param  
+/// @param
 void dual_net_notify_wifi_up(void);
 
 /// @brief 通知WiFi断开连接
-/// @param  
+/// @param
 void dual_net_notify_wifi_down(void);
 
 /// @brief 获取当前激活的网络接口
-/// @param  
+/// @param
 /// @return "ETHERNET" / "WIFI" / "NONE"
-const char* dual_net_get_active_interface(void);
+const char *dual_net_get_active_interface(void);
 
 /// @brief 检查以太网是否激活
-/// @param  
-/// @return 
+/// @param
+/// @return
 bool dual_net_is_ethernet_active(void);
 
 /// @brief 检查WiFi是否激活
@@ -136,15 +143,15 @@ bool dual_net_is_wifi_active(void);
 bool dual_net_is_any_network_up(void);
 
 /// @brief 获取WiFi状态
-/// @param  
-/// @return 
-const char* dual_net_get_wifi_state(void);
+/// @param
+/// @return
+const char *dual_net_get_wifi_state(void);
 
 // 注册网络就绪回调
 typedef void (*network_ready_cb_t)(void);
 
 /// @brief 注册网络就绪回调函数
-/// @param callback 
+/// @param callback
 void dual_net_register_ready_callback(network_ready_cb_t callback);
 
 void dual_net_set_mesh_switching(bool switching);
