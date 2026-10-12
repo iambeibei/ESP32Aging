@@ -9,10 +9,14 @@
 #include "cJSON.h"
 #include "esp_app_desc.h"
 #include "appTask.h"
+#include "dual_net.h"
 
 static const char *TAG = "mesh_mqtt";
 
 static esp_mqtt_client_handle_t s_client = NULL;
+/* 启动计数由 net_init/配置任务更新；连接计数仅由 SDK MQTT 任务更新。 */
+static unsigned s_client_start_count;
+static unsigned s_mqtt_connect_count;
 
 static QueueHandle_t Topic_queue = NULL;
 static QueueHandle_t Data_queue = NULL;
@@ -99,10 +103,17 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
 {
     switch (event->event_id)
     {
+    case MQTT_EVENT_BEFORE_CONNECT:
+        ESP_LOGI(TAG, "MQTT_EVENT_BEFORE_CONNECT client=%p, task=%p, uplink=%s",
+                 (void *)event->client, (void *)xTaskGetCurrentTaskHandle(),
+                 IsRoot == 1 ? dual_net_get_active_interface() : "MESH_STA");
+        break;
     case MQTT_EVENT_CONNECTED:
     {
         s_mqtt_connected = true;
-        ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+        ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED client=%p, connection_count=%u, uplink=%s",
+                 (void *)event->client, ++s_mqtt_connect_count,
+                 IsRoot == 1 ? dual_net_get_active_interface() : "MESH_STA");
 
         char *json = create_up_line_json(time(NULL), DEVICE_ID);
         if (json != NULL)
@@ -229,7 +240,10 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
     case MQTT_EVENT_DISCONNECTED:
     {
         s_mqtt_connected = false;
-        ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
+        /* 自动重连复用 SDK MQTT 任务、队列和 mqtt_rx，不在这里重建客户端。 */
+        ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED client=%p, uplink=%s; keep client and queues",
+                 (void *)event->client,
+                 IsRoot == 1 ? dual_net_get_active_interface() : "MESH_STA");
 
         break;
     }
@@ -433,6 +447,8 @@ esp_err_t mqtt_app_start(void)
         return ret;
     }
 
+    ESP_LOGI(TAG, "MQTT client started: client=%p, start_count=%u",
+             (void *)s_client, ++s_client_start_count);
     return ESP_OK;
 }
 

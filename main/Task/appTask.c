@@ -2859,6 +2859,10 @@ cleanup:
 // MQTT数据处理任务，主要处理MQTT消息的接收和解析
 static void app_MQTT_Rdata_handle(void *arg)
 {
+    /* 创建次数只由本任务入口更新；网络断开不会删除或重新创建本任务。 */
+    static unsigned mqtt_rx_start_count;
+    ESP_LOGI(TAG, "mqtt_rx started: task=%p, start_count=%u",
+             (void *)xTaskGetCurrentTaskHandle(), ++mqtt_rx_start_count);
     char *json_str = app_malloc_prefer_psram(MQTT_DATA_Cache);
     if (json_str == NULL)
     {
@@ -2979,7 +2983,7 @@ void Init_ByNetwork_Flag(void *arg)
 {
     while (1)
     {
-        if (Network_Flag == 1)
+        if (__atomic_load_n(&Network_Flag, __ATOMIC_ACQUIRE) == 1)
         {
             esp_err_t err = mqtt_init();
             if (err != ESP_OK)
@@ -3008,6 +3012,7 @@ void Init_ByNetwork_Flag(void *arg)
 
             if (IsRoot == 1)
             {
+                ESP_LOGI(TAG, "Root network services initialized; MQTT auto reconnect owns subsequent recovery");
                 break;
             }
 

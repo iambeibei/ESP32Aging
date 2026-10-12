@@ -57,4 +57,4 @@ char *SERVER_UDP_Port_R=NULL;
 
 
 // 网络标志位
-volatile uint8_t Network_Flag = 0; // 0=本机无 STA IP，1=本机已取得 STA IP
+volatile uint8_t Network_Flag = 0; // 根节点：有线/STA 的链路与 IP 条件；子节点：父节点 STA IP

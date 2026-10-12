@@ -16,8 +16,8 @@
  */
 
 /*
- * 能力门控：默认只保留「状态观察」，所有会产生副作用的动作都默认关闭，
- * 以保证现有 Mesh-Lite 子节点入网链路不受影响。
+ * 能力门控：默认仅根节点执行有线优先、路由裁决和 STA 重连控制；
+ * 子节点不初始化此模块。硬件仍由 iot_bridge 管理。
  */
 #ifndef DUAL_NET_ENABLE
 #define DUAL_NET_ENABLE 1 /**< 模块总开关；0 时 dual_net_init() 直接返回 */
@@ -39,17 +39,22 @@
 #define DUAL_NET_ENABLE_WIFI_FALLBACK 0 /**< 1=允许 dual_net 主动调用 esp_wifi_connect() */
 #endif
 
-/* 监控任务在「仅观察」模式下的轮询周期；带单位，避免魔法数 */
+/* 默认探测/认证重试周期；事件唤醒不改变周期计数。 */
 #ifndef LG_DUAL_NET_MONITOR_IDLE_PERIOD_MS
 #define LG_DUAL_NET_MONITOR_IDLE_PERIOD_MS 60000
 #endif
 
-/* 监控任务在「允许主动连接」模式下的轮询周期 */
+/* 允许主动连接时的探测/重试周期。 */
 #ifndef LG_DUAL_NET_MONITOR_ACTIVE_PERIOD_MS
 #define LG_DUAL_NET_MONITOR_ACTIVE_PERIOD_MS 10000
 #endif
 
-/* 认证失败后的重试次数上限（每次轮询周期计一次） */
+/* 事件响应和去抖检查的最大等待时间，不计入探测/认证重试次数。 */
+#ifndef LG_DUAL_NET_EVENT_CHECK_PERIOD_MS
+#define LG_DUAL_NET_EVENT_CHECK_PERIOD_MS 1000
+#endif
+
+/* 认证失败后的重试次数上限（每个探测/重试周期计一次） */
 #ifndef LG_DUAL_NET_AUTH_RETRY_MAX_COUNT
 #define LG_DUAL_NET_AUTH_RETRY_MAX_COUNT 30
 #endif
@@ -61,8 +66,8 @@
 
 /*
  * 上行可用性判定参数。
- * 只拿到 IP 不足以认定上行可用（网线可能接到一台不通的设备），
- * 必须叠加「配置的 MQTT IPv4 地址与 TCP 端口可建连」探测。
+ * WiFi 可用时，以太网必须通过 MQTT TCP 探测才抢占默认路由。
+ * WiFi 不可用时，有线有效 IP 立即作为唯一出口；网络条件与服务可达性分开。
  */
 #ifndef LG_DUAL_NET_ETH_LINK_UP_DEBOUNCE_MS
 #define LG_DUAL_NET_ETH_LINK_UP_DEBOUNCE_MS 3000 /**< 网线插入后的去抖确认时间 */
@@ -98,19 +103,23 @@ typedef enum
     DUAL_NET_UPLINK_STATE_NONE = 0, /**< 无可用上行 */
     DUAL_NET_UPLINK_STATE_PROBING,  /**< 已取得 IP，正在探测连通性 */
     DUAL_NET_UPLINK_STATE_READY,    /**< 有线已通过 MQTT TCP 探测，或 WiFi STA 已取得 IP */
-    DUAL_NET_UPLINK_STATE_STALE,    /**< 曾可用但探测连续失败，等待回落 */
+    DUAL_NET_UPLINK_STATE_STALE,    /**< 探测连续失败达到阈值，恢复无线重连 */
 } dual_net_uplink_state_t;
 
-/** 上行变化回调；在事件上下文调用，回调内不得阻塞 */
+/** 上行变化回调；在 net_monitor 任务调用，回调内不得阻塞或删除该任务 */
 typedef void (*dual_net_uplink_cb_t)(dual_net_uplink_t uplink);
 
-extern bool wifi_up;
-extern bool wifi_auth_failed;
+/** 以下状态查询使用短临界区快照；仅任务/事件上下文调用，不可在 ISR 调用。 */
+bool dual_net_is_initialized(void);
+
+/** 物理链路在线且有有效 IP；不要求 MQTT 探测完成。供根节点重启守卫使用。 */
+bool dual_net_has_eth_ip(void);
 
 /// @brief 初始化双网卡。
 /// @note 必须在 esp_bridge_create_all_netif() 之后调用，否则取不到 WIFI_STA_DEF 句柄。
 ///       非根节点(IsRoot!=1)时直接返回 ESP_OK，不注册任何事件处理器、不创建任务。
-/// @return ESP_OK 成功或不适用；ESP_FAIL 取 netif 句柄失败或建任务失败
+/// @note 仅启动任务串行调用；可能阻塞，不可在 ISR/事件回调调用，不支持并发初始化。
+/// @return ESP_OK 成功或不适用；ESP_ERR_INVALID_STATE 缺少 STA netif；其他错误为初始化失败
 esp_err_t dual_net_init(void);
 
 /// @brief 通知WiFi连接成功
@@ -145,7 +154,7 @@ const char *dual_net_get_wifi_state(void);
 // 注册网络就绪回调
 typedef void (*network_ready_cb_t)(void);
 
-/// @brief 注册网络就绪回调函数
+/// @brief 注册一次性网络就绪回调；由 net_monitor 任务调用，回调不得阻塞
 /// @param callback
 void dual_net_register_ready_callback(network_ready_cb_t callback);
 
@@ -161,8 +170,9 @@ dual_net_uplink_t dual_net_get_active_uplink(void);
 /// @return netif 句柄或 NULL
 esp_netif_t *dual_net_get_uplink_netif(dual_net_uplink_t uplink);
 
-/// @brief 预留：手动选择上行链路（DUAL_NET_UPLINK_NONE 表示恢复自动）
-/// @return ESP_OK 成功；ESP_ERR_NOT_SUPPORTED 当前门控下不支持切换
+/// @brief 请求选择上行链路（DUAL_NET_UPLINK_NONE 恢复自动）；任务/事件上下文，不阻塞
+/// @note 由 net_monitor 串行执行；通过 active_uplink 查询或回调确认实际切换结果。
+/// @return ESP_OK 请求已受理；ESP_ERR_NOT_SUPPORTED 当前门控下不支持切换
 esp_err_t dual_net_select_uplink(dual_net_uplink_t uplink);
 
 /// @brief 预留：注册上行变化回调
@@ -174,22 +184,22 @@ void dual_net_register_uplink_change_cb(dual_net_uplink_cb_t callback);
 dual_net_uplink_state_t dual_net_get_uplink_state(void);
 
 /// @brief 以太网是否已确认为可用上行（取得 IP + 连通性探测通过）
-/// @note 这是「以太网优先」的唯一依据，也是抑制 root_failover 重启的判据。
+/// @note WiFi 可用时以此决定有线抢占；重启守卫应使用 dual_net_has_eth_ip()。
 /// @return true=以太网可承担上行
 bool dual_net_is_eth_uplink_ready(void);
 
-/// @brief 根节点上行是否真正可用（以太网已确认，或 WiFi STA 已取得 IP）
+/// @brief 根节点是否具备链路/IP条件（有线或 WiFi STA 有有效 IP；不保证服务器可达）
 /// @note 供 Network_Flag 裁决使用；可在任务上下文调用。
 /// @return true=有可用上行
 bool dual_net_is_uplink_ready(void);
 
-/// @brief Network_Flag 的统一裁决入口（mesh.c 的两处写点已改为调用本函数）
-/// @note 在事件上下文调用，内部只做轻量赋值与日志，不阻塞。
+/// @brief 兼容入口：请求监控任务重新检查网络；初始化后根节点标志仅由监控任务写入
+/// @note 任务/事件上下文调用，不阻塞，不可在 ISR 调用。
 void dual_net_arbitrate_network_flag(void);
 
-/// @brief 以太网成为出口后，把它的 DNS 重新下发给 SoftAP（修复 iot_bridge 固定用 STA 覆盖的问题）
-/// @note 内部使用 esp_bridge_update_dns_info()，对 NULL 参数安全，不要求 netif 已 up。
-/// @return ESP_OK 成功；ESP_ERR_INVALID_STATE 当前无可用以太网 netif
+/// @brief 将实际选中的上行 DNS 下发给数据转发网卡（含 SoftAP）
+/// @note 在 net_monitor 任务串行调用，可能阻塞，不可在 ISR/事件回调调用。
+/// @return ESP_OK 成功；ESP_ERR_INVALID_STATE 当前无有效上行
 esp_err_t dual_net_refresh_dns_to_softap(void);
 
 #endif // DUAL_NET_H

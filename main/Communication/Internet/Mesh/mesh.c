@@ -1,5 +1,6 @@
 #include <ctype.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,15 +41,49 @@ static char s_softap_ssid[33];
 /* Returned by lg_mesh_get_ssid_by_mac(); has to outlive the callback. */
 static uint8_t s_parent_ssid[33];
 static uint8_t s_uplink_index;
-static volatile bool s_scan_requested;
-static volatile bool s_scan_active;
-static volatile bool s_restart_for_failover;
-static volatile bool s_trial_success;
+static atomic_bool s_scan_requested;
+static atomic_bool s_scan_active;
+static atomic_bool s_restart_for_failover;
+static atomic_bool s_trial_success;
 static bool s_trial_active;
 static bool s_sntp_started;
 static RTC_NOINIT_ATTR uint32_t s_failover_magic;
-static RTC_NOINIT_ATTR volatile uint32_t s_failover_attempts;
+static RTC_NOINIT_ATTR atomic_uint_least32_t s_failover_attempts;
 static RTC_NOINIT_ATTR uint32_t s_trial_uplink_index;
+
+/* 只有 net_monitor 访问此标志；SDK 调用可产生新的断开事件，先标记再调用。
+ * disconnect 返回失败时内部可能已暂停重连，仍须在有线失效时执行一次 connect。
+ * 这是每次状态转换的一次控制尝试，不在断开事件中反复调用。 */
+static bool s_sta_reconnect_paused_by_eth;
+
+void mesh_root_manage_sta_reconnect(bool wired_preferred, bool sta_has_ip)
+{
+    if (IsRoot != 1) return;
+    bool pause = wired_preferred && (s_sta_reconnect_paused_by_eth || !sta_has_ip);
+    if (pause == s_sta_reconnect_paused_by_eth) return;
+    s_sta_reconnect_paused_by_eth = pause;
+    if (pause) {
+        esp_err_t err = esp_mesh_lite_disconnect();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "有线接管：暂停 STA 重连请求返回 %s（STA 可能已断开）", esp_err_to_name(err));
+        } else {
+            ESP_LOGI(TAG, "有线接管：已暂停 STA 内部重连，保留根身份与 SoftAP");
+        }
+    } else {
+        ESP_LOGI(TAG, "有线上行失效：恢复根节点 STA 重连");
+        esp_mesh_lite_connect();
+    }
+}
+
+/* dual_net 初始化成功后由它发布根节点标志；初始化前/失败时保留 STA 兜底。
+ * 子节点依旧按父节点 STA 的 IP 事件更新，不参与有线控制。 */
+static void mesh_update_network_flag(bool sta_has_ip)
+{
+#if DUAL_NET_ENABLE && DUAL_NET_ENABLE_ROUTE_CONTROL
+    if (IsRoot == 1 && dual_net_is_initialized()) return;
+#endif
+    __atomic_store_n(&Network_Flag, sta_has_ip ? 1U : 0U, __ATOMIC_RELEASE);
+}
 
 static bool parse_mesh_id(const char *value, uint8_t *id)
 {
@@ -126,14 +161,7 @@ static void network_event_handler(void *arg, esp_event_base_t base,
          * 根节点由 dual_net 综合「以太网 + WiFi」裁决（以太网可用时不会被判为断网）；
          * 子节点上行由 mesh 父节点提供，dual_net 不运行，沿用原判据。
          */
-        if (IsRoot == 1)
-        {
-            dual_net_arbitrate_network_flag();
-        }
-        else
-        {
-            Network_Flag = 1;
-        }
+        mesh_update_network_flag(true);
         s_failover_attempts = 0;
         ESP_LOGI(TAG, "STA IP " IPSTR ", level=%u, role=%s",
                  IP2STR(&event->ip_info.ip), esp_mesh_lite_get_level(),
@@ -147,14 +175,7 @@ static void network_event_handler(void *arg, esp_event_base_t base,
     } else if ((base == IP_EVENT && event_id == IP_EVENT_STA_LOST_IP) ||
                (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)) {
         /* 与上面 STA_GOT_IP 对称：根节点交给 dual_net 裁决，子节点沿用原判据 */
-        if (IsRoot == 1)
-        {
-            dual_net_arbitrate_network_flag();
-        }
-        else
-        {
-            Network_Flag = 0;
-        }
+        mesh_update_network_flag(false);
         if (s_trial_active) s_trial_success = false;
         ESP_LOGW(TAG, "STA uplink lost; local Mesh-Lite remains active");
     }
@@ -175,7 +196,7 @@ static void scan_done_handler(void *arg, esp_event_base_t base,
                               int32_t event_id, void *event_data)
 {
     if (!s_scan_active) return;
-    if (Network_Flag || !IsRoot) {
+    if (__atomic_load_n(&Network_Flag, __ATOMIC_ACQUIRE) || !IsRoot || dual_net_has_eth_ip()) {
         scan_end_cb();
         return;
     }
@@ -192,7 +213,7 @@ static void scan_done_handler(void *arg, esp_event_base_t base,
     const char *other_ssid = s_uplink_index == 0 ? SSID1 : SSID;
     if (esp_wifi_scan_get_ap_records(&count, records) == ESP_OK) {
         for (uint16_t i = 0; i < count; ++i) {
-            if (strcmp((const char *)records[i].ssid, other_ssid) == 0) {
+            if (strcmp((const char *)records[i].ssid, other_ssid) == 0 && !dual_net_has_eth_ip()) {
                 ESP_LOGW(TAG, "Alternate SSID found; testing it after restart");
                 s_restart_for_failover = true;
                 break;
@@ -214,12 +235,13 @@ static void root_failover_task(void *arg)
          * 此时不应按「上行故障」处理，否则会扫描备用路由器并 esp_restart()，
          * 导致插着网线的根节点被无谓重启（本任务只在根节点创建）。
          */
-        if (dual_net_is_eth_uplink_ready()) {
+        if (dual_net_has_eth_ip()) {
             if (lost_since != 0 || s_scan_requested) {
                 ESP_LOGI(TAG, "以太网上行可用，暂停主备路由器切换（WiFi 侧无 IP 属正常）");
             }
             lost_since = 0;
             s_scan_requested = false;
+            s_scan_active = false;
             s_restart_for_failover = false;
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
@@ -231,6 +253,7 @@ static void root_failover_task(void *arg)
                     s_trial_uplink_index = UINT32_MAX;
                     ESP_LOGI(TAG, "Alternate uplink confirmed; restarting with saved credentials");
                     vTaskDelay(pdMS_TO_TICKS(200));
+                    if (dual_net_has_eth_ip()) continue;
                     esp_restart();
                 }
                 ESP_LOGE(TAG, "Failed to save confirmed uplink: %s", esp_err_to_name(err));
@@ -240,13 +263,14 @@ static void root_failover_task(void *arg)
                     s_trial_uplink_index = UINT32_MAX;
                     ESP_LOGW(TAG, "Alternate uplink did not obtain IP; returning to saved uplink");
                     vTaskDelay(pdMS_TO_TICKS(200));
+                    if (dual_net_has_eth_ip()) continue;
                     esp_restart();
                 }
             }
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
-        if (Network_Flag) {
+        if (__atomic_load_n(&Network_Flag, __ATOMIC_ACQUIRE)) {
             lost_since = 0;
         } else {
             if (lost_since == 0) lost_since = now;
@@ -269,7 +293,8 @@ static void root_failover_task(void *arg)
                 }
             }
         }
-        if (s_restart_for_failover && Network_Flag) {
+        if (s_restart_for_failover &&
+            (__atomic_load_n(&Network_Flag, __ATOMIC_ACQUIRE) || dual_net_has_eth_ip())) {
             s_restart_for_failover = false;
         }
         if (s_restart_for_failover) {
@@ -278,6 +303,13 @@ static void root_failover_task(void *arg)
             ++s_failover_attempts;
             ESP_LOGW(TAG, "Restarting to verify uplink %u", next);
             vTaskDelay(pdMS_TO_TICKS(200));
+            if (dual_net_has_eth_ip() || __atomic_load_n(&Network_Flag, __ATOMIC_ACQUIRE)) {
+                s_trial_uplink_index = UINT32_MAX;
+                s_restart_for_failover = false;
+                /* GOT_IP 回调也会清零计数，不能用 -- 回滚而导致无符号下溢。 */
+                s_failover_attempts = 0;
+                continue;
+            }
             esp_restart();
         }
         vTaskDelay(pdMS_TO_TICKS(1000));
