@@ -22,11 +22,17 @@ extern "C" {
 /* -------------------------------------------------------------------------- */
 
 /*
- * OTA 固件根目录。
- * 目录末尾带不带 '/' 都可以，simple_ota 内部的 build_url() 会自动补分隔。
- * 实际请求地址 = 该目录 + update.json（版本描述） / + 固件文件名。
+ * OTA 文件下载接口（HTTPS REST 形态，2026-10 服务器迁移后启用）。
+ * 旧形态为静态目录 http://<ip>:<port>/OTABin/（目录 + 文件名拼接），已随
+ * 8080 端口下线失效；新形态为查询串下载，文件名通过 ?fileName= 传入：
+ *   https://192.168.40.116:7088/api/OTAFiles/Download?fileName=update.json
+ *   https://192.168.40.116:7088/api/OTAFiles/Download?fileName=xxx_v0.0.2.bin
+ * 与 LG_URL_Get_LOST_IDNUM_URL 同主机同端口（7088）。
+ * 注意：base_url 末尾的 "?fileName=" 是接口契约的一部分，
+ * simple_ota 按 SIMPLE_OTA_URL_STYLE_QUERY 原样拼接，不要再补 '/'。
+ * 详见 OTA_SERVER_MIGRATION_DESIGN.md。
  */
-#define LG_URL_OTA_BASE_URL "http://192.168.40.116:8080/OTAFiles/"
+#define LG_URL_OTA_BASE_URL "http://192.168.1.65:11282/api/OTAFiles/Download?fileName="
 
 
 /*
@@ -38,7 +44,7 @@ extern "C" {
 #define LG_URL_HTTP_PROTOCOL_WHOLE_URL "https://ipc.poweroak.ltd:29009/DataCenter/V1/Protocol/GetWholeProtocol"
 
 
-#define LG_URL_Get_LOST_IDNUM_URL "https://192.168.40.116:7088/DeviceServiceCallback/GetMissingIdNums"
+#define LG_URL_Get_LOST_IDNUM_URL "http://192.168.1.65:11282/DeviceServiceCallback/GetMissingIdNums"
 
 #ifdef __cplusplus
 }

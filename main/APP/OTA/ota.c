@@ -12,7 +12,6 @@
 #include "cJSON.h"
 #include "esp_app_format.h"
 #include "esp_http_client.h"
-#include "esp_https_ota.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
@@ -64,11 +63,25 @@ static esp_err_t validate_config(const simple_ota_config_t *config)
         return ESP_ERR_INVALID_ARG;
     }
 
+    /*
+     * QUERY 风格的 base 必须是完整的下载接口前缀：同时含 scheme 与 '?'。
+     * 缺 '?' 说明配置写成了目录形态（或反之），继续拼会产出
+     * "…Download?fileName=/update.json" 这类脏 URL，此处防呆。
+     */
+    if (config->url_style == SIMPLE_OTA_URL_STYLE_QUERY &&
+        (strstr(config->base_url, "://") == NULL ||
+         strchr(config->base_url, '?') == NULL)) {
+        ESP_LOGE(TAG, "QUERY url_style requires base_url with scheme and '?': %s",
+                 config->base_url);
+        return ESP_ERR_INVALID_ARG;
+    }
+
     return ESP_OK;
 }
 
 static esp_err_t build_url(const char *base_url,
                            const char *name,
+                           simple_ota_url_style_t url_style,
                            char *out,
                            size_t out_size)
 {
@@ -76,14 +89,23 @@ static esp_err_t build_url(const char *base_url,
         return ESP_ERR_INVALID_ARG;
     }
 
-    size_t base_len = strlen(base_url);
-    bool has_slash = (base_len > 0 && base_url[base_len - 1] == '/');
-
-    int written = snprintf(out,
+    int written;
+    if (url_style == SIMPLE_OTA_URL_STYLE_QUERY) {
+        /*
+         * QUERY：base 已含 "?fileName=" 等查询前缀，必须原样拼接。
+         * 此处若按 PATH 逻辑补 '/'，会生成 "…?fileName=/update.json" 导致 404。
+         */
+        written = snprintf(out, out_size, "%s%s", base_url, name);
+    } else {
+        /* PATH：目录拼接，base 不带 '/' 时自动补分隔（旧静态目录形态）。 */
+        size_t base_len = strlen(base_url);
+        bool has_slash = (base_len > 0 && base_url[base_len - 1] == '/');
+        written = snprintf(out,
                            out_size,
                            has_slash ? "%s%s" : "%s/%s",
                            base_url,
                            name);
+    }
 
     if (written < 0 || (size_t)written >= out_size) {
         ESP_LOGE(TAG, "OTA URL is too long");
@@ -136,11 +158,16 @@ static bool validate_firmware_filename(const char *file)
         return false;
     }
 
-    /* file 字段只允许同目录文件名，不允许 URL、子目录和 .. 跳转。 */
+    /* file 字段只允许同目录文件名，不允许 URL、子目录和 .. 跳转。
+     * QUERY 风格下 file 直接拼进 "?fileName=" 查询串，'?'、'&'、'#' 会破坏
+     * 查询参数边界，一并拒绝（PATH 风格下这些字符同样无合法用途）。 */
     if (strstr(file, "..") != NULL ||
         strstr(file, "://") != NULL ||
         strchr(file, '/') != NULL ||
-        strchr(file, '\\') != NULL) {
+        strchr(file, '\\') != NULL ||
+        strchr(file, '?') != NULL ||
+        strchr(file, '&') != NULL ||
+        strchr(file, '#') != NULL) {
         return false;
     }
 
@@ -229,8 +256,19 @@ static esp_err_t apply_https_config(esp_http_client_config_t *http_config,
         return ESP_OK;
     }
 
+#ifdef CONFIG_ESP_TLS_INSECURE
+    /*
+     * 无证书 HTTPS 放行：仅当 sdkconfig 启用 CONFIG_ESP_TLS_INSECURE
+     * （及 CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY）时才编译进本分支，
+     * 与仓库内访问同一内网主机的 test_http_post_record_query() 先例一致。
+     * 打 WRN 以便现场识别本次为不安全连接；关闭该配置时维持报错，不静默降级。
+     */
+    ESP_LOGW(TAG, "HTTPS without certificate (insecure build): %s", http_config->url);
+    return ESP_OK;
+#else
     ESP_LOGE(TAG, "HTTPS URL requires cert_pem or certificate bundle");
     return ESP_ERR_INVALID_ARG;
+#endif
 }
 
 static esp_err_t download_metadata_json(const simple_ota_config_t *config,
@@ -240,6 +278,7 @@ static esp_err_t download_metadata_json(const simple_ota_config_t *config,
     char metadata_url[SIMPLE_OTA_URL_MAX_LEN];
     esp_err_t err = build_url(config->base_url,
                               config->metadata_file,
+                              config->url_style,
                               metadata_url,
                               sizeof(metadata_url));
     if (err != ESP_OK) {
@@ -403,24 +442,37 @@ esp_err_t simple_ota_get_running_version(char *version, size_t version_size)
     return ESP_OK;
 }
 
-static esp_err_t perform_http_ota(const char *firmware_url)
+/*
+ * 固件下载：esp_http_client 手动 OTA 通路，对 http:// 与 https:// 均适用。
+ * 证书策略与元数据下载共用 apply_https_config()（cert_pem / bundle /
+ * 无证书 INSECURE 放行），不使用 esp_https_ota 组件——后者强制要求证书配置，
+ * 与本报文的无证书 HTTPS 策略冲突（见 OTA_SERVER_MIGRATION_DESIGN.md 第 8 节）。
+ */
+static esp_err_t perform_http_ota(const char *firmware_url,
+                                  const simple_ota_config_t *config)
 {
-    ESP_LOGI(TAG, "Starting HTTP OTA: %s", firmware_url);
+    ESP_LOGI(TAG, "Starting OTA download: %s", firmware_url);
 
-    esp_http_client_config_t config = {
+    esp_http_client_config_t http_config = {
         .url = firmware_url,
         .event_handler = http_event_handler,
         .timeout_ms = 15000,
         .keep_alive_enable = true,
+        .skip_cert_common_name_check = config->skip_cert_common_name_check,
     };
 
-    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_err_t err = apply_https_config(&http_config, config);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    esp_http_client_handle_t client = esp_http_client_init(&http_config);
     if (client == NULL) {
         ESP_LOGE(TAG, "Failed to initialize HTTP client");
         return ESP_FAIL;
     }
 
-    esp_err_t err = esp_http_client_open(client, 0);
+    err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to open firmware URL: %s", esp_err_to_name(err));
         esp_http_client_cleanup(client);
@@ -546,48 +598,19 @@ ota_fail:
     return err;
 }
 
-static esp_err_t perform_https_ota(const char *firmware_url,
-                                   const simple_ota_config_t *config)
-{
-    esp_http_client_config_t http_config = {
-        .url = firmware_url,
-        .event_handler = http_event_handler,
-        .timeout_ms = 15000,
-        .keep_alive_enable = true,
-        .skip_cert_common_name_check = config->skip_cert_common_name_check,
-    };
-
-    esp_err_t err = apply_https_config(&http_config, config);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    esp_https_ota_config_t ota_config = {
-        .http_config = &http_config,
-    };
-
-    ESP_LOGI(TAG, "Starting HTTPS OTA: %s", firmware_url);
-
-    err = esp_https_ota(&ota_config);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "HTTPS OTA failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    ESP_LOGI(TAG, "OTA successful. Restarting...");
-    esp_restart();
-    return ESP_OK;
-}
-
 static esp_err_t perform_firmware_ota(const char *firmware_url,
                                       const simple_ota_config_t *config)
 {
-    if (is_https_url(firmware_url)) {
-        return perform_https_ota(firmware_url, config);
-    }
-
-    if (strncmp(firmware_url, "http://", 7) == 0) {
-        return perform_http_ota(firmware_url);
+    /*
+     * http:// 与 https:// 统一走 esp_http_client 手动 OTA 通路。
+     * 不按 scheme 分流到 esp_https_ota 组件：其 is_server_verification_enabled()
+     * 只接受 cert_pem/use_global_ca_store/crt_bundle_attach，拒绝本工程的无证书
+     * HTTPS 策略；而 esp_http_client 通路经 apply_https_config() 处理后已由
+     * 元数据下载实测验证可用（见 OTA_SERVER_MIGRATION_DESIGN.md 第 8 节）。
+     */
+    if (strncmp(firmware_url, "http://", 7) == 0 ||
+        strncmp(firmware_url, "https://", 8) == 0) {
+        return perform_http_ota(firmware_url, config);
     }
 
     ESP_LOGE(TAG, "Unsupported firmware URL: %s", firmware_url);
@@ -653,6 +676,7 @@ esp_err_t simple_ota_check_and_update(const simple_ota_config_t *config)
     char firmware_url[SIMPLE_OTA_URL_MAX_LEN];
     err = build_url(config->base_url,
                     metadata.file,
+                    config->url_style,
                     firmware_url,
                     sizeof(firmware_url));
     if (err != ESP_OK) {
@@ -674,8 +698,11 @@ esp_err_t simple_ota_check_and_update_default(void)
         .base_url = LG_URL_OTA_BASE_URL,
         .metadata_file = SIMPLE_OTA_DEFAULT_METADATA_FILE,
         .cert_pem = NULL,
-        .skip_cert_common_name_check = false,
+        /* 内网 IP + HTTPS 下载接口：证书 CN 校验必然失败，与仓库内访问同一
+         * 7088 主机的 test_http_post_record_query() 策略一致（无证书放行）。 */
+        .skip_cert_common_name_check = true,
         .use_crt_bundle = false,
+        .url_style = SIMPLE_OTA_URL_STYLE_QUERY,
     };
 
     return simple_ota_check_and_update(&config);
