@@ -64,6 +64,10 @@
 #define LG_STACK_MESH_FAILOVER     4096
 #define LG_PRIO_MESH_FAILOVER      5
 
+/* 子节点 mesh 健康监视：只读状态打日志，无任何重连/重启动作 */
+#define LG_STACK_MESH_HEALTH       3072
+#define LG_PRIO_MESH_HEALTH        2
+
 #define LG_STACK_NET_MONITOR       3072
 #define LG_PRIO_NET_MONITOR        3
 

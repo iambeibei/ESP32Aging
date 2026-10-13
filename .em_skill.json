@@ -1,0 +1,8 @@
+{
+  "embedded_coding_standard": {
+    "review": {
+      "rules": ["CERT C", "FreeRTOS", "Local coding standard"],
+      "updated_at": "2026-10-13"
+    }
+  }
+}

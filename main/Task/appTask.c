@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <inttypes.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
@@ -121,7 +122,8 @@ uint16_t s_new_pn_ready = 0;
 /*
  * MQTT老化启动协调状态：
  * AGING_CMD_IDLE    : 当前没有待启动任务，也没有正在运行的老化任务；
- * AGING_CMD_WAIT_PN : 已收到start_aging并缓存，但尚未收到本轮新的set_pn；
+ * AGING_CMD_WAIT_PN : 旧固件遗留（掉电恢复）的挂起start_aging，尚未被本轮新set_pn消费；
+ *                    新固件收到缺PN的start_aging时直接拒绝回IDLE，不再产生该状态；
  * AGING_CMD_RUNNING : PN和start_aging均已就绪，老化任务已经真正启动。
  *
  * 注意：PN_Code中即使残留旧PN，也不能据此判断下一轮是否可以启动；
@@ -136,6 +138,12 @@ typedef enum
 
 static AgingCommandState s_aging_cmd_state = AGING_CMD_IDLE;
 static int s_pending_start_seq = 0;
+
+/*
+ * start_aging缺少PN时的指令回复文案（线上契约，服务器按 Msg 内容识别）。
+ * 沿用现有英文回复风格，与 "Aging already started, ignoring new command" 一致。
+ */
+#define AGING_START_REPLY_NO_PN "Aging start rejected: PN is not set, please send set_pn first"
 
 int8_t Mqtt_Log_Mode = -1; // MQTT日志上报模式，-1表示不启动，0为启动运行日志，1为启动错误日志
 
@@ -160,7 +168,9 @@ static QueueHandle_t Upload_data_queue = NULL; // 上传数据队列
 
 AgingResumeState agingResumeState = {0}; // 定义全局老化恢复状态变量
 
-uint8_t BTDisConnect = 0; // 蓝牙断开标志位，为1是主动去断开蓝牙触发的，为0是被动断开蓝牙触发的
+/* 蓝牙断开标志位，为1是主动去断开蓝牙触发的，为0是被动断开蓝牙触发的。
+ * Bluedroid 任务写、CPU1 业务任务读，加 volatile 保证跨任务可见性。 */
+volatile uint8_t BTDisConnect = 0;
 
 void Aging_Test_Task(void *arg);
 void app_AgingData_Get_handle(void *arg);
@@ -237,6 +247,27 @@ static void print_application_task_stacks(void)
  * 所有错误均写入本地；只有日志会话激活后才通过 MQTT 上报运行日志和错误日志。
  */
 static volatile bool AgingLogActive = false;
+
+/*
+ * BLE 异常断开事件：ble_disconnect_cb() 只负责置位（回调上下文不碰存储/MQTT/任务），
+ * 由 Aging_Test_Task 主循环与 AgingAction 各长循环内的检查点消费并决定
+ * 「蓝牙老化会话优雅中止」还是「忽略」。
+ * 严禁在此路径整机重启：根节点掉线期间 mesh 重扫会击穿 BLE 链路，
+ * 重启会杀死本可继续的老化会话（见 CHILD_NODE_ROOT_LOSS_DESIGN.md 第 7.1 节）。
+ * 生产者/消费者跨任务（Bluedroid GATTC 任务 vs CPU1 老化任务），用 atomic_exchange
+ * 消费，避免「检测与清除」窗口吞掉第二次事件（CERT C CON32-C）。
+ */
+static atomic_bool s_ble_abnormal_disconnect;
+
+/* BLE 扫描完成回调丢失时的等待上限，超时按本次尝试失败走 FailCount 路径。 */
+#define BLE_SCAN_WAIT_TIMEOUT_MS 30000
+
+/*
+ * 蓝牙老化会话的丢失数据列表：随老化任务创建/销毁。
+ * 提为文件静态指针，使各退出路径（自删除式中止/完成）能统一释放；
+ * 外部 vTaskDelete 路径的残留泄漏见设计文档「已知限制」。
+ */
+static char *s_aging_lost_data_list = NULL;
 static uint32_t s_consecutive_data_read_failures = 0;
 static TickType_t s_last_data_read_error_report_tick = 0;
 static uint32_t s_consecutive_data_upload_failures = 0;
@@ -1558,7 +1589,8 @@ static int make_can_write_transfer_by_nameorid(Externaldevice *device,
 #pragma region BLE连接与接收任务
 // 是否加密，暂时只有待老化设备(Modbus协议)
 bool IsEnc = false;
-static bool ScanComplete = false; // 用于判断是否扫描完成
+/* 用于判断是否扫描完成：Bluedroid 扫描回调写、CPU1 老化任务读，需 volatile 保证可见性 */
+static volatile bool ScanComplete = false;
 // BLE扫描完成回调
 void ble_scan_complete_cb(ble_device_info_t *devices, int device_count)
 {
@@ -1594,12 +1626,13 @@ void ble_disconnect_cb(void)
 {
     if (BTDisConnect == 0) // 异常断开
     {
-        ESP_LOGW(TAG, "BLE disconnected,Restarting...\n");
-
-        aging_error_log("BLE abnormal disconnection; gateway is restarting");
-
-        // 这里暂时重启，后面重新修改
-        esp_restart();
+        /*
+         * 不再整机重启（旧行为 esp_restart 会杀死本可继续的老化会话，
+         * 且根掉线期间 mesh 重扫即可击穿 BLE 链路，见 CHILD_NODE_ROOT_LOSS_DESIGN.md）。
+         * 回调只置事件标志，具体处置由 Aging_Test_Task 检查点完成。
+         */
+        atomic_store(&s_ble_abnormal_disconnect, true);
+        ESP_LOGW(TAG, "BLE disconnected abnormally; deferred to aging task, no restart");
     }
     else if (BTDisConnect == 1) // 主动断开
     {
@@ -2316,46 +2349,45 @@ static void persist_ready_pn_state(void)
 }
 
 /*
- * 缓存一条“已经收到start_aging但还没有本轮新PN”的启动命令。
- * 这里只建立WAIT_PN状态，不把aging_valid写成1，也不主动上报agingStart。
+ * PN是否已就绪：只有收到过本轮set_pn（s_new_pn_ready==1）且Ready PN非空，
+ * 才允许start_aging启动。PN_Code中残留的上一轮PN不作为判据。
  */
-static bool cache_pending_start_command(const char *aging_json, int start_seq)
+static bool aging_pn_is_ready(void)
 {
-    if (aging_json == NULL)
+    return s_new_pn_ready == 1 && PN_Code_Ready[0] != '\0';
+}
+
+/*
+ * start_aging缺少PN时的统一拒绝路径（AGING_CMD_PN_GUARD_DESIGN.md 第 3.2 节）：
+ * 1. 清理旧固件遗留的WAIT_PN挂起命令（Aging.json + NVS标志 + 内存状态）；
+ * 2. 经MQTT返回老化异常：cmd/reply/point，Msg明示缺少PN、请先下发set_pn；
+ * 3. 上报event/state的agingError；
+ * 4. 写本地错误日志（日志会话激活时同步MQTT日志主题）。
+ * 拒绝后状态回IDLE、零残留，服务器按 set_pn -> start_aging 顺序重发即可启动。
+ */
+static void reject_start_aging_missing_pn(int start_seq)
+{
+    if (s_aging_cmd_state == AGING_CMD_WAIT_PN)
     {
-        return false;
+        /* 新固件不再产生WAIT_PN；此处仅兼容旧固件掉电恢复遗留的挂起命令。 */
+        aging_error_log("Discard legacy pending start_aging while rejecting missing PN, old_seq=%d",
+                        s_pending_start_seq);
+        esp_err_t del_ret = spiffs_file_delete("Aging.json");
+        if (del_ret != ESP_OK)
+        {
+            local_error_log("Delete legacy pending Aging.json failed, error=%s", esp_err_to_name(del_ret));
+        }
+        s_pending_start_seq = 0;
+        s_aging_cmd_state = AGING_CMD_IDLE;
+        persist_pending_start_state(false, 0);
     }
 
-    esp_err_t ret = save_json_to_spiffs("Aging.json", aging_json);
-    if (ret != ESP_OK)
-    {
-        aging_error_log("Cache pending Aging.json failed, error=%s", esp_err_to_name(ret));
-        device_response_publish_point(start_seq, 0, "Cache start aging command failed");
-        return false;
-    }
+    device_response_publish_point(start_seq, 0, AGING_START_REPLY_NO_PN);
+    ESP_LOGW(TAG, "start_aging rejected: PN is not set, seq=%d", start_seq);
 
-    /* WAIT_PN不是正在老化，掉电后不能按老化断点恢复处理。 */
-    ret = SelfRecovery_Write_uint16(NVS_KEY_AGING_VALID, 0);
-    if (ret != ESP_OK)
-    {
-        local_error_log("Clear aging_valid while waiting PN failed, error=%s", esp_err_to_name(ret));
-    }
+    aging_state_publish("agingError");
 
-    memset(PN_Code, 0, sizeof(PN_Code));
-    ret = SelfRecovery_Write_str(NVS_KEY_CURRENT_PN, "");
-    if (ret != ESP_OK)
-    {
-        local_error_log("Clear current PN while waiting PN failed, error=%s", esp_err_to_name(ret));
-    }
-
-    s_pending_start_seq = start_seq;
-    s_aging_cmd_state = AGING_CMD_WAIT_PN;
-    persist_pending_start_state(true, start_seq);
-
-    AgingLogActive = true;
-    aging_runtime_log("Start aging command cached; waiting for a new PN, cmd_seq=%d", start_seq);
-    ESP_LOGI(TAG, "start_aging cached, waiting for set_pn, seq=%d", start_seq);
-    return true;
+    aging_error_log("Start aging rejected: PN is not set, please send set_pn first, cmd_seq=%d", start_seq);
 }
 
 /*
@@ -2378,9 +2410,13 @@ static bool start_aging_with_ready_pn(const char *aging_json, int start_seq)
         return false;
     }
 
-    if (s_new_pn_ready == 0 || PN_Code_Ready[0] == '\0')
+    if (!aging_pn_is_ready())
     {
+        /* 与 start_aging 分支的 PN 门共用同一判定；当前所有调用点均已过 PN 门，
+         * 此处为防御性分支，失败时同样给出 MQTT 应答，避免服务器无响应。
+         */
         ESP_LOGW(TAG, "Cannot start aging: no new PN is ready");
+        device_response_publish_point(start_seq, 0, AGING_START_REPLY_NO_PN);
         return false;
     }
 
@@ -2537,25 +2573,11 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                     ESP_LOGW(TAG, "start_aging command missing programId, seq=%d", start_seq);
                     goto cleanup;
                 }
-                aging_state_publish_ProgramId(programId->valuestring);
-                cJSON *recordId = cJSON_GetObjectItem(pRoot, "RecordId");
-                if (cJSON_IsString(recordId) && recordId->valuestring != NULL)
-                {
-                    // 清空RecordId
-                    memset(RecordId, 0, sizeof(RecordId));
-                    strncpy(RecordId, recordId->valuestring, sizeof(RecordId) - 1);
-                    RecordId[sizeof(RecordId) - 1] = '\0';
-                    // 存nvs
-                    esp_err_t ret = SelfRecovery_Write_str("RecordId", RecordId);
-                    if (ret != ESP_OK)
-                    {
-                        local_error_log("Write RecordId failed, error=%s", esp_err_to_name(ret));
-                    }
-                }
-
                 /*
                  * RUNNING时必须先拒绝，不能先修改PN_Code、Ready PN或Aging.json，
                  * 否则可能把正在运行的上一台设备错误切换到下一台PN。
+                 * 该检查必须位于PN门之前：RUNNING时本轮Ready PN已被消费，
+                 * 若PN门前置会把“重复启动”误报成“缺少PN”。
                  */
                 if (s_aging_cmd_state == AGING_CMD_RUNNING)
                 {
@@ -2563,38 +2585,40 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                     ESP_LOGW(TAG, "Duplicate start_aging rejected while RUNNING, seq=%d", start_seq);
                     aging_error_log("Duplicate start aging command rejected: aging is already running");
                 }
-                else if (s_aging_cmd_state == AGING_CMD_WAIT_PN)
+                else if (!aging_pn_is_ready())
                 {
-                    if (start_seq == s_pending_start_seq)
-                    {
-                        /*
-                         * QoS1或服务器重发可能带来相同Seq的重复消息。
-                         * 该命令仍处于WAIT_PN，不发送失败回复，避免服务器把“等待PN”误判为启动失败。
-                         * 真正启动后仍使用原始Seq只回复一次最终结果。
-                         */
-                        ESP_LOGW(TAG, "Duplicate pending start_aging ignored, seq=%d", start_seq);
-                    }
-                    else
-                    {
-                        device_response_publish_point(start_seq, 0, "Another start aging command is already waiting for PN");
-                        ESP_LOGW(TAG,
-                                 "New start_aging rejected because another command is waiting for PN, old_seq=%d, new_seq=%d",
-                                 s_pending_start_seq,
-                                 start_seq);
-                    }
-                }
-                else if (s_new_pn_ready == 1 && PN_Code_Ready[0] != '\0')
-                {
-                    /* 正常顺序：set_pn先到，start_aging后到。 */
-                    start_aging_with_ready_pn(packet_copy, start_seq);
+                    /*
+                     * PN未设置：直接拒绝并回IDLE，不缓存命令等待（产品决策，
+                     * 见 AGING_CMD_PN_GUARD_DESIGN.md）。拒绝路径顺带清理
+                     * 旧固件遗留的WAIT_PN挂起，保证拒绝后零残留。
+                     */
+                    reject_start_aging_missing_pn(start_seq);
                 }
                 else
                 {
                     /*
-                     * start_aging先到：不能使用PN_Code中可能残留的上一轮PN。
-                     * 缓存完整JSON和原始Seq，等待新的set_pn到达后再真正启动。
+                     * 正常顺序：set_pn先到，start_aging后到。
+                     * ProgramId 状态与 RecordId 均只在通过 PN 门后生效，
+                     * 拒绝路径不产生任何“已受理”类外部信号。
                      */
-                    cache_pending_start_command(packet_copy, start_seq);
+                    aging_state_publish_ProgramId(programId->valuestring);
+
+                    cJSON *recordId = cJSON_GetObjectItem(pRoot, "RecordId");
+                    if (cJSON_IsString(recordId) && recordId->valuestring != NULL)
+                    {
+                        // 清空RecordId
+                        memset(RecordId, 0, sizeof(RecordId));
+                        strncpy(RecordId, recordId->valuestring, sizeof(RecordId) - 1);
+                        RecordId[sizeof(RecordId) - 1] = '\0';
+                        // 存nvs
+                        esp_err_t ret = SelfRecovery_Write_str("RecordId", RecordId);
+                        if (ret != ESP_OK)
+                        {
+                            local_error_log("Write RecordId failed, error=%s", esp_err_to_name(ret));
+                        }
+                    }
+
+                    start_aging_with_ready_pn(packet_copy, start_seq);
                 }
             }
             else if (strstr(TopicBuf, "stop_aging"))
@@ -4034,6 +4058,31 @@ static bool ExDevice_Check(void)
 
 // static double aging_get_condition_value(const AgingStep *step, const char *expect_name, double default_value)
 
+/*
+ * 消费 BLE 异常断开事件并判定是否需要中止当前老化会话。
+ * 返回 true：当前正是蓝牙老化会话，调用方必须执行优雅中止并退出任务；
+ * 返回 false：无需中止（无事件，或当前不是蓝牙老化会话——后者记一次警告）。
+ * 用于 Aging_Test_Task 主循环及 AgingAction 各长循环内部：Standing/Discharge/
+ * Recharge 等阶段可能持续数小时且不返回外层循环，只在循环顶部检查会导致
+ * 掉线后迟迟不被处理（设计文档 7.1 节）。
+ */
+static bool aging_ble_link_lost_pending(void)
+{
+    if (!atomic_exchange(&s_ble_abnormal_disconnect, false))
+    {
+        return false;
+    }
+
+    if (agingState != AgingIdle && Aging_device != NULL &&
+        strncmp(Aging_device[0].CommunicationMode, "Bluetooth", 9) == 0)
+    {
+        return true;
+    }
+
+    ESP_LOGW(TAG, "BLE abnormal disconnect ignored: no active Bluetooth aging session");
+    return false;
+}
+
 static void Aging_Task_Abort_Cleanup(void)
 {
     agingState = AgingIdle;
@@ -4088,6 +4137,12 @@ static void Aging_Task_Abort_And_Delete(void)
     s_consecutive_data_upload_failures = 0;
     s_last_data_upload_error_report_tick = 0;
     Aging_test_task_handle = NULL;
+    /* 自删除前释放本任务持有的丢失数据列表（任务删除不回收堆块）。 */
+    if (s_aging_lost_data_list != NULL)
+    {
+        free(s_aging_lost_data_list);
+        s_aging_lost_data_list = NULL;
+    }
     vTaskDelete(NULL); // 删除当前任务
 }
 
@@ -4095,10 +4150,34 @@ void Aging_Test_Task(void *arg)
 {
     uint8_t FailCount = 0;
     bool aging_action_logged = false;
-    char *Lost_Data_List = (char *)app_malloc_prefer_psram(1024);
+
+    /* 新会话开始：丢弃上一个会话遗留的 BLE 断开事件，避免误中止本次老化。 */
+    atomic_store(&s_ble_abnormal_disconnect, false);
+
+    s_aging_lost_data_list = (char *)app_malloc_prefer_psram(1024);
+    if (s_aging_lost_data_list == NULL)
+    {
+        aging_error_log("Aging lost-data list allocation failed; aborting aging session");
+        aging_state_publish("agingError");
+        Aging_Task_Abort_And_Delete();
+        return;
+    }
 
     while (1)
     {
+        /*
+         * BLE 异常断开的统一处置（根掉线期间 mesh 重扫可击穿 BLE 链路）：
+         * 当前正是蓝牙老化会话 → 按老化错误优雅中止，整机不重启；
+         * 其余情况 → aging_ble_link_lost_pending() 内记录一次警告。
+         */
+        if (aging_ble_link_lost_pending())
+        {
+            aging_error_log("Bluetooth aging link lost abnormally; abort aging session without restart");
+            aging_state_publish("agingError");
+            Aging_Task_Abort_And_Delete();
+            return;
+        }
+
         switch (agingState)
         {
         case AgingIdle:
@@ -4169,13 +4248,42 @@ void Aging_Test_Task(void *arg)
                 if (!ble_is_connected())
                 {
                     aging_runtime_log("Connecting Bluetooth aging device, attempt=%u", (unsigned)FailCount);
-                    ble_start_scan(10);
+                    if (!ble_start_scan(10))
+                    {
+                        /*
+                         * 上一轮扫描未结束或仍处于连接态时 ble_start_scan 返回 false 且不会启动扫描，
+                         * 必须立即按本次尝试失败处理，否则后续超时等待必然空转满 30s。
+                         */
+                        aging_error_log("Bluetooth scan not started, attempt=%u", (unsigned)FailCount);
+                        break;
+                    }
 
+                    /*
+                     * 扫描完成回调丢失时不得永久自旋（旧行为为无超时等待，
+                     * 会饿死同级任务）：超过 BLE_SCAN_WAIT_TIMEOUT_MS 未完成，
+                     * 停止扫描并按本次尝试失败处理，交由 FailCount 路径重试或 agingError 中止。
+                     */
+                    TickType_t scan_start_tick = xTaskGetTickCount();
                     while (!ScanComplete)
                     {
+                        if ((xTaskGetTickCount() - scan_start_tick) >= pdMS_TO_TICKS(BLE_SCAN_WAIT_TIMEOUT_MS))
+                        {
+                            break;
+                        }
                         vTaskDelay(pdMS_TO_TICKS(1000));
                     }
+
+                    bool scan_completed = ScanComplete;
                     ScanComplete = false;
+
+                    if (!scan_completed)
+                    {
+                        /* 回调丢失时底层扫描可能仍在继续，先停止再进入下一次重试。 */
+                        ble_stop_scan();
+                        aging_error_log("Bluetooth scan did not complete within %u ms, attempt=%u",
+                                        (unsigned)BLE_SCAN_WAIT_TIMEOUT_MS, (unsigned)FailCount);
+                        break;
+                    }
 
                     if (ble_connect_by_name(PN_Code))
                     {
@@ -4407,6 +4515,14 @@ void Aging_Test_Task(void *arg)
 
                         while (now < deadline)
                         {
+                            /* Standing 可持续数小时：循环内必须检查 BLE 断开，否则掉线迟迟不被处理。 */
+                            if (aging_ble_link_lost_pending())
+                            {
+                                aging_error_log("Bluetooth aging link lost abnormally during standing; abort aging session without restart");
+                                aging_state_publish("agingError");
+                                Aging_Task_Abort_And_Delete();
+                                return;
+                            }
                             vTaskDelay(pdMS_TO_TICKS(10000));
                             now = time(NULL);
                         }
@@ -4426,6 +4542,14 @@ void Aging_Test_Task(void *arg)
                         uint8_t conditionflag = 1;
                         while (conditionflag)
                         {
+                            /* Discharge 条件轮询可能长期自旋：循环内检查 BLE 断开。 */
+                            if (aging_ble_link_lost_pending())
+                            {
+                                aging_error_log("Bluetooth aging link lost abnormally during discharge; abort aging session without restart");
+                                aging_state_publish("agingError");
+                                Aging_Task_Abort_And_Delete();
+                                return;
+                            }
                             for (int i = 0; i < current_step->judging_condition_count; i++)
                             {
                                 double value = -1.0;
@@ -4450,6 +4574,14 @@ void Aging_Test_Task(void *arg)
                         uint8_t conditionflag = 1;
                         while (conditionflag)
                         {
+                            /* Recharge 条件轮询可能长期自旋：循环内检查 BLE 断开。 */
+                            if (aging_ble_link_lost_pending())
+                            {
+                                aging_error_log("Bluetooth aging link lost abnormally during recharge; abort aging session without restart");
+                                aging_state_publish("agingError");
+                                Aging_Task_Abort_And_Delete();
+                                return;
+                            }
                             for (int i = 0; i < current_step->judging_condition_count; i++)
                             {
                                 double value = -1.0;
@@ -4505,6 +4637,14 @@ void Aging_Test_Task(void *arg)
                         publish_aging_complete(1, AgingNumber);
                         while (Cannextstep == 0)
                         {
+                            /* 群控等待上位机下一步指令可能长时间挂起：循环内检查 BLE 断开。 */
+                            if (aging_ble_link_lost_pending())
+                            {
+                                aging_error_log("Bluetooth aging link lost abnormally while waiting next step; abort aging session without restart");
+                                aging_state_publish("agingError");
+                                Aging_Task_Abort_And_Delete();
+                                return;
+                            }
                             vTaskDelay(pdMS_TO_TICKS(10000));
                         }
                         Cannextstep = 0;
@@ -4521,6 +4661,14 @@ void Aging_Test_Task(void *arg)
         {
             while (QueryLatestRecordByPNAndPushState(PN_Code, false, g_db1_result) == 0)
             {
+                /* 历史数据补发轮询：循环内检查 BLE 断开。 */
+                if (aging_ble_link_lost_pending())
+                {
+                    aging_error_log("Bluetooth aging link lost abnormally during data check; abort aging session without restart");
+                    aging_state_publish("agingError");
+                    Aging_Task_Abort_And_Delete();
+                    return;
+                }
                 if (g_db1_result->json_data[0] != '\0')
                 {
                     if (app_mqtt_publish("device/%s/data/aging", g_db1_result->json_data, DEVICE_ID) > 0)
@@ -4537,12 +4685,12 @@ void Aging_Test_Task(void *arg)
                 vTaskDelay(pdMS_TO_TICKS(100));
             }
             // 清空数据
-            memset(Lost_Data_List, 0, 1024);
-            esp_err_t ret = test_http_post_record_query(time(NULL), s_idnum_index, RecordId, Lost_Data_List, 1024);
+            memset(s_aging_lost_data_list, 0, 1024);
+            esp_err_t ret = test_http_post_record_query(time(NULL), s_idnum_index, RecordId, s_aging_lost_data_list, 1024);
             if (ret == ESP_OK)
             {
                 int count = 0;
-                int *ids = parse_ids_array(Lost_Data_List, &count);
+                int *ids = parse_ids_array(s_aging_lost_data_list, &count);
                 if (ids != NULL && count > 0)
                 {
                     // printf("Parsed %d IDs:\n", count);
@@ -4618,6 +4766,12 @@ void Aging_Test_Task(void *arg)
             memset(PN_Code, 0, sizeof(PN_Code));
             clear_ready_pn_runtime();
             Aging_test_task_handle = NULL;
+            /* 自删除前释放本任务持有的丢失数据列表（任务删除不回收堆块）。 */
+            if (s_aging_lost_data_list != NULL)
+            {
+                free(s_aging_lost_data_list);
+                s_aging_lost_data_list = NULL;
+            }
             vTaskDelete(NULL);
             return;
         }

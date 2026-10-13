@@ -35,6 +35,20 @@
 #define FAILOVER_RETRY_COOLDOWN_MS 300000
 #define FAILOVER_RTC_MAGIC 0x4D4C4657U
 
+/*
+ * mesh-lite 父节点重连/重扫节奏（esp_mesh_lite_set_wifi_reconnect_interval 单位：秒）。
+ * 库默认「5s×2 次重连当前父，失败后每 10s 重扫」。
+ * 根节点消失后子节点会长期停留重扫态：间隔过短与 BLE 老化链路争用射频，
+ * 并放大闭源重扫路径的暴露。30s 重扫对根恢复（通常分钟级）可接受。
+ */
+#define MESH_PARENT_RETRY_INTERVAL_SEC 10
+#define MESH_PARENT_RETRY_COUNT        3
+#define MESH_RESCAN_INTERVAL_SEC       30
+
+/* 子节点健康监视周期：父丢失态 5s 一条（掉线属异常态），恢复后 60s 心跳。 */
+#define MESH_HEALTH_LOST_INTERVAL_MS 5000
+#define MESH_HEALTH_OK_INTERVAL_MS   60000
+
 static const char *TAG = "mesh_lite_app";
 static char s_softap_prefix[16];
 static char s_softap_ssid[33];
@@ -50,6 +64,10 @@ static bool s_sntp_started;
 static RTC_NOINIT_ATTR uint32_t s_failover_magic;
 static RTC_NOINIT_ATTR atomic_uint_least32_t s_failover_attempts;
 static RTC_NOINIT_ATTR uint32_t s_trial_uplink_index;
+
+/* 最近一次 STA 断开原因：事件任务写、健康监视任务读。
+ * atomic_uint 的 4 字节对齐访问在 Xtensa 上原子；仅用于诊断，不作为控制依据。 */
+static atomic_uint s_last_sta_disconnect_reason;
 
 /* 只有 net_monitor 访问此标志；SDK 调用可产生新的断开事件，先标记再调用。
  * disconnect 返回失败时内部可能已暂停重连，仍须在有线失效时执行一次 connect。
@@ -83,6 +101,42 @@ static void mesh_update_network_flag(bool sta_has_ip)
     if (IsRoot == 1 && dual_net_is_initialized()) return;
 #endif
     __atomic_store_n(&Network_Flag, sta_has_ip ? 1U : 0U, __ATOMIC_RELEASE);
+}
+
+/*
+ * 子节点 mesh 健康监视（仅 IsRoot==0 创建）。
+ * 只读状态 + 打日志，不做任何重连/重启决策：
+ * 重连策略归 mesh-lite 库；本任务为「根掉线时子节点必须存活」提供现场证据，
+ * 并证实无上行期间任务调度保持正常（对应 CHILD_NODE_ROOT_LOSS_DESIGN.md 第 6.4/7.2 节）。
+ */
+static void mesh_health_task(void *arg)
+{
+    TickType_t last_report_tick = 0;
+    bool was_online = __atomic_load_n(&Network_Flag, __ATOMIC_ACQUIRE) != 0;
+
+    while (1)
+    {
+        bool online = __atomic_load_n(&Network_Flag, __ATOMIC_ACQUIRE) != 0;
+        TickType_t now = xTaskGetTickCount();
+        uint32_t interval_ms = online ? MESH_HEALTH_OK_INTERVAL_MS : MESH_HEALTH_LOST_INTERVAL_MS;
+
+        if (online != was_online || last_report_tick == 0 ||
+            (now - last_report_tick) >= pdMS_TO_TICKS(interval_ms))
+        {
+            ESP_LOGI(TAG,
+                     "mesh_health: parent=%s, level=%u, network_flag=%u, last_sta_reason=%u, internal_free_bytes=%u",
+                     online ? "online" : "LOST",
+                     (unsigned)esp_mesh_lite_get_level(),
+                     online ? 1U : 0U,
+                     (unsigned)__atomic_load_n(&s_last_sta_disconnect_reason, __ATOMIC_RELAXED),
+                     (unsigned)esp_get_free_internal_heap_size());
+            last_report_tick = now;
+            was_online = online;
+        }
+
+        /* 按当前态周期休眠：在线时 60s 一轮，无需每 5s 空转唤醒。 */
+        vTaskDelay(pdMS_TO_TICKS(interval_ms));
+    }
 }
 
 static bool parse_mesh_id(const char *value, uint8_t *id)
@@ -177,7 +231,24 @@ static void network_event_handler(void *arg, esp_event_base_t base,
         /* 与上面 STA_GOT_IP 对称：根节点交给 dual_net 裁决，子节点沿用原判据 */
         mesh_update_network_flag(false);
         if (s_trial_active) s_trial_success = false;
-        ESP_LOGW(TAG, "STA uplink lost; local Mesh-Lite remains active");
+        /*
+         * 断开原因落诊断变量，供子节点健康监视与「根掉线不重启」排查使用。
+         * WIFI_EVENT_STA_DISCONNECTED 的 event_data 为 wifi_event_sta_disconnected_t；
+         * IP_EVENT_STA_LOST_IP 无该结构，reason 保持上次已知值。
+         */
+        if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED && event_data != NULL) {
+            const wifi_event_sta_disconnected_t *disc = (const wifi_event_sta_disconnected_t *)event_data;
+            __atomic_store_n(&s_last_sta_disconnect_reason, disc->reason, __ATOMIC_RELAXED);
+            /* ssid 非保证 NUL 终止：用精度限定打印，并对 ssid_len 做防御性截断。 */
+            unsigned print_len = disc->ssid_len;
+            if (print_len > sizeof(disc->ssid) - 1) {
+                print_len = sizeof(disc->ssid) - 1;
+            }
+            ESP_LOGW(TAG, "STA disconnected, reason=%u, ssid=%.*s; local Mesh-Lite remains active",
+                     (unsigned)disc->reason, (int)print_len, (const char *)disc->ssid);
+        } else {
+            ESP_LOGW(TAG, "STA uplink lost; local Mesh-Lite remains active");
+        }
     }
 }
 
@@ -512,6 +583,14 @@ esp_err_t mesh_init_Custom(void)
     }
 
     /*
+     * 拉长父节点重连/重扫节奏（库默认 5s×2 次后每 10s 重扫），
+     * 降低根消失后长时间重扫态对 BLE 老化链路的射频争用与闭源重扫路径暴露。
+     */
+    esp_mesh_lite_set_wifi_reconnect_interval(MESH_PARENT_RETRY_INTERVAL_SEC,
+                                              MESH_PARENT_RETRY_COUNT,
+                                              MESH_RESCAN_INTERVAL_SEC);
+
+    /*
      * Give Mesh-Lite a way to resolve the parent SSID from the BSSID even when the
      * scan record cannot supply it. Without this, the STA keeps an empty SSID and
      * esp_wifi_connect() only answers "Haven't to connect to a suitable AP now!".
@@ -550,7 +629,18 @@ esp_err_t mesh_init_Custom(void)
             ESP_LOGE(TAG, "Failed to create failover task");
         }
     }
-    ESP_LOGI(TAG, "Mesh-Lite started: ID=%02X, role=%s, AP=%s, uplink=%u",
-             mesh_id, IsRoot ? "root" : "node", s_softap_ssid, s_uplink_index);
+    bool mesh_health_started = true; /* 根节点无此任务，视为不适用 */
+    if (!IsRoot) {
+        /* 根掉线期间子节点必须存活：只观测不动作的健康监视，见设计文档 7.2 节。 */
+        mesh_health_started = xTaskCreatePinnedToCore(mesh_health_task, "mesh_health", LG_STACK_MESH_HEALTH,
+                                                      NULL, LG_PRIO_MESH_HEALTH,
+                                                      NULL, LG_APP_CPU_CORE) == pdPASS;
+        if (!mesh_health_started) {
+            ESP_LOGE(TAG, "Failed to create mesh health task");
+        }
+    }
+    ESP_LOGI(TAG, "Mesh-Lite started: ID=%02X, role=%s, AP=%s, uplink=%u, mesh_health=%s",
+             mesh_id, IsRoot ? "root" : "node", s_softap_ssid, s_uplink_index,
+             mesh_health_started ? "on" : "OFF");
     return ESP_OK;
 }

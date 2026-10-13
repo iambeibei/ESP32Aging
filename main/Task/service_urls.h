@@ -26,7 +26,7 @@ extern "C" {
  * 目录末尾带不带 '/' 都可以，simple_ota 内部的 build_url() 会自动补分隔。
  * 实际请求地址 = 该目录 + update.json（版本描述） / + 固件文件名。
  */
-#define LG_URL_OTA_BASE_URL "http://10.16.160.51:8888/OTABin/"
+#define LG_URL_OTA_BASE_URL "http://192.168.40.116:8080/OTAFiles/"
 
 
 /*
