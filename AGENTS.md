@@ -50,25 +50,30 @@ IDF_SKIP_CHECK_SUBMODULES=1 idf.py -B build/mesh-lite -D SDKCONFIG=build/mesh-li
 流程（`simple_ota_check_and_update()`）：
 
 1. 读本地版本（来自 `esp_app_desc_t`，即 version.txt 的编译期值），要求严格 `MAJOR.MINOR.PATCH`。
-2. 下载 `LG_URL_OTA_BASE_URL`（`main/Task/service_urls.h`，当前为 HTTPS REST 下载接口
-   `https://192.168.40.116:7088/api/OTAFiles/Download?fileName=`，查询串拼接风格，
-   与 `LG_URL_Get_LOST_IDNUM_URL` 同主机）下的 `update.json`（≤1024 字节），
-   字段：`version` + `file`。旧静态目录形态（`http://<ip>:<port>/OTABin/`）已随
-   8080 端口下线失效，迁移详情见 `OTA_SERVER_MIGRATION_DESIGN.md`。
+2. 下载 `LG_URL_OTA_BASE_URL_FMT`（`main/Task/service_urls.h` 的 `_FMT` 模板）经
+   `lg_url_build()` 填充后的 `update.json`（≤1024 字节），字段：`version` + `file`。
+   **IP 运行时取自 `SERVER_IP`**（baseconfig.json，与 MQTT broker 同一机制），
+   端口/路径为编译期常量（当前 `http://<SERVER_IP>:11282/api/OTAFiles/Download?fileName=`，
+   查询串拼接风格）。旧静态目录形态（`http://<ip>:<port>/OTABin/`）已随 8080 端口
+   下线失效，迁移详情见 `OTA_SERVER_MIGRATION_DESIGN.md`。
 3. 校验：semver 严格三段式（**`version.txt` 必须为三段式**，四段号会在读取本地版本处
    直接失败）；`file` 只允许同目录 `*.bin` 文件名（另拒绝 `?`/`&`/`#` 查询串元字符），
    且必须以 `_v<version>.bin` 结尾（防止 JSON 版本与文件名不一致）。
 4. 版本比较：服务器 **>** 本地才升级；相等跳过，更旧**阻止降级**，均返回 `ESP_OK`。
-5. 下载固件：HTTP 走手动 `esp_ota_begin/write/end` + `esp_ota_set_boot_partition()` + `esp_restart()`
-   （2048 字节缓冲、进度日志、长度校验）；HTTPS 走 `esp_https_ota()`。
+5. 下载固件：`http://`/`https://` 统一走手动 `esp_ota_begin/write/end` +
+   `esp_ota_set_boot_partition()` + `esp_restart()`（2048 字节缓冲、进度日志、长度校验）。
+   不使用 `esp_https_ota()` 组件——其强制证书校验与无证书 HTTPS 策略冲突。
 6. 分区表为 `ota_0`/`ota_1` 双槽（各 0x240000）+ `otadata`，见 `partition.csv`。
 
 注意事项：
 
-- OTA 服务器地址是**编译期常量**（`service_urls.h`），改后需重新编译烧录。
-- `version.txt` 为 `0.0.0` 时，任何服务器版本 > 0.0.0 都会触发升级 —— 发布正式固件前应设置真实版本号。
-- OTA 服务器地址是编译期常量，且当前为**无证书 HTTPS**（内网部署，依赖 sdkconfig 的
-  `CONFIG_ESP_TLS_INSECURE`；关闭该选项 OTA 会明确报错而非静默降级）。
+- OTA 与 GetMissingIdNums 的服务器 **IP 运行时取自 `SERVER_IP`**（`lg_url_build()`，
+  service_urls.c）：**改 IP 只需改 baseconfig.json 并完整 flash，无需重新编译 app**；
+  端口/路径仍是编译期常量（`_FMT` 模板），改它们才需重新编译烧录。
+- 当前 OTA 下载为**明文 HTTP**（内网 `11282`），无需证书；`apply_https_config()` 的
+  无证书 HTTPS 放行路径保留备用（换回 HTTPS 内网地址时自动生效，打 WRN 可识别）。
+- `version.txt` 现为 `0.0.1`（三段式对齐服务器；为 `0.0.0` 时任何服务器版本都会触发升级，
+  发布正式固件前应设置真实版本号）。
 - OTA 成功路径会 `esp_restart()`，`simple_ota_check_and_update*()` 不会正常返回。
 - 升级只写另一个 ota 槽，SQLite 数据库（`data_storage` 分区）与配置（`storage` 分区）不受影响。
 

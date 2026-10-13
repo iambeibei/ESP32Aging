@@ -489,7 +489,16 @@ int app_read_HTTP_data(char *data_buffer, int buffer_len, uint32_t timeout)
 
 esp_err_t test_http_post_record_query(int32_t seq, int32_t id_num, const char *record_id,char *out_response_buffer, int out_buffer_len)
 {
-    const char *url = LG_URL_Get_LOST_IDNUM_URL;
+    /*
+     * 服务器 IP 运行时取自 baseconfig.json 的 SERVER_IP（与 MQTT broker 同一
+     * 机制），端口/路径为编译期模板；换服务器 IP 无需重新编译 app。
+     */
+    char url[LG_URL_MAX_LEN];
+    esp_err_t build_err = lg_url_build(LG_URL_GET_LOST_IDNUM_URL_FMT, url, sizeof(url));
+    if (build_err != ESP_OK) {
+        ESP_LOGE(TAG, "Build GetMissingIdNums URL failed: %s", esp_err_to_name(build_err));
+        return build_err;
+    }
 
     // ---- Build request JSON body: {"Seq":...,"Data":{"RecordId":"...","IdNum":...}} ----
     cJSON *root = cJSON_CreateObject();

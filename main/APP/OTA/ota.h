@@ -43,7 +43,7 @@ typedef enum {
  * @brief OTA 配置
  */
 typedef struct {
-    const char *base_url;                  /**< OTA 根地址：PATH 风格为目录，QUERY 风格为含 "?fileName=" 的下载接口前缀（默认取 LG_URL_OTA_BASE_URL，见 service_urls.h） */
+    const char *base_url;                  /**< OTA 根地址：PATH 风格为目录，QUERY 风格为含 "?fileName=" 的下载接口前缀（默认由 lg_url_build(LG_URL_OTA_BASE_URL_FMT, ...) 运行时构建，IP 取自 SERVER_IP，见 service_urls.h） */
     const char *metadata_file;             /**< 版本描述文件，通常固定为 update.json */
     const char *cert_pem;                  /**< HTTPS 根证书；HTTP 或（INSECURE 放行的）无证书 HTTPS 可为 NULL */
     bool skip_cert_common_name_check;      /**< HTTPS 是否跳过证书 CN 检查（IP 地址访问必须为 true） */

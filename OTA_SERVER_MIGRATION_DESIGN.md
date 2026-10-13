@@ -56,11 +56,19 @@ OTA 仍然失败。按 `simple_ota_check_and_update()`（ota.c:597-669）的执�
 
 ### 4.1 `service_urls.h`：新 OTA 下载地址
 
+最终形态（2026-10-13，服务器迁至内网 11282 后端，且 IP 运行时化）：
+
 ```c
-#define LG_URL_OTA_BASE_URL "https://192.168.40.116:7088/api/OTAFiles/Download?fileName="
+/* %s 为 IP 占位，运行时由 lg_url_build() 用 SERVER_IP（baseconfig.json）填充 */
+#define LG_URL_OTA_BASE_URL_FMT "http://%s:11282/api/OTAFiles/Download?fileName="
 ```
 
-（宏名保持不变，注释说明新形态；编译期常量，改后需重新编译烧录。）
+- 端口/路径为编译期常量（`_FMT` 模板），**IP 取自 `SERVER_IP`**（与 MQTT broker
+  同一机制，`lg_url_build()` 构建于 service_urls.c）：改 IP 只需改 baseconfig.json
+  并完整 flash，改端口/路径才需重新编译 app。
+- GetMissingIdNums 接口同样运行时化：`LG_URL_GET_LOST_IDNUM_URL_FMT`
+  `http://%s:11282/DeviceServiceCallback/GetMissingIdNums`。
+- 协议拉取接口 `LG_URL_HTTP_PROTOCOL_WHOLE_URL` 为公网域名，保持完整 URL 宏不变。
 
 ### 4.2 `ota.h`：URL 拼接风格枚举
 

@@ -694,12 +694,23 @@ esp_err_t simple_ota_check_and_update(const simple_ota_config_t *config)
 
 esp_err_t simple_ota_check_and_update_default(void)
 {
+    /*
+     * 服务器 IP 运行时取自 baseconfig.json 的 SERVER_IP（与 MQTT broker 同一
+     * 机制），端口/路径为编译期模板；换服务器 IP 无需重新编译 app。
+     */
+    char base_url[LG_URL_MAX_LEN];
+    esp_err_t build_err = lg_url_build(LG_URL_OTA_BASE_URL_FMT, base_url, sizeof(base_url));
+    if (build_err != ESP_OK) {
+        ESP_LOGE(TAG, "Build OTA base URL failed: %s", esp_err_to_name(build_err));
+        return build_err;
+    }
+
     simple_ota_config_t config = {
-        .base_url = LG_URL_OTA_BASE_URL,
+        .base_url = base_url,
         .metadata_file = SIMPLE_OTA_DEFAULT_METADATA_FILE,
         .cert_pem = NULL,
         /* 内网 IP + HTTPS 下载接口：证书 CN 校验必然失败，与仓库内访问同一
-         * 7088 主机的 test_http_post_record_query() 策略一致（无证书放行）。 */
+         * 服务器的 test_http_post_record_query() 策略一致（无证书放行）。 */
         .skip_cert_common_name_check = true,
         .use_crt_bundle = false,
         .url_style = SIMPLE_OTA_URL_STYLE_QUERY,
