@@ -24,6 +24,9 @@ static const char *TAG = "dual_net";
 static esp_netif_t *eth_netif;
 static esp_netif_t *wifi_netif;
 
+/* H2 诊断：update_route 因 revision 竞争跳过时的限频日志周期（同因 10s 内一条）。 */
+#define LG_DUAL_NET_SKIP_LOG_MS 10000
+
 /* 事件只发布状态；路由、DNS、探测和 Mesh-Lite 控制只有 net_monitor 执行。
  * 锁内仅复制状态，不调用 SDK、回调或阻塞 API。netif 生命周期由 bridge 管理。 */
 typedef enum {
@@ -313,8 +316,22 @@ static bool dual_net_update_route(void)
 #endif
     portENTER_CRITICAL(&s_state_lock);
     if (s_state.revision != state.revision) {
+        /*
+         * H2 诊断：快照之后 revision 又变化，本轮 Network_Flag 发布被跳过。
+         * 若 mesh-lite 重试风暴使该分支持续命中，根节点标志将停在旧值，
+         * 主备路由器切换的扫描触发条件永不成立。限频打印便于证实/证伪。
+         */
+        uint32_t skipped_revision = s_state.revision;
         portEXIT_CRITICAL(&s_state_lock);
         dual_net_wake_monitor();
+        static TickType_t last_skip_log_tick = 0;
+        TickType_t skip_now = xTaskGetTickCount();
+        if (last_skip_log_tick == 0 ||
+            (skip_now - last_skip_log_tick) >= pdMS_TO_TICKS(LG_DUAL_NET_SKIP_LOG_MS)) {
+            last_skip_log_tick = skip_now;
+            ESP_LOGW(TAG, "Route reconcile skipped: revision changed %lu -> %lu during snapshot",
+                     (unsigned long)state.revision, (unsigned long)skipped_revision);
+        }
         return false;
     }
     bool changed = s_state.active_uplink != target;
@@ -453,6 +470,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     if (id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *event = data;
         if (event == NULL) return;
+        uint32_t wifi_generation;
+        uint32_t revision;
         portENTER_CRITICAL(&s_state_lock);
         s_state.wifi_up = false;
         s_state.wifi_connecting = false;
@@ -461,9 +480,13 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         s_state.wifi_state = s_state.wifi_auth_failed ? WIFI_STATE_AUTH_FAILED : WIFI_STATE_IDLE;
         s_state.wifi_generation++;
         s_state.revision++;
+        wifi_generation = s_state.wifi_generation;
+        revision = s_state.revision;
         portEXIT_CRITICAL(&s_state_lock);
-        /* 包括 NO_AP_FOUND，不能在完成状态发布前提前返回。 */
-        ESP_LOGI(TAG, "WiFi disconnected, reason=%u", event->reason);
+        /* 包括 NO_AP_FOUND，不能在完成状态发布前提前返回。
+         * 诊断：generation/revision 用于与 net_monitor 的标志发布日志对齐时序。 */
+        ESP_LOGI(TAG, "WiFi disconnected, reason=%u, wifi_generation=%lu, revision=%lu",
+                 event->reason, (unsigned long)wifi_generation, (unsigned long)revision);
     } else if (id == WIFI_EVENT_STA_CONNECTED || id == WIFI_EVENT_STA_START) {
         portENTER_CRITICAL(&s_state_lock);
         s_state.wifi_connecting = id == WIFI_EVENT_STA_CONNECTED;

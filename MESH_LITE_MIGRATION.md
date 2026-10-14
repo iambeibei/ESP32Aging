@@ -96,3 +96,27 @@ Mesh-Lite。这些宏由组件的 Kconfig 生成；`sdkconfig.defaults` 只在�
    MQTT 恢复，并检查只有一组 MQTT 接收任务。
 
 上述无线和断网场景必须用实机验证；编译只能确认代码和依赖集成。
+
+## 主备路由器切换（root_failover）行为契约
+
+2026-10-14 实机排查后确认的完整行为链（`mesh.c` 的 `root_failover_task`）：
+
+- **触发时序**：主路由器断开 → `Network_Flag=0`（dual_net 发布，根节点唯一写者）持续
+  **30s** → 扫描备用 SSID1 → 命中后 `esp_restart()` 切 trial（uplink=1）。
+  未命中则每 **60s** 重扫；`s_failover_attempts`（RTC 跨重启残留）满 2 次后进入
+  **5 分钟**冷却，GOT_IP 清零。
+- **trial 重启前必须清除 mesh-lite 库存储的路由器信息**（`mesh_failover_restart()` →
+  `esp_mesh_lite_erase_rtc_store()`）：闭源库在启动时若 RTC 存储非空，会用存储的路由器
+  **覆盖**应用设置的 STA 配置并重连旧路由器（串口特征：`[Unexpected restart] ... Try to
+  connect the original parent node` 之后紧跟第二次 STA 配置应用）。不清除则切备用的
+  trial 重启必然被改回旧路由器，30s 后退回 saved uplink——这是 2026-10-14 修复的根因。
+- **粘性语义**：一旦切到备用并确认（`Alternate uplink confirmed`，uplink=1 存入 NVS），
+  主路由器恢复后**不会自动切回**（当前上行正常，无触发条件）；只有备用也断线时才会按
+  对称逻辑扫主 SSID。切回需人工下发配置或等待对称故障转移。
+- **验收 4 的通过标准**：关主路由约 30s 后出现 `Failover scan requested` →
+  `Alternate SSID found` → `Failover restart ... erase stored router` → 重启后
+  `sta ssid: <备用SSID>`（**无**第二次 authmode 覆盖日志）→ `Alternate uplink obtained IP`
+  → `Alternate uplink confirmed` → 再次重启后稳定在备用，MQTT 重连、子节点重挂。
+- 诊断日志（长期保留，限频）：`failover_state:`（掉线 5s/健康 60s）、
+  `WIFI_EVENT_SCAN_DONE:`、`scan ap[i]=`、`mesh scan start/end cb`、
+  `Route reconcile skipped:`（dual_net，revision 竞争时）。

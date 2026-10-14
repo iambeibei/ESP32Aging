@@ -49,6 +49,10 @@
 #define MESH_HEALTH_LOST_INTERVAL_MS 5000
 #define MESH_HEALTH_OK_INTERVAL_MS   60000
 
+/* 主备路由器切换任务循环态诊断日志限频周期（掉线态密、健康态疏）。 */
+#define MESH_FAILOVER_LOG_LOST_MS 5000
+#define MESH_FAILOVER_LOG_OK_MS   60000
+
 static const char *TAG = "mesh_lite_app";
 static char s_softap_prefix[16];
 static char s_softap_ssid[33];
@@ -254,11 +258,15 @@ static void network_event_handler(void *arg, esp_event_base_t base,
 
 static void scan_start_cb(void)
 {
+    /* 诊断：mesh-lite 回调进入顺序（与 WIFI_EVENT_SCAN_DONE 的先后是 H3 关键证据）。 */
+    ESP_LOGI(TAG, "mesh scan start cb: requested=%d",
+             __atomic_load_n(&s_scan_requested, __ATOMIC_RELAXED) ? 1 : 0);
     if (s_scan_requested) s_scan_active = true;
 }
 
 static void scan_end_cb(void)
 {
+    ESP_LOGI(TAG, "mesh scan end cb");
     s_scan_requested = false;
     s_scan_active = false;
 }
@@ -266,6 +274,12 @@ static void scan_end_cb(void)
 static void scan_done_handler(void *arg, esp_event_base_t base,
                               int32_t event_id, void *event_data)
 {
+    /* 诊断：无论后续是否处理，先记录 SCAN_DONE 到达时刻的各门禁值。 */
+    ESP_LOGI(TAG, "WIFI_EVENT_SCAN_DONE: scan_active=%d, network_flag=%u, eth_ip=%d, is_root=%d",
+             __atomic_load_n(&s_scan_active, __ATOMIC_RELAXED) ? 1 : 0,
+             (unsigned)__atomic_load_n(&Network_Flag, __ATOMIC_ACQUIRE),
+             dual_net_has_eth_ip() ? 1 : 0,
+             IsRoot ? 1 : 0);
     if (!s_scan_active) return;
     if (__atomic_load_n(&Network_Flag, __ATOMIC_ACQUIRE) || !IsRoot || dual_net_has_eth_ip()) {
         scan_end_cb();
@@ -273,6 +287,7 @@ static void scan_done_handler(void *arg, esp_event_base_t base,
     }
     uint16_t count = 0;
     if (esp_wifi_scan_get_ap_num(&count) != ESP_OK || count == 0) {
+        ESP_LOGW(TAG, "Failover scan returned no AP (err or count=0)");
         scan_end_cb();
         return;
     }
@@ -282,25 +297,101 @@ static void scan_done_handler(void *arg, esp_event_base_t base,
         return;
     }
     const char *other_ssid = s_uplink_index == 0 ? SSID1 : SSID;
+    bool matched = false;
     if (esp_wifi_scan_get_ap_records(&count, records) == ESP_OK) {
         for (uint16_t i = 0; i < count; ++i) {
-            if (strcmp((const char *)records[i].ssid, other_ssid) == 0 && !dual_net_has_eth_ip()) {
-                ESP_LOGW(TAG, "Alternate SSID found; testing it after restart");
+            bool hit = strcmp((const char *)records[i].ssid, other_ssid) == 0;
+            /* 诊断：仅打印前 10 条防刷屏；匹配判定必须覆盖全部 AP（旧实现只统计前 10 条，
+             * 目标位于第 11 条以后时会误报 "not found"）。ssid 非保证 NUL 终止，限宽打印。 */
+            if (i < 10) {
+                ESP_LOGI(TAG, "scan ap[%u/%u]=%.32s rssi=%d %s",
+                         (unsigned)(i + 1), (unsigned)count,
+                         (const char *)records[i].ssid, records[i].rssi,
+                         hit ? "<== TARGET" : "");
+            }
+            if (hit && !dual_net_has_eth_ip()) {
+                ESP_LOGW(TAG, "Alternate SSID found at ap[%u/%u] rssi=%d; testing it after restart",
+                         (unsigned)(i + 1), (unsigned)count, records[i].rssi);
                 s_restart_for_failover = true;
+                matched = true;
                 break;
             }
         }
+    } else {
+        ESP_LOGW(TAG, "Failover scan: get ap records failed");
+    }
+    if (!matched) {
+        ESP_LOGW(TAG, "Failover scan done: target SSID \"%s\" not found in %u APs",
+                 other_ssid ? other_ssid : "(null)", (unsigned)count);
     }
     free(records);
     scan_end_cb();
+}
+
+/*
+ * 故障转移任务循环态诊断日志（限频，不改变任何行为）：
+ * 仅由 root_failover_task 调用；状态翻转立即打印，否则按掉线 5s / 健康 60s 节流。
+ */
+static void mesh_failover_log_state(bool online, TickType_t now)
+{
+    static bool prev_online = true;
+    static TickType_t last_log_tick = 0;
+
+    uint32_t interval_ms = online ? MESH_FAILOVER_LOG_OK_MS : MESH_FAILOVER_LOG_LOST_MS;
+    if (online == prev_online && last_log_tick != 0 &&
+        (now - last_log_tick) < pdMS_TO_TICKS(interval_ms)) {
+        return;
+    }
+    prev_online = online;
+    last_log_tick = now;
+
+    const char *other_ssid = s_uplink_index == 0 ? SSID1 : SSID;
+    ESP_LOGI(TAG,
+             "failover_state: online=%u, attempts=%lu, uplink_index=%u, other_ssid=%s, "
+             "scan_requested=%d, scan_active=%d, restart_pending=%d, trial_active=%d, eth_ip=%d",
+             online ? 1U : 0U,
+             (unsigned long)__atomic_load_n(&s_failover_attempts, __ATOMIC_RELAXED),
+             (unsigned)s_uplink_index,
+             other_ssid ? other_ssid : "(null)",
+             __atomic_load_n(&s_scan_requested, __ATOMIC_RELAXED) ? 1 : 0,
+             __atomic_load_n(&s_scan_active, __ATOMIC_RELAXED) ? 1 : 0,
+             __atomic_load_n(&s_restart_for_failover, __ATOMIC_RELAXED) ? 1 : 0,
+             s_trial_active ? 1 : 0,
+             dual_net_has_eth_ip() ? 1 : 0);
+}
+
+/*
+ * 故障转移重启辅助：先清除 mesh-lite 库存储的路由器信息，再重启。
+ *
+ * 根因（2026-10-14 实机日志确认）：mesh-lite 闭源库在启动时若其 RTC 存储非空，
+ * 会用存储的路由器配置覆盖 mesh_init_Custom() 设置的 STA 配置并重连旧路由器
+ * （串口表现为 "[Unexpected restart] ... Try to connect the original parent node"
+ * 之后紧跟第二次 STA 配置应用/authmode 日志）。若不清除，切备用路由器的 trial
+ * 重启会被库改回旧路由器（已关闭），30s 后必然退回 saved uplink，切换永远无法生效。
+ *
+ * 清除后启动时库无存储可恢复，只能使用本次 mesh_init_Custom 设置的目标 uplink
+ * 配置（由 s_uplink_index/s_trial_uplink_index 决定）。
+ *
+ * 注意：esp_mesh_lite_erase_rtc_store() 官方注释为 "Must be called before node
+ * factory reset"，此处为有意的偏离使用——语义上正是「切换路由器前丢弃旧路由器
+ * 存储」，且仅在根节点故障转移重启路径调用。RTC 内存为直接写访问，无需等待。
+ */
+static void mesh_failover_restart(const char *reason)
+{
+    ESP_LOGW(TAG, "Failover restart (%s): erase stored router, then restart", reason);
+    esp_mesh_lite_erase_rtc_store();
+    esp_restart();
 }
 
 static void root_failover_task(void *arg)
 {
     TickType_t lost_since = 0;
     TickType_t last_scan = 0;
+    TickType_t last_log_cooldown_tick = 0;
     for (;;) {
         TickType_t now = xTaskGetTickCount();
+        /* 诊断：循环态限频日志（翻转即报），供 H1-H5 假设树判读。 */
+        mesh_failover_log_state(__atomic_load_n(&Network_Flag, __ATOMIC_ACQUIRE) != 0, now);
         /*
          * 以太网守卫：上行已由有线承担时，WiFi STA 没有 IP 属于正常情况。
          * 此时不应按「上行故障」处理，否则会扫描备用路由器并 esp_restart()，
@@ -325,7 +416,7 @@ static void root_failover_task(void *arg)
                     ESP_LOGI(TAG, "Alternate uplink confirmed; restarting with saved credentials");
                     vTaskDelay(pdMS_TO_TICKS(200));
                     if (dual_net_has_eth_ip()) continue;
-                    esp_restart();
+                    mesh_failover_restart("alternate uplink confirmed");
                 }
                 ESP_LOGE(TAG, "Failed to save confirmed uplink: %s", esp_err_to_name(err));
             } else {
@@ -335,7 +426,7 @@ static void root_failover_task(void *arg)
                     ESP_LOGW(TAG, "Alternate uplink did not obtain IP; returning to saved uplink");
                     vTaskDelay(pdMS_TO_TICKS(200));
                     if (dual_net_has_eth_ip()) continue;
-                    esp_restart();
+                    mesh_failover_restart("alternate uplink failed, return to saved");
                 }
             }
             vTaskDelay(pdMS_TO_TICKS(1000));
@@ -357,16 +448,32 @@ static void root_failover_task(void *arg)
                 !s_scan_requested) {
                 s_scan_requested = true;
                 last_scan = now;
+                ESP_LOGI(TAG,
+                         "Failover scan requested: lost_ms=%lu, attempts=%lu, target=%s",
+                         (unsigned long)((now - lost_since) * portTICK_PERIOD_MS),
+                         (unsigned long)__atomic_load_n(&s_failover_attempts, __ATOMIC_RELAXED),
+                         other_ssid ? other_ssid : "(null)");
                 esp_err_t err = esp_mesh_lite_wifi_scan_start(NULL, pdMS_TO_TICKS(3000));
                 if (err != ESP_OK) {
                     s_scan_requested = false;
                     ESP_LOGW(TAG, "Failover scan: %s", esp_err_to_name(err));
                 }
+            } else if (s_failover_attempts >= 2 &&
+                       (now - lost_since) < pdMS_TO_TICKS(FAILOVER_RETRY_COOLDOWN_MS) &&
+                       (now - last_log_cooldown_tick) >= pdMS_TO_TICKS(MESH_FAILOVER_LOG_LOST_MS)) {
+                /* H5：attempts 耗尽量冷却期，明示剩余等待，避免误判为“无反应”。 */
+                last_log_cooldown_tick = now;
+                ESP_LOGW(TAG,
+                         "Failover paused in cooldown: attempts=%lu, elapsed_ms=%lu, cooldown_ms=%lu",
+                         (unsigned long)__atomic_load_n(&s_failover_attempts, __ATOMIC_RELAXED),
+                         (unsigned long)((now - lost_since) * portTICK_PERIOD_MS),
+                         (unsigned long)FAILOVER_RETRY_COOLDOWN_MS);
             }
         }
         if (s_restart_for_failover &&
             (__atomic_load_n(&Network_Flag, __ATOMIC_ACQUIRE) || dual_net_has_eth_ip())) {
             s_restart_for_failover = false;
+            ESP_LOGI(TAG, "Failover restart cancelled: link recovered before restart");
         }
         if (s_restart_for_failover) {
             uint8_t next = s_uplink_index == 0 ? 1 : 0;
@@ -379,9 +486,10 @@ static void root_failover_task(void *arg)
                 s_restart_for_failover = false;
                 /* GOT_IP 回调也会清零计数，不能用 -- 回滚而导致无符号下溢。 */
                 s_failover_attempts = 0;
+                ESP_LOGI(TAG, "Failover restart aborted: link recovered during guard window");
                 continue;
             }
-            esp_restart();
+            mesh_failover_restart("switch to alternate uplink");
         }
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
@@ -627,7 +735,20 @@ esp_err_t mesh_init_Custom(void)
                                     NULL, LG_PRIO_MESH_FAILOVER,
                                     NULL, LG_APP_CPU_CORE) != pdPASS) {
             ESP_LOGE(TAG, "Failed to create failover task");
+        } else {
+            /* 诊断：主备切换任务就绪，明示初始 uplink_index 与扫描目标（H1 证据）。 */
+            ESP_LOGI(TAG, "Failover task created: uplink_index=%u, primary=%s, alternate=%s",
+                     (unsigned)s_uplink_index,
+                     SSID ? SSID : "(null)", SSID1 ? SSID1 : "(null)");
         }
+    } else if (IsRoot) {
+        /*
+         * H1：主备切换任务被条件静默跳过——根节点将永远不会切备用路由器。
+         * 此处必须可诊断：打印 SSID1 与密码长度（不打印密码本体）。
+         */
+        ESP_LOGE(TAG, "Failover task NOT created: alternate router invalid, ssid1=%s, pass1_len=%u",
+                 SSID1 ? SSID1 : "(null)",
+                 (unsigned)(WIFI_PS1 ? strlen(WIFI_PS1) : 0));
     }
     bool mesh_health_started = true; /* 根节点无此任务，视为不适用 */
     if (!IsRoot) {
