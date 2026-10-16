@@ -263,6 +263,23 @@ static atomic_bool s_ble_abnormal_disconnect;
 #define BLE_SCAN_WAIT_TIMEOUT_MS 30000
 
 /*
+ * BLE 连接结果等待上限：ble_connect_by_name() 返回 true 仅代表 enh_open 被接受，
+ * 连接建立结果（CONNECT_EVT 成功 / OPEN_EVT 133 或建链中断失败）由
+ * ble_connect_cb() 经 BleConnectComplete/BleConnectSuccess 交付。
+ * 覆盖 enh_open 受理到控制器建链失败的实测时长（约 200ms），15s 足够宽容。
+ */
+#define BLE_CONNECT_WAIT_TIMEOUT_MS 15000
+
+/*
+ * BLE GATT 设置阶段结论等待上限：连接建立后 Ble_control 依次完成服务发现、
+ * notify 注册与 CCCD 写入，结论经 ble_gatt_setup_done() 查询。
+ * 正常 <2s；实机呆滞 DUT 服务发现即耗时 7.5s 且 CCCD 写永无响应（最终靠
+ * 对端 500ms 监控超时掉线），取 10s 既容忍慢设备，又能在对端拖死链路前
+ * 快速失败重试（远早于原 20s 固定等待）。
+ */
+#define BLE_GATT_SETUP_TIMEOUT_MS 10000
+
+/*
  * 蓝牙老化会话的丢失数据列表：随老化任务创建/销毁。
  * 提为文件静态指针，使各退出路径（自删除式中止/完成）能统一释放；
  * 外部 vTaskDelete 路径的残留泄漏见设计文档「已知限制」。
@@ -1591,6 +1608,12 @@ static int make_can_write_transfer_by_nameorid(Externaldevice *device,
 bool IsEnc = false;
 /* 用于判断是否扫描完成：Bluedroid 扫描回调写、CPU1 老化任务读，需 volatile 保证可见性 */
 static volatile bool ScanComplete = false;
+/*
+ * BLE 连接结果：Bluedroid GATTC 回调（ble_connect_cb）写、CPU1 老化任务读。
+ * Complete=结果已交付；Success=建立成功（false 表示建立失败，需重试）。
+ */
+static volatile bool BleConnectComplete = false;
+static volatile bool BleConnectSuccess = false;
 // BLE扫描完成回调
 void ble_scan_complete_cb(ble_device_info_t *devices, int device_count)
 {
@@ -1610,15 +1633,20 @@ void ble_scan_complete_cb(ble_device_info_t *devices, int device_count)
     }
 }
 // BLE连接结果回调
+// success=true：连接建立成功；success=false：连接建立失败（enh_open 被拒或
+// 建链失败，如 HCI rsn 0x3E / OPEN_EVT 133），由 Ble_control 的状态机分流上报。
+// 回调上下文只置标志与打日志，不碰存储/MQTT/任务删除。
 void ble_connect_cb(bool success, const char *device_name)
 {
+    BleConnectSuccess = success;
+    BleConnectComplete = true;
     if (success)
     {
         ESP_LOGI(TAG, "BLE connected to: %s\n", device_name);
     }
     else
     {
-        ESP_LOGE(TAG, "BLE connection failed to: %s\n", device_name);
+        ESP_LOGE(TAG, "BLE connection establishment failed to: %s\n", device_name);
     }
 }
 // BLE断开连接回调
@@ -4285,8 +4313,92 @@ void Aging_Test_Task(void *arg)
                         break;
                     }
 
+                    /*
+                     * ble_connect_by_name() 返回 true 仅代表 enh_open 被受理，
+                     * 连接尚未建立：结果由 CONNECT_EVT（成功）/ OPEN_EVT 133 或
+                     * 建链中断（失败，如 HCI rsn 0x3E）经 ble_connect_cb 置位
+                     * BleConnectComplete/BleConnectSuccess 交付。
+                     * 先复位上一轮遗留结果再发起，避免快速失败事件被旧值吞掉。
+                     */
+                    BleConnectComplete = false;
+                    BleConnectSuccess = false;
+
                     if (ble_connect_by_name(PN_Code))
                     {
+                        aging_runtime_log("Bluetooth connect request accepted, awaiting establishment result, attempt=%u",
+                                          (unsigned)FailCount);
+
+                        /*
+                         * 等待连接建立结果（参照 ScanComplete 轮询模式）：
+                         * 超过 BLE_CONNECT_WAIT_TIMEOUT_MS 未交付按本次尝试失败处理。
+                         */
+                        TickType_t connect_start_tick = xTaskGetTickCount();
+                        while (!BleConnectComplete)
+                        {
+                            if ((xTaskGetTickCount() - connect_start_tick) >= pdMS_TO_TICKS(BLE_CONNECT_WAIT_TIMEOUT_MS))
+                            {
+                                break;
+                            }
+                            vTaskDelay(pdMS_TO_TICKS(500));
+                        }
+
+                        bool connect_established = false;
+                        if (BleConnectComplete && BleConnectSuccess)
+                        {
+                            connect_established = true;
+                        }
+                        else if (!BleConnectComplete && ble_is_connected())
+                        {
+                            /* 回调与轮询竞态：CONNECT_EVT 已处理但标志尚未被读到 */
+                            connect_established = true;
+                        }
+
+                        if (!connect_established)
+                        {
+                            /*
+                             * 建立失败（或结果等待超时）：按本次尝试失败走 FailCount
+                             * 路径重试，不再误判为「异常断开」一次失败即中止老化。
+                             */
+                            BleConnectComplete = false;
+                            aging_error_log("Bluetooth connection establishment failed (link setup or open error), attempt=%u",
+                                            (unsigned)FailCount);
+                            /* 防御：失败后底层若仍在扫描，先停止再进入下一轮重试。 */
+                            ble_stop_scan();
+                            vTaskDelay(pdMS_TO_TICKS(3000)); // 退避，避开 DUT 刚上电/被占用窗口
+                            break;
+                        }
+
+                        /*
+                         * 等待 GATT 设置阶段结论（服务发现/notify 注册/CCCD 写确认）：
+                         * 呆滞 DUT 建链后停止响应时，在此带超时快速失败并重试，
+                         * 不再傻等 20s 后才在通信检查中暴露（2026-10-16 实机日志：
+                         * CCCD 写 7.3s 无响应，最终 rsn 0x08 掉线）。
+                         */
+                        TickType_t setup_start_tick = xTaskGetTickCount();
+                        while (!ble_gatt_setup_done())
+                        {
+                            if ((xTaskGetTickCount() - setup_start_tick) >= pdMS_TO_TICKS(BLE_GATT_SETUP_TIMEOUT_MS))
+                            {
+                                break;
+                            }
+                            vTaskDelay(pdMS_TO_TICKS(500));
+                        }
+
+                        if (!ble_gatt_setup_done())
+                        {
+                            aging_error_log("Bluetooth GATT setup not confirmed (service discovery/notify/CCCD) within %u ms, attempt=%u",
+                                            (unsigned)BLE_GATT_SETUP_TIMEOUT_MS, (unsigned)FailCount);
+                            /*
+                             * 主动断开（BTDisConnect=1 主动语义，避免被误判为异常
+                             * 断开而直接中止整台老化）：本次尝试失败，走 FailCount
+                             * 路径重试（下一轮重新扫描+连接）。
+                             */
+                            BTDisConnect = 1;
+                            ble_disconnect();
+                            vTaskDelay(pdMS_TO_TICKS(1000)); // 等断开事件落定，避免下一轮扫描被拒
+                            break;
+                        }
+
                         aging_runtime_log("Bluetooth aging device connected");
 
                         vTaskDelay(pdMS_TO_TICKS(20000)); // 等待设备初始化完成，避免刚连接就读数据失败

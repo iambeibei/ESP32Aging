@@ -49,7 +49,8 @@ static atomic_bool s_mqtt_connected;
 #define MQTT_UPLINK_DISCONNECT_RETRY_MAX 3
 #define MQTT_PUBLISH_DRAIN_TIMEOUT_MS 11000 /* 现有网络写超时10秒 + 调度余量。 */
 
-typedef enum {
+typedef enum
+{
     MQTT_APP_STOPPED,
     MQTT_APP_CONNECTING,
     MQTT_APP_CONNECTED,
@@ -57,7 +58,8 @@ typedef enum {
     MQTT_APP_STOPPING,
 } MqttAppPhase;
 
-typedef struct {
+typedef struct
+{
     MqttAppPhase phase;
     dual_net_uplink_t desired_uplink;
     uint32_t route_generation;
@@ -88,11 +90,13 @@ static SemaphoreHandle_t mqtt_lifecycle_mutex(void)
 static esp_err_t mqtt_lifecycle_init(void)
 {
     portENTER_CRITICAL(&s_mqtt_state_lock);
-    if (s_mqtt_lifecycle_mutex != NULL) {
+    if (s_mqtt_lifecycle_mutex != NULL)
+    {
         portEXIT_CRITICAL(&s_mqtt_state_lock);
         return ESP_OK;
     }
-    if (s_mqtt_mutex_initializing) {
+    if (s_mqtt_mutex_initializing)
+    {
         portEXIT_CRITICAL(&s_mqtt_state_lock);
         return ESP_ERR_INVALID_STATE; // 并发首次初始化者由现有启动重试流程重试。
     }
@@ -108,7 +112,8 @@ static esp_err_t mqtt_lifecycle_init(void)
 
 static void mqtt_lifecycle_unlock(SemaphoreHandle_t mutex)
 {
-    if (xSemaphoreGive(mutex) != pdTRUE) ESP_LOGE(TAG, "MQTT lifecycle unlock failed");
+    if (xSemaphoreGive(mutex) != pdTRUE)
+        ESP_LOGE(TAG, "MQTT lifecycle unlock failed");
 }
 
 /* 调用者已持生命周期锁，或正在该客户端的 SDK 回调中。SDK API 一律在状态锁外。
@@ -120,20 +125,25 @@ static void mqtt_request_disconnect(esp_mqtt_client_handle_t client)
                    s_mqtt_control.switch_pending && !s_mqtt_control.disconnect_requested &&
                    s_mqtt_control.desired_uplink != DUAL_NET_UPLINK_NONE &&
                    s_mqtt_control.disconnect_failures < MQTT_UPLINK_DISCONNECT_RETRY_MAX;
-    if (request) {
+    if (request)
+    {
         s_mqtt_control.disconnect_requested = true;
         atomic_store(&s_mqtt_connected, false);
     }
     uint32_t generation = s_mqtt_control.route_generation;
     portEXIT_CRITICAL(&s_mqtt_state_lock);
-    if (!request) return;
+    if (!request)
+        return;
     esp_err_t err = esp_mqtt_client_disconnect(client);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         portENTER_CRITICAL(&s_mqtt_state_lock);
-        if (client == s_client && s_mqtt_control.phase == MQTT_APP_CONNECTED) {
+        if (client == s_client && s_mqtt_control.phase == MQTT_APP_CONNECTED)
+        {
             s_mqtt_control.disconnect_requested = false;
             if (s_mqtt_control.route_generation == generation &&
-                ++s_mqtt_control.disconnect_failures >= MQTT_UPLINK_DISCONNECT_RETRY_MAX) {
+                ++s_mqtt_control.disconnect_failures >= MQTT_UPLINK_DISCONNECT_RETRY_MAX)
+            {
                 s_mqtt_control.switch_pending = false;
                 s_mqtt_control.expedite_pending = false;
                 /* 断开请求从未被SDK受理，旧连接仍在；允许业务继续并由SDK处理后续故障。 */
@@ -142,7 +152,9 @@ static void mqtt_request_disconnect(esp_mqtt_client_handle_t client)
         }
         portEXIT_CRITICAL(&s_mqtt_state_lock);
         ESP_LOGW(TAG, "上行切换请求 MQTT 断开失败：%s", esp_err_to_name(err));
-    } else {
+    }
+    else
+    {
         ESP_LOGI(TAG, "上行切换请求 MQTT 断开：client=%p, generation=%lu",
                  (void *)client, (unsigned long)generation);
     }
@@ -151,20 +163,26 @@ static void mqtt_request_disconnect(esp_mqtt_client_handle_t client)
 static void mqtt_request_immediate_reconnect(esp_mqtt_client_handle_t client)
 {
     /* 即使路由事件尚未处理，物理链路失效时也不能加速无出口的连接尝试。 */
-    if (IsRoot != 1 || dual_net_get_active_uplink() == DUAL_NET_UPLINK_NONE) return;
+    if (IsRoot != 1 || dual_net_get_active_uplink() == DUAL_NET_UPLINK_NONE)
+        return;
     portENTER_CRITICAL(&s_mqtt_state_lock);
     bool request = client == s_client && s_mqtt_control.phase == MQTT_APP_WAIT_RECONNECT &&
                    s_mqtt_control.expedite_pending &&
                    s_mqtt_control.desired_uplink != DUAL_NET_UPLINK_NONE;
-    if (request) s_mqtt_control.expedite_pending = false;
+    if (request)
+        s_mqtt_control.expedite_pending = false;
     uint32_t generation = s_mqtt_control.route_generation;
     portEXIT_CRITICAL(&s_mqtt_state_lock);
-    if (!request) return;
+    if (!request)
+        return;
     /* 每次上行变化只加速一次；失败后沿用 SDK 自动重连退避，避免拒绝连接时忙循环。 */
     esp_err_t err = esp_mqtt_client_reconnect(client);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGW(TAG, "立即 MQTT 重连未受理：%s，保留自动重连", esp_err_to_name(err));
-    } else {
+    }
+    else
+    {
         ESP_LOGI(TAG, "上行切换立即重连 MQTT：client=%p, generation=%lu",
                  (void *)client, (unsigned long)generation);
     }
@@ -172,11 +190,14 @@ static void mqtt_request_immediate_reconnect(esp_mqtt_client_handle_t client)
 
 void mqtt_app_process_uplink_reconnect(void)
 {
-    if (IsRoot != 1) return;
+    if (IsRoot != 1)
+        return;
     SemaphoreHandle_t mutex = mqtt_lifecycle_mutex();
     /* 不阻塞 net_monitor；停止/启动持锁时保留请求，下一次监控检查再处理。 */
-    if (mutex == NULL || xSemaphoreTake(mutex, 0) != pdTRUE) return;
-    if (s_client != NULL && s_client_started) {
+    if (mutex == NULL || xSemaphoreTake(mutex, 0) != pdTRUE)
+        return;
+    if (s_client != NULL && s_client_started)
+    {
         mqtt_request_disconnect(s_client);
         mqtt_request_immediate_reconnect(s_client);
     }
@@ -185,9 +206,11 @@ void mqtt_app_process_uplink_reconnect(void)
 
 void mqtt_app_on_uplink_changed(dual_net_uplink_t uplink)
 {
-    if (IsRoot != 1) return;
+    if (IsRoot != 1)
+        return;
     portENTER_CRITICAL(&s_mqtt_state_lock);
-    if (s_mqtt_control.desired_uplink == uplink) {
+    if (s_mqtt_control.desired_uplink == uplink)
+    {
         portEXIT_CRITICAL(&s_mqtt_state_lock);
         return;
     }
@@ -198,7 +221,8 @@ void mqtt_app_on_uplink_changed(dual_net_uplink_t uplink)
     s_mqtt_control.switch_pending = running && uplink != DUAL_NET_UPLINK_NONE;
     s_mqtt_control.expedite_pending = s_mqtt_control.switch_pending;
     s_mqtt_control.disconnect_failures = 0;
-    if (uplink == DUAL_NET_UPLINK_NONE) atomic_store(&s_mqtt_connected, false);
+    if (uplink == DUAL_NET_UPLINK_NONE)
+        atomic_store(&s_mqtt_connected, false);
     uint32_t generation = s_mqtt_control.route_generation;
     portEXIT_CRITICAL(&s_mqtt_state_lock);
     ESP_LOGI(TAG, "MQTT 上行变化：target=%d, generation=%lu", uplink, (unsigned long)generation);
@@ -208,7 +232,8 @@ void mqtt_app_on_uplink_changed(dual_net_uplink_t uplink)
 static void mqtt_before_connect(esp_mqtt_client_handle_t client)
 {
     portENTER_CRITICAL(&s_mqtt_state_lock);
-    if (client == s_client && s_mqtt_control.phase != MQTT_APP_STOPPING) {
+    if (client == s_client && s_mqtt_control.phase != MQTT_APP_STOPPING)
+    {
         s_mqtt_control.phase = MQTT_APP_CONNECTING;
         s_mqtt_control.attempt_generation = s_mqtt_control.route_generation;
         /* 本轮已使用当前默认出口；失败后不继续零等待重试。 */
@@ -226,9 +251,11 @@ static bool mqtt_connected(esp_mqtt_client_handle_t client)
                   s_mqtt_control.phase != MQTT_APP_STOPPED;
     bool stale = usable && IsRoot == 1 && s_mqtt_control.switch_pending &&
                  s_mqtt_control.attempt_generation != s_mqtt_control.route_generation;
-    if (usable) {
+    if (usable)
+    {
         s_mqtt_control.phase = MQTT_APP_CONNECTED;
-        if (!stale) {
+        if (!stale)
+        {
             s_mqtt_control.switch_pending = false;
             s_mqtt_control.expedite_pending = false;
             s_mqtt_control.disconnect_requested = false;
@@ -237,7 +264,8 @@ static bool mqtt_connected(esp_mqtt_client_handle_t client)
         }
     }
     portEXIT_CRITICAL(&s_mqtt_state_lock);
-    if (stale) {
+    if (stale)
+    {
         ESP_LOGI(TAG, "连接期间出口已变化，重新建立 MQTT 连接");
         mqtt_request_disconnect(client);
     }
@@ -249,13 +277,15 @@ static void mqtt_disconnected(esp_mqtt_client_handle_t client)
     portENTER_CRITICAL(&s_mqtt_state_lock);
     bool running = client == s_client && s_mqtt_control.phase != MQTT_APP_STOPPING &&
                    s_mqtt_control.phase != MQTT_APP_STOPPED;
-    if (running) {
+    if (running)
+    {
         atomic_store(&s_mqtt_connected, false);
         s_mqtt_control.phase = MQTT_APP_WAIT_RECONNECT;
         s_mqtt_control.disconnect_requested = false;
     }
     portEXIT_CRITICAL(&s_mqtt_state_lock);
-    if (running) mqtt_request_immediate_reconnect(client);
+    if (running)
+        mqtt_request_immediate_reconnect(client);
 }
 
 /**
@@ -329,7 +359,8 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
         break;
     case MQTT_EVENT_CONNECTED:
     {
-        if (!mqtt_connected(event->client)) break;
+        if (!mqtt_connected(event->client))
+            break;
         ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED client=%p, connection_count=%u, uplink=%s",
                  (void *)event->client, ++s_mqtt_connect_count,
                  IsRoot == 1 ? dual_net_get_active_interface() : "MESH_STA");
@@ -449,6 +480,14 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
             if (esp_mqtt_client_subscribe(event->client, topic, 0) < 0)
             {
                 ESP_LOGE(TAG, "Failed to subscribe to Cannextstep");
+            }
+
+            // 订阅服务，重启主题，多点位ota升级时统一重启
+            memset(topic, 0, sizeof(topic));
+            snprintf(topic, sizeof(topic), "server/rack/%s/CanRestart", AgingNumber);
+            if (esp_mqtt_client_subscribe(event->client, topic, 0) < 0)
+            {
+                ESP_LOGE(TAG, "Failed to subscribe to CanRestart");
             }
         }
 
@@ -602,7 +641,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 static void mqtt_destroy_client_locked(void)
 {
     esp_err_t err = esp_mqtt_client_destroy(s_client);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGE(TAG, "Destroy MQTT client failed: %s; retain handle", esp_err_to_name(err));
         portENTER_CRITICAL(&s_mqtt_state_lock);
         s_mqtt_control.phase = MQTT_APP_STOPPING;
@@ -639,18 +679,15 @@ static esp_err_t mqtt_app_start_locked(void)
                 .transport = MQTT_TRANSPORT_OVER_TCP,
             }},
         .credentials = {.username = "dev", .authentication = {
-                                                 .password = "123456",
-                                             }},
-        .session = {.keepalive = IsRoot == 1 ? MQTT_ROOT_KEEPALIVE_SECONDS : MQTT_NODE_KEEPALIVE_SECONDS,
-                    .disable_clean_session = false,
-                    .protocol_ver = MQTT_PROTOCOL_V_3_1_1,
-                    .last_will = {
-                        .topic = "device/public/down_line",
-                        .msg = json,
-                        .qos = 1,
-                        .retain = 0,
+                                               .password = "123456",
+                                           }},
+        .session = {.keepalive = IsRoot == 1 ? MQTT_ROOT_KEEPALIVE_SECONDS : MQTT_NODE_KEEPALIVE_SECONDS, .disable_clean_session = false, .protocol_ver = MQTT_PROTOCOL_V_3_1_1, .last_will = {
+                                                                                                                                                                                     .topic = "device/public/down_line",
+                                                                                                                                                                                     .msg = json,
+                                                                                                                                                                                     .qos = 1,
+                                                                                                                                                                                     .retain = 0,
 
-                    }},
+                                                                                                                                                                                 }},
         .network = {
             .timeout_ms = 10000, // 网络连接超时时间，单位为毫秒
             .disable_auto_reconnect = false,
@@ -705,9 +742,11 @@ static esp_err_t mqtt_app_start_locked(void)
 esp_err_t mqtt_app_start(void)
 {
     esp_err_t err = mqtt_lifecycle_init();
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK)
+        return err;
     SemaphoreHandle_t mutex = mqtt_lifecycle_mutex();
-    if (xSemaphoreTake(mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
+    if (xSemaphoreTake(mutex, portMAX_DELAY) != pdTRUE)
+        return ESP_ERR_TIMEOUT;
     err = mqtt_app_start_locked();
     mqtt_lifecycle_unlock(mutex);
     return err;
@@ -716,8 +755,10 @@ esp_err_t mqtt_app_start(void)
 void mqtt_app_stop(void)
 {
     SemaphoreHandle_t mutex = mqtt_lifecycle_mutex();
-    if (mutex == NULL) return;
-    if (xSemaphoreTake(mutex, portMAX_DELAY) != pdTRUE) {
+    if (mutex == NULL)
+        return;
+    if (xSemaphoreTake(mutex, portMAX_DELAY) != pdTRUE)
+    {
         ESP_LOGE(TAG, "MQTT lifecycle lock failed on stop");
         return;
     }
@@ -727,10 +768,13 @@ void mqtt_app_stop(void)
     s_mqtt_control.expedite_pending = false;
     atomic_store(&s_mqtt_connected, false);
     portEXIT_CRITICAL(&s_mqtt_state_lock);
-    if (s_client != NULL) {
-        if (s_client_started) {
+    if (s_client != NULL)
+    {
+        if (s_client_started)
+        {
             esp_err_t err = esp_mqtt_client_stop(s_client);
-            if (err != ESP_OK) {
+            if (err != ESP_OK)
+            {
                 ESP_LOGE(TAG, "Stop MQTT client failed: %s; retain handle", esp_err_to_name(err));
                 mqtt_lifecycle_unlock(mutex);
                 return;
@@ -739,12 +783,15 @@ void mqtt_app_stop(void)
         }
         /* 回调不获取生命周期锁；在途 publish 用计数保护句柄，释放计数不依赖该锁。 */
         TickType_t started_ticks = xTaskGetTickCount();
-        for (;;) {
+        for (;;)
+        {
             portENTER_CRITICAL(&s_mqtt_state_lock);
             uint32_t refs = s_mqtt_control.publish_refs;
             portEXIT_CRITICAL(&s_mqtt_state_lock);
-            if (refs == 0) break;
-            if (xTaskGetTickCount() - started_ticks >= pdMS_TO_TICKS(MQTT_PUBLISH_DRAIN_TIMEOUT_MS)) {
+            if (refs == 0)
+                break;
+            if (xTaskGetTickCount() - started_ticks >= pdMS_TO_TICKS(MQTT_PUBLISH_DRAIN_TIMEOUT_MS))
+            {
                 ESP_LOGE(TAG, "MQTT publish drain timed out; retain stopped client");
                 mqtt_lifecycle_unlock(mutex);
                 return;
@@ -752,7 +799,9 @@ void mqtt_app_stop(void)
             vTaskDelay(1);
         }
         mqtt_destroy_client_locked();
-    } else {
+    }
+    else
+    {
         portENTER_CRITICAL(&s_mqtt_state_lock);
         s_mqtt_control.phase = MQTT_APP_STOPPED;
         portEXIT_CRITICAL(&s_mqtt_state_lock);
@@ -765,7 +814,8 @@ void mqtt_app_restart(void)
     mqtt_app_stop();
     vTaskDelay(pdMS_TO_TICKS(200));
     esp_err_t err = mqtt_app_start();
-    if (err != ESP_OK) ESP_LOGE(TAG, "Restart MQTT client failed: %s", esp_err_to_name(err));
+    if (err != ESP_OK)
+        ESP_LOGE(TAG, "Restart MQTT client failed: %s", esp_err_to_name(err));
 }
 
 static int mqtt_app_publish(char *topic, char *publish_string)
@@ -773,10 +823,14 @@ static int mqtt_app_publish(char *topic, char *publish_string)
     /* SDK回调中的 Config_Report 也会发布，不能获取可能被 stop 持有的生命周期锁。 */
     portENTER_CRITICAL(&s_mqtt_state_lock);
     esp_mqtt_client_handle_t client = atomic_load(&s_mqtt_connected) &&
-                                    s_mqtt_control.phase == MQTT_APP_CONNECTED ? s_client : NULL;
-    if (client != NULL) s_mqtt_control.publish_refs++;
+                                              s_mqtt_control.phase == MQTT_APP_CONNECTED
+                                          ? s_client
+                                          : NULL;
+    if (client != NULL)
+        s_mqtt_control.publish_refs++;
     portEXIT_CRITICAL(&s_mqtt_state_lock);
-    if (client == NULL) return -1;
+    if (client == NULL)
+        return -1;
     int msg_id = esp_mqtt_client_publish(client, topic, publish_string, 0, 1, 0);
     portENTER_CRITICAL(&s_mqtt_state_lock);
     s_mqtt_control.publish_refs--;
@@ -903,9 +957,11 @@ static esp_err_t mqtt_init_locked(void)
 esp_err_t mqtt_init(void)
 {
     esp_err_t err = mqtt_lifecycle_init();
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK)
+        return err;
     SemaphoreHandle_t mutex = mqtt_lifecycle_mutex();
-    if (xSemaphoreTake(mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
+    if (xSemaphoreTake(mutex, portMAX_DELAY) != pdTRUE)
+        return ESP_ERR_TIMEOUT;
     err = mqtt_init_locked();
     mqtt_lifecycle_unlock(mutex);
     return err;

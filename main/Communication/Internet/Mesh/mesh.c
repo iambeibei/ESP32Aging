@@ -29,6 +29,16 @@
 
 
 #define MESH_MAX_LEVEL 6
+/*
+ * 每节点 SoftAP 最大接入子节点数：2026-10-16 曾由 5 调到 8（缓解「中间父
+ * 断开+根已满」时无替代父的重连循环），同日应现场要求回退为 5。
+ * 回退后该场景依靠：重连节奏 5s×2/15s（加快重扫发现）+ 无父自愈 watchdog
+ * （软复位→重启兜底，见 MESH_PARENT_LOST_SOFT_RESET_MS）兜底。
+ * 约束备忘：ESP32-S3 SoftAP 单节点上限 15；CONFIG_LWIP_DHCPS_MAX_STATION_NUM=64；
+ * iot_bridge Kconfig 要求 DHCPS ≥ SOFTAP_MAX_CONNECT_NUMBER；NAPT 表 512 条。
+ * 注意：esp_bridge_wifi_set_config() 会用 CONFIG_BRIDGE_SOFTAP_MAX_CONNECT_NUMBER
+ * 覆盖此处设置，sdkconfig.defaults 与构建生效 sdkconfig 必须同步。
+ */
 #define MESH_MAX_CHILDREN 5
 #define FAILOVER_LOST_IP_MS 30000
 #define FAILOVER_SCAN_INTERVAL_MS 60000
@@ -38,12 +48,17 @@
 /*
  * mesh-lite 父节点重连/重扫节奏（esp_mesh_lite_set_wifi_reconnect_interval 单位：秒）。
  * 库默认「5s×2 次重连当前父，失败后每 10s 重扫」。
- * 根节点消失后子节点会长期停留重扫态：间隔过短与 BLE 老化链路争用射频，
- * 并放大闭源重扫路径的暴露。30s 重扫对根恢复（通常分钟级）可接受。
+ * 历史取舍（CHILD_NODE_ROOT_LOSS_DESIGN.md 7.3）：曾调到 10s×3/30s，
+ * 压 BLE 老化链路射频争用与闭源重扫路径暴露，但中间父断开时
+ * 「30s 只重连原父 + 30s 才重扫」使子节点长时间卡在重连循环
+ * （根已满时每轮撞满员根被 deauth，见现场根日志 max connection, deauth!）。
+ * 2026-10-16 折中：5s×2（重连窗口 30s→10s）+ 15s 重扫，
+ * 重扫暴露介于原设计与库默认之间；配合无父 watchdog（见
+ * MESH_PARENT_LOST_SOFT_RESET_MS）做有界自愈，不再依赖拖长节奏兜底。
  */
-#define MESH_PARENT_RETRY_INTERVAL_SEC 10
-#define MESH_PARENT_RETRY_COUNT        3
-#define MESH_RESCAN_INTERVAL_SEC       30
+#define MESH_PARENT_RETRY_INTERVAL_SEC 5
+#define MESH_PARENT_RETRY_COUNT        2
+#define MESH_RESCAN_INTERVAL_SEC       15
 
 /* 子节点健康监视周期：父丢失态 5s 一条（掉线属异常态），恢复后 60s 心跳。 */
 #define MESH_HEALTH_LOST_INTERVAL_MS 5000
@@ -52,6 +67,34 @@
 /* 主备路由器切换任务循环态诊断日志限频周期（掉线态密、健康态疏）。 */
 #define MESH_FAILOVER_LOG_LOST_MS 5000
 #define MESH_FAILOVER_LOG_OK_MS   60000
+
+/*
+ * 无父自愈 watchdog（2026-10-16，仅子节点；根节点由 root_failover_task 负责）。
+ * 触发条件只看 Network_Flag（父链路/IP 条件），与 BLE/MQTT 事件解耦——
+ * BLE 老化掉线、MQTT 断连都不会触发本 watchdog。
+ *
+ * 分级 escalate（用户 2026-10-16 确认）：
+ *   L1 连续无父 MESH_PARENT_LOST_SOFT_RESET_MS → 软复位一次：
+ *      esp_mesh_lite_disconnect() + esp_mesh_lite_connect()，
+ *      强制库走「扫描匹配节点并连接」的 fresh 路径，绕开可能卡住的
+ *      内部重试状态与 RTC 原父偏好；不重启、不动老化任务、不丢数据；
+ *   L2 软复位 MESH_SOFT_RESET_MAX 次仍无父 → esp_restart()；
+ *   L3 每上电周期重启达 MESH_RESTART_MAX_PER_CYCLE（RTC 计数，
+ *      ESP_RST_SW 延续、上电/Brownout 清零，镜像 failover 范式）→
+ *      永久放弃重启，只限频打日志并继续扫描，回到「无限期存活于
+ *      无上行状态」（CHILD_NODE_ROOT_LOSS_DESIGN.md 7.2/7.7）。
+ *
+ * 背景：现场实测重启可恢复「中间父断开 + 根已满」的卡死；
+ * 软复位用官方 API 达成同等 scan-first 效果且不杀老化会话，
+ * 故作为第一级手段，重启仅作兜底。根掉线场景最坏时间线：
+ * 约 12/24/36 分钟三次重启后稳定存活（每次软复位有 3 分钟观察窗）。
+ */
+#define MESH_PARENT_LOST_SOFT_RESET_MS 180000 /* 连续无父 3 分钟后软复位 */
+#define MESH_SOFT_RESET_MAX             3      /* 本次无父期间软复位次数上限 */
+#define MESH_RESTART_MAX_PER_CYCLE      3      /* 每上电周期 watchdog 重启次数上限 */
+#define MESH_HEAL_RTC_MAGIC             0x4D484C57U /* "MHLW" */
+#define MESH_HEAL_GIVEUP_LOG_INTERVAL_MS 60000     /* 放弃重启后的限频日志周期 */
+#define MESH_HEAL_SOFT_RESET_GAP_MS     100        /* disconnect→connect 间隔与重启前日志落盘等待 */
 
 static const char *TAG = "mesh_lite_app";
 static char s_softap_prefix[16];
@@ -68,6 +111,10 @@ static bool s_sntp_started;
 static RTC_NOINIT_ATTR uint32_t s_failover_magic;
 static RTC_NOINIT_ATTR atomic_uint_least32_t s_failover_attempts;
 static RTC_NOINIT_ATTR uint32_t s_trial_uplink_index;
+/* 无父 watchdog 重启预算：仅软复位无效后的重启计数，镜像 failover 范式。
+ * ESP_RST_SW（本 watchdog 或 OTA 的软重启）延续计数；上电/Brownout 清零。 */
+static RTC_NOINIT_ATTR uint32_t s_heal_magic;
+static RTC_NOINIT_ATTR atomic_uint_least32_t s_heal_restart_count;
 
 /* 最近一次 STA 断开原因：事件任务写、健康监视任务读。
  * atomic_uint 的 4 字节对齐访问在 Xtensa 上原子；仅用于诊断，不作为控制依据。 */
@@ -108,10 +155,83 @@ static void mesh_update_network_flag(bool sta_has_ip)
 }
 
 /*
+ * 无父自愈 watchdog：仅子节点、仅由 mesh_health_task 串行调用（单写者）。
+ * 分级 escalate 见 MESH_PARENT_LOST_SOFT_RESET_MS 处注释；
+ * 触发条件只看 Network_Flag，与 BLE/MQTT 事件解耦。
+ * 恢复挂接时清零本次无父周期状态；重启预算跨重启保留（RTC）。
+ */
+static void mesh_heal_watchdog(bool online, TickType_t now)
+{
+    static TickType_t s_parent_lost_since = 0;
+    static uint32_t s_soft_reset_count = 0;
+    static TickType_t s_giveup_log_tick = 0;
+
+    if (online) {
+        /* 恢复挂接：丢弃本次无父周期的累计状态（含软复位计数）。 */
+        s_parent_lost_since = 0;
+        s_soft_reset_count = 0;
+        return;
+    }
+
+    if (s_parent_lost_since == 0) {
+        s_parent_lost_since = now;
+        s_soft_reset_count = 0;
+        ESP_LOGW(TAG, "Parent lost; heal watchdog armed (soft reset after %u ms)",
+                 (unsigned)MESH_PARENT_LOST_SOFT_RESET_MS);
+        return;
+    }
+
+    uint32_t lost_ms = (uint32_t)((now - s_parent_lost_since) * portTICK_PERIOD_MS);
+    if (lost_ms < MESH_PARENT_LOST_SOFT_RESET_MS) {
+        return;
+    }
+
+    if (s_soft_reset_count < MESH_SOFT_RESET_MAX) {
+        /* L1：软复位。重置计时给本次软复位一个完整观察窗。 */
+        s_soft_reset_count++;
+        s_parent_lost_since = now;
+        ESP_LOGW(TAG, "Parent lost %u ms; mesh soft reset %u/%u (disconnect+connect)",
+                 (unsigned)lost_ms, (unsigned)s_soft_reset_count, (unsigned)MESH_SOFT_RESET_MAX);
+        esp_err_t err = esp_mesh_lite_disconnect();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "esp_mesh_lite_disconnect: %s", esp_err_to_name(err));
+        }
+        vTaskDelay(pdMS_TO_TICKS(MESH_HEAL_SOFT_RESET_GAP_MS));
+        /* esp_mesh_lite_connect() 为 void 返回（esp_mesh_lite_core.h）：扫描匹配
+         * 节点并连接，结果由后续 mesh_health 心跳与 STA IP 日志体现。 */
+        esp_mesh_lite_connect();
+        return;
+    }
+
+    /* L2：软复位额度用尽 → 重启（受每上电周期预算约束）。 */
+    unsigned long restarts = __atomic_load_n(&s_heal_restart_count, __ATOMIC_RELAXED);
+    if (restarts < MESH_RESTART_MAX_PER_CYCLE) {
+        __atomic_store_n(&s_heal_restart_count, (atomic_uint_least32_t)(restarts + 1), __ATOMIC_RELAXED);
+        ESP_LOGW(TAG, "Parent lost %u ms; soft reset x%u ineffective; restarting node (%lu/%u this power cycle)",
+                 (unsigned)lost_ms, (unsigned)MESH_SOFT_RESET_MAX,
+                 (unsigned long)(restarts + 1), (unsigned)MESH_RESTART_MAX_PER_CYCLE);
+        vTaskDelay(pdMS_TO_TICKS(MESH_HEAL_SOFT_RESET_GAP_MS)); /* 给日志落盘留时间 */
+        esp_restart();
+        return; /* 不会到达 */
+    }
+
+    /* L3：重启预算耗尽 → 永久放弃重启，限频记录后继续扫描（无上行存活）。 */
+    if (s_giveup_log_tick == 0 ||
+        (now - s_giveup_log_tick) >= pdMS_TO_TICKS(MESH_HEAL_GIVEUP_LOG_INTERVAL_MS)) {
+        s_giveup_log_tick = now;
+        ESP_LOGW(TAG, "Parent lost %u ms; heal restart budget exhausted (%lu/%u); keep scanning, no more restarts this power cycle",
+                 (unsigned)lost_ms, (unsigned long)restarts, (unsigned)MESH_RESTART_MAX_PER_CYCLE);
+    }
+}
+
+/*
  * 子节点 mesh 健康监视（仅 IsRoot==0 创建）。
- * 只读状态 + 打日志，不做任何重连/重启决策：
- * 重连策略归 mesh-lite 库；本任务为「根掉线时子节点必须存活」提供现场证据，
- * 并证实无上行期间任务调度保持正常（对应 CHILD_NODE_ROOT_LOSS_DESIGN.md 第 6.4/7.2 节）。
+ * 常规职责：只读状态 + 打心跳日志（父丢失态 5s 一条、恢复后 60s 一条），
+ * 为「根掉线时子节点必须存活」提供现场证据（CHILD_NODE_ROOT_LOSS_DESIGN.md
+ * 第 6.4/7.2 节）。
+ * 2026-10-16 增补：无父自愈 watchdog（mesh_heal_watchdog）——
+ * 由「只观测」升级为「观测 + 有界自愈」：连续无父先软复位、无效再重启，
+ * 每上电周期重启上限 3 次后永久放弃。设计文档对应 7.2/7.7 节。
  */
 static void mesh_health_task(void *arg)
 {
@@ -137,6 +257,9 @@ static void mesh_health_task(void *arg)
             last_report_tick = now;
             was_online = online;
         }
+
+        /* 无父自愈：分级 escalate（软复位 → 重启 → 放弃），只看父链路。 */
+        mesh_heal_watchdog(online, now);
 
         /* 按当前态周期休眠：在线时 60s 一轮，无需每 5s 空转唤醒。 */
         vTaskDelay(pdMS_TO_TICKS(interval_ms));
@@ -262,6 +385,56 @@ static void scan_start_cb(void)
     ESP_LOGI(TAG, "mesh scan start cb: requested=%d",
              __atomic_load_n(&s_scan_requested, __ATOMIC_RELAXED) ? 1 : 0);
     if (s_scan_requested) s_scan_active = true;
+}
+
+/*
+ * SoftAP 站点进出观测（2026-10-16 增补，所有节点生效）：
+ * 每个节点的 SoftAP 都开放接入，此前对「谁占满了槽位、谁在反复撞满员的 AP」
+ * 完全不可观测，现场只能看到 WiFi 栈的 max connection, deauth! 原始告警，
+ * 无法区分是 mesh 子节点重连还是外来设备占槽。
+ * is_mesh_child 为 mesh-lite 补丁字段：可区分 mesh 子节点与手机/调试机等外来站点。
+ * 只打印事件与当前占用，不动作、不重连、不删站点；回调上下文仅打日志，
+ * 无阻塞 API。sta_list 用文件级静态而非局部：默认事件循环为单任务，
+ * 所有 AP 事件串行到达，单访问者无需同步，同时避免事件任务栈（2304B）压力。
+ */
+static wifi_sta_list_t s_ap_sta_list;
+
+static void mesh_ap_station_event_handler(void *arg, esp_event_base_t base,
+                                          int32_t event_id, void *event_data)
+{
+    if (event_data == NULL) {
+        return;
+    }
+
+    uint8_t mac[6] = {0};
+    uint8_t aid = 0;
+    bool is_mesh_child = false;
+    const char *what = "unknown";
+
+    if (event_id == WIFI_EVENT_AP_STACONNECTED) {
+        const wifi_event_ap_staconnected_t *ev = (const wifi_event_ap_staconnected_t *)event_data;
+        memcpy(mac, ev->mac, sizeof(mac));
+        aid = ev->aid;
+        is_mesh_child = ev->is_mesh_child;
+        what = "connected";
+    } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+        const wifi_event_ap_stadisconnected_t *ev = (const wifi_event_ap_stadisconnected_t *)event_data;
+        memcpy(mac, ev->mac, sizeof(mac));
+        aid = ev->aid;
+        is_mesh_child = ev->is_mesh_child;
+        what = "disconnected";
+    } else {
+        return;
+    }
+
+    unsigned occupied = 0;
+    if (esp_wifi_ap_get_sta_list(&s_ap_sta_list) == ESP_OK) {
+        occupied = (unsigned)s_ap_sta_list.num;
+    }
+
+    ESP_LOGI(TAG, "SoftAP station %s: aid=%u, mac=" MACSTR ", mesh_child=%d, occupied=%u/%u",
+             what, (unsigned)aid, MAC2STR(mac), is_mesh_child ? 1 : 0,
+             occupied, (unsigned)MESH_MAX_CHILDREN);
 }
 
 static void scan_end_cb(void)
@@ -619,6 +792,13 @@ esp_err_t mesh_init_Custom(void)
         s_failover_attempts = 0;
         s_trial_uplink_index = UINT32_MAX;
     }
+    /* 无父 watchdog 重启预算：软复位无效后的重启计数。
+     * ESP_RST_SW（本 watchdog 主动重启或 OTA）延续计数以强制执行上限；
+     * 上电/Brownout 等硬复位清零，开启新的上电周期预算。 */
+    if (esp_reset_reason() != ESP_RST_SW || s_heal_magic != MESH_HEAL_RTC_MAGIC) {
+        s_heal_magic = MESH_HEAL_RTC_MAGIC;
+        s_heal_restart_count = 0;
+    }
 
     ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "netif init failed");
     ESP_RETURN_ON_ERROR(esp_event_loop_create_default(), TAG, "event loop init failed");
@@ -691,8 +871,11 @@ esp_err_t mesh_init_Custom(void)
     }
 
     /*
-     * 拉长父节点重连/重扫节奏（库默认 5s×2 次后每 10s 重扫），
-     * 降低根消失后长时间重扫态对 BLE 老化链路的射频争用与闭源重扫路径暴露。
+     * 父节点重连/重扫节奏（库默认 5s×2 次后每 10s 重扫），取值见文件头部
+     * MESH_PARENT_RETRY 与 MESH_RESCAN_INTERVAL_SEC 系列宏及注释：
+     * 当前为 5s×2/15s 折中值，加快中间父断开后的重扫发现，
+     * 同时不回到库默认的激进节奏；持续无父场景由无父
+     * watchdog（MESH_PARENT_LOST_SOFT_RESET_MS）兜底。
      */
     esp_mesh_lite_set_wifi_reconnect_interval(MESH_PARENT_RETRY_INTERVAL_SEC,
                                               MESH_PARENT_RETRY_COUNT,
@@ -712,6 +895,17 @@ esp_err_t mesh_init_Custom(void)
                                                     network_event_handler, NULL), TAG, "IP handler failed");
     ESP_RETURN_ON_ERROR(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED,
                                                     network_event_handler, NULL), TAG, "WiFi handler failed");
+    /*
+     * SoftAP 站点进出观测（所有节点）：本节点 SoftAP 的接入/离开事件，
+     * 用于诊断「槽位被谁占满、谁在反复撞满员的 AP」。只打印不动作。
+     * 注意：不覆盖 iot_bridge 自己注册的 AP 事件处理器（多处理器可共存）。
+     */
+    ESP_RETURN_ON_ERROR(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED,
+                                                    mesh_ap_station_event_handler, NULL),
+                        TAG, "AP sta-connected handler failed");
+    ESP_RETURN_ON_ERROR(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED,
+                                                    mesh_ap_station_event_handler, NULL),
+                        TAG, "AP sta-disconnected handler failed");
     if (IsRoot && valid_router(SSID1, WIFI_PS1)) {
         static esp_mesh_lite_scan_cb_t scan_callbacks = {
             .scan_start_cb = scan_start_cb,

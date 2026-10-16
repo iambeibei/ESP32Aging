@@ -156,8 +156,8 @@ appTask.c:4982），根恢复后经 SDK 重连 + 补发路径收回。
 |---|---|
 | 重启前出现 `BLE disconnected,Restarting...` / `BLE abnormal disconnection; gateway is restarting` | R1 确认，本次修复直接消除 |
 | 出现 `Guru Meditation` / `StoreProhibited` / `LoadProhibited` | R7，用 coredump（已烧录启用）解析；修复降暴露后仍复现则需升级 mesh-lite 组件 |
-| 均无，但日志出现 `mesh_health` 父丢失记录后静默重启 | 查 brownout（`esp_reset_reason()`，建议在启动日志补充打印） |
-| 子节点 30 分钟不重启、老化继续、缓存数据在根恢复后补发 | 修复生效 |
+| 均无，但日志出现 `mesh_health` 父丢失记录后静默重启 | 查 brownout（`esp_reset_reason()`，建议在启动日志补充打印）。2026-10-16 起：无父约 12/24/36 分钟的带日志重启（`restarting node (n/3 this power cycle)`）属 7.7 watchdog 预期行为，不再是故障信号 |
+| 子节点在根掉线期间存活：最坏 3 次 watchdog 重启（约 12/24/36 分钟）后稳定扫描，老化经 SQLite(`pushed=0`)+NVS 断点恢复继续，缓存数据在根恢复后补发 | 修复生效（2026-10-16 起按 7.7 修订的验收标准） |
 
 ## 7. 处理逻辑（修复设计）
 
@@ -179,17 +179,23 @@ appTask.c:4982），根恢复后经 SDK 重连 + 补发路径收回。
   `task_config.h` 新增 `LG_STACK_MESH_HEALTH` / `LG_PRIO_MESH_HEALTH`。
 - 周期 5s：无父关联（`Network_Flag==0`）时打印 `level`、`Network_Flag`、
   最近一次 STA 断开原因、内部堆余量；恢复关联后每 60s 打一次心跳。
-- **只观测、不动作**：不做任何重启/重连决策（重连策略归 mesh-lite），
-  为 6.4 诊断提供现场证据，同时证实「任务调度正常」。
+- **观测 + 有界自愈**（2026-10-16 起）：常规职责仍是打心跳证据；另增
+  无父自愈 watchdog（见 7.7）：连续无父先软复位（`disconnect`+`connect`）、
+  无效再重启、每上电周期重启上限 3 次后永久放弃。日常重连/重扫与父选择
+  策略仍归 mesh-lite 库，本任务不干预父选择，只在库自身无法恢复时
+  按有界阶梯介入。
 - `WIFI_EVENT_STA_DISCONNECTED` 事件补记断开原因（`wifi_event_sta_disconnected_t`
   无 reason 字段时用事件 id + 关联状态代替，以 SDK 实际结构为准）。
 
 ### 7.3 mesh-lite 重连节奏调优（mesh.c）
 
-- 调用 `esp_mesh_lite_set_wifi_reconnect_interval(10, 3, 30)`：
-  重连当前父 10s×3 次，失败后每 30s 重扫一次。
-- 取舍：根恢复后发现时间最坏 30s（根自身重启恢复通常分钟级），
-  换取 BLE 老化链路稳定与闭源重扫路径暴露下降 3 倍。
+- 调用 `esp_mesh_lite_set_wifi_reconnect_interval(5, 2, 15)`（2026-10-16 起）：
+  重连当前父 5s×2 次（窗口约 10s），失败后每 15s 重扫一次。
+- 参数沿革：库默认 5s×2/10s → 曾调 10s×3/30s 压 BLE 射频争用与闭源重扫
+  暴露 → 现场发现「中间父断开 + 根已满」时 30s 只重连原父 + 30s 才重扫
+  使子节点长时间卡循环（根日志反复 `max connection, deauth!`）→
+  折中为 5s×2/15s，重扫暴露介于原设计与库默认之间；持续无父场景
+  改由 watchdog（7.7）有界兜底，不再依赖拖长节奏。
 - 根节点同样生效（参数对根的重连/重扫一致，根另有 root_failover_task 兜底）。
 
 ### 7.4 BLE 扫描等待超时（appTask.c）
@@ -204,18 +210,100 @@ appTask.c:4982），根恢复后经 SDK 重连 + 补发路径收回。
 - 不让子节点在根消失时重启 MQTT 客户端/重建任务（SDK 自动重连已覆盖）。
 - 不动老化数据采集/缓存/补发链路（已验证只降上行不降执行）。
 
+### 7.6 BLE 连接建立失败与掉线的分流（2026-10-15 增补）
+
+实机日志（子节点）暴露一类被误分类的 BLE 事件：`enh_open` 被接受后控制器建链失败
+（4 次 `hcif disc complete rsn 0x3e`「Connection Failed to be Established」+
+`ESP_GATTC_OPEN_EVT status=133`，全程无 `ESP_GATTC_CONNECT_EVT`，RSSI -61 信号强）。
+旧代码把 `ESP_GATTC_DISCONNECT_EVT` 一律当作「异常断开」，一次建链失败即走 7.1 的
+中止路径，`FailCount>5` 的 5 次重试额度完全未使用；且 `ble_connect_by_name()` 返回
+true 仅代表 `enh_open` 被受理，状态机却立即认定已连接并空等 20s。
+
+分流规则（`Ble_control.c` 连接尝试状态机 + `appTask.c` 结果等待与重试）：
+
+| 事件序列 | 语义 | 处置 |
+|---|---|---|
+| `enh_open` 返回 ESP_OK | 请求在途（`s_connect_attempting`） | `AgingDeviceCheck` 等待结果（≤`BLE_CONNECT_WAIT_TIMEOUT_MS` 15s） |
+| `ESP_GATTC_CONNECT_EVT` | 连接建立成功 | `notify_connect_result(true)` → 原 20s 初始化等待 + 通信检查流程 |
+| `ESP_GATTC_OPEN_EVT` status≠OK（如 133） | 建立失败 | `notify_connect_result(false)` → `aging_error_log` 记 attempt，退避 3s 后按 FailCount 重试（每轮含 10s 重扫），满 5 次才 agingError |
+| 建链过程中到达 `ESP_GATTC_DISCONNECT_EVT`（rsn 0x3E 等，先于 OPEN_EVT 约 20ms） | 建立失败 | 同上；OPEN_EVT 后续到达被 `notify_connect_result` 的 once 语义吞掉，不二次上报 |
+| 已建立连接（`s_is_connected`）后的 `ESP_GATTC_DISCONNECT_EVT` | 链路掉线 | 维持 7.1：`s_disconnect_cb()` → 优雅中止、整机不重启 |
+| 未连接且无在途尝试的迟到 `ESP_GATTC_DISCONNECT_EVT` | 陈旧事件 | 仅记 WRN，不触发任何回调（消除陈旧事件误判） |
+
+设计取舍：建链失败按「瞬时故障」处理（DUT 刚上电未就绪、被其他主机占用、RPA 轮换
+均可能表现为 0x3E/133），用满既有 FailCount 额度（最坏约 2 分钟：
+5 × (10s 扫描 + ≤15s 结果等待 + 3s 退避)）后 agingError；已建立链路掉线仍按 7.1
+中止（老化步骤时序不可中断重连）。回调上下文只置 volatile 标志与打日志，
+审查结论见第 9 节增补行。
+
+### 7.7 子节点无父自愈 watchdog（mesh.c，2026-10-16 增补）
+
+现场问题：子节点的**中间父节点断开且根节点已满**时，子节点每轮扫描都选中
+满员根被 deauth，库自身无法恢复，长时间卡在重连循环（用户实测重启 ESP32
+可恢复）。配套修改：重连节奏调整为 5s×2/15s（7.3）+ 本 watchdog。
+容量说明：每节点子节点上限 `MESH_MAX_CHILDREN` 曾于 2026-10-16 由 5 调到 8
+（`mesh.c:659/668` + `CONFIG_BRIDGE_SOFTAP_MAX_CONNECT_NUMBER` 三处同步），
+**同日应现场要求回退为 5**——「根已满无替代父」场景改由本 watchdog 兜底
+（软复位→重启），不再依赖加槽位。
+
+分级 escalate（用户 2026-10-16 确认；实现为 `mesh_health_task` 内的
+`mesh_heal_watchdog()`，仅子节点，触发条件只看 `Network_Flag`，
+与 BLE/MQTT 事件解耦）：
+
+| 级别 | 触发 | 动作 | 说明 |
+|---|---|---|---|
+| L1 软复位 | 连续无父 3min（`MESH_PARENT_LOST_SOFT_RESET_MS`） | `esp_mesh_lite_disconnect()` + 100ms + `esp_mesh_lite_connect()` | 强制库走「扫描匹配节点并连接」的 fresh 路径，绕开可能卡住的内部重试状态与 RTC 原父偏好；不重启、不动老化任务、不丢数据；每次软复位后重置计时，给 3 分钟观察窗；上限 `MESH_SOFT_RESET_MAX=3` 次 |
+| L2 重启 | 软复位 3 次仍无父 | `esp_restart()` | 重启前 100ms 等日志落盘；受每上电周期预算约束 |
+| L3 放弃 | 重启预算耗尽 | 只限频（60s）打 WRN，继续扫描 | 回到「无限期存活于无上行状态」 |
+
+重启预算：`RTC_NOINIT_ATTR` 计数（`s_heal_restart_count`，镜像 7.3 failover
+的 `s_failover_attempts` 范式）：`ESP_RST_SW` 延续计数，上电/Brownout 清零；
+每上电周期上限 `MESH_RESTART_MAX_PER_CYCLE=3` 次。
+
+**根掉线场景时间线（验收标准随之修订）**：约 12/24/36 分钟三次重启后
+稳定存活（每次软复位有 3 分钟观察窗），不再承诺「30 分钟绝对不重启」；
+老化经 SQLite（`pushed=0`）+ NVS 断点恢复继续，采样数据不丢。
+BLE 老化掉线、MQTT 断连不改变 `Network_Flag`，不会触发本 watchdog
+（7.1 的「BLE 掉线优雅中止不重启」不受影响）。
+
 ## 8. 验证与实机验收
 
 1. 编译通过（`idf.py -B build/mesh-lite build`），无新增 warning。
 2. 一台根 + 一台子 + 一台老化电池包：
-   - 拔根节点电源，子节点串口持续观察 ≥30 分钟：
-     不重启；`mesh_health` 父丢失日志规律出现；老化状态机继续推进；
+   - 拔根节点电源，子节点串口持续观察 ≥40 分钟：
+     `mesh_health` 父丢失日志规律出现；watchdog 按 7.7 时间线动作
+     （约 12/24/36 分钟三次带日志重启后进入 L3 放弃态，每 60s 一条
+     `heal restart budget exhausted`）；老化状态机经断点恢复继续推进；
      采样数据以 `pushed=0` 入库；上传失败计数增长但无崩溃。
    - BLE 老化期间人为拉远电池包造成 BLE 断开：出现 agingError 与优雅中止，
-     **整机不重启**，`ble_data` 任务恢复，可重新 start_aging。
-   - 恢复根节点：30s 内子节点重挂（mesh_health 心跳恢复），MQTT 自动重连，
+     **整机不重启**，`ble_data` 任务恢复，可重新 start_aging
+     （watchdog 只看父链路，本场景不触发）。
+   - 恢复根节点：15s 内子节点重挂（mesh_health 心跳恢复），MQTT 自动重连，
      缓存数据补发，服务器侧无重复/丢号。
 3. 回归：根节点拔主路由器（主备切换）、插拔网线，确认根行为与 0.0.1.12 一致。
+4. BLE 建链失败回归（2026-10-15 增补，对应 7.6）：DUT 未就绪/被占用时串口应见
+   `Open failed: 133`（或建链中断开）→ `BLE connection establishment failed to: <PN>` →
+   运行日志 `Bluetooth connection establishment failed ... attempt=N`（MQTT）按 1→5
+   循环重试（每轮重扫 10s），满 5 次才 `agingError`；已建立连接的人为断开仍一次即
+   优雅中止、整机不重启（7.1 验收不回归）。
+5. 无父自愈回归（2026-10-16 增补，对应 7.7）：
+   - 拔掉中间父节点电源（根有槽位）：子节点约 10s 内进入重扫、15s 节奏
+     发现并挂接新父，串口见 `STA IP <ip>, level=N` 与
+     `SoftAP station connected: ... occupied=n/8`（新父侧），**不触发**
+     watchdog（无父时长不足 3 分钟）；
+   - 根节点刻意占满（≥8 个子节点）后拔中间父：子节点进入重连循环时
+     根侧应见反复 `max connection, deauth!`；约 3 分钟起子节点串口出现
+     `mesh soft reset 1/3` → `2/3` → `3/3`（每轮间隔约 3 分钟），
+     软复位后若挂接成功（`STA IP` 日志）即恢复，watchdog 状态清零；
+   - 软复位 3 次仍无效：约 12 分钟见 `restarting node (1/3 this power cycle)`
+     并重启；重启后重新计时，最坏 12/24/36 分钟三次后进入
+     `heal restart budget exhausted (3/3)` L3 放弃态，之后不再重启；
+   - 每次重启后老化会话经 SelfRecovery 断点恢复（`aging_valid` → RUNNING），
+     SQLite `pushed=0` 记录在恢复后补发，无静默丢数。
+6. 容量回归：组网后各节点串口确认 SoftAP 槽位为 5（`occupied=n/5`，
+   构建 sdkconfig 回读 `CONFIG_BRIDGE_SOFTAP_MAX_CONNECT_NUMBER=5`；
+   2026-10-16 曾短暂调 8，同日回退）；BLE 老化扫描/连接不受重扫节奏
+   加快（15s）的射频争用影响。
 
 ## 9. 代码审查记录（CERT C + FreeRTOS + 本地规范，双模型交叉）
 
@@ -239,6 +327,30 @@ esp_mesh_lite_core.h:623-625，单位秒），两位审查员提的「返回值�
 | 10 | low | 健康任务创建失败未在启动日志体现 | 最终 `Mesh-Lite started` 增加 `mesh_health=on/OFF` |
 | 11 | low | `start_aging_with_ready_pn` 内 PN 检查重复定义且失败无 MQTT 应答 | 复用 `aging_pn_is_ready()`，防御分支补拒绝回复 |
 | 12 | low | `BTDisConnect` 跨任务非 volatile | 改 `volatile uint8_t` |
+
+2026-10-15 增补审查（7.6 BLE 建立失败分流，范围 `Ble_control.c` / `Ble_control.h` /
+`appTask.c`，单模型，规则组合 CERT C + FreeRTOS + Local coding standard，
+见 `.em_skill.json`）。API 依据：`esp_ble_gattc_open` 文档明确成功时
+「always triggers `ESP_GATTC_CONNECT_EVT` and `ESP_GATTC_OPEN_EVT`」
+（esp_gattc_api.h:325），失败时仅 OPEN_EVT 带错误码——分流设计成立。
+
+| # | 级别 | 问题 | 处理 |
+|---|---|---|---|
+| 13 | low | `BleConnectComplete/Success`、`s_connect_attempting/pending` 为跨任务 volatile bool，非原子类型 | 均为「置位-观察」单向标志、无读-改-写、无并发双写窗口（请求写与结果写由 `enh_open` 调用/事件交付排序），与既有 `ScanComplete` 模式一致；ESP32-S3 内部 SRAM 无 cache，volatile 跨 CPU0/CPU1 可见性成立。理论残余（超时尝试的迟到事件落入下一轮复位微秒窗口）后果有界（多计一次失败重试），记录不改 |
+| 14 | info | OPEN_EVT(OK) 成功路径未交付结果，依赖 CONNECT_EVT 必达 | API 文档已保证；15s 等待超时兜底为失败重试，不会永久挂起 |
+
+2026-10-16 增补审查（7.7 无父自愈 watchdog + 容量 8 + 节奏 5s×2/15s +
+SoftAP 站点观测，范围 `mesh.c` / `sdkconfig.defaults` / build sdkconfig，
+单模型，规则组合同 `.em_skill.json`）。
+
+| # | 级别 | 问题 | 处理 |
+|---|---|---|---|
+| 15 | medium | watchdog 使「根掉线 30 分钟不重启」的原验收标准失效（最坏 12/24/36 分钟三次重启） | 用户 2026-10-16 明确接受（重启可恢复卡死是现场实测结论）；第 6.4/8 节验收标准已按 7.7 修订，重启有 RTC 上限（3 次/上电周期）与 L3 放弃态兜底，不会形成无限重启循环 |
+| 16 | low | `mesh_heal_watchdog` 三个 static 状态量非 volatile | 仅 mesh_health_task 单任务串行读写（单写者，无跨任务/ISR 访问），注释已声明；与既有 `last_report_tick`/`was_online` 任务内静态量同模式 |
+| 17 | low | AP 事件处理器局部 `wifi_sta_list_t`（约 240B）压在事件任务栈（2304B）上 | 改文件级静态 `s_ap_sta_list`：默认事件循环单任务串行，单访问者无需同步，栈压力归零 |
+| 18 | info | 软复位/重启前 100ms 延时原为裸常量 | 提取 `MESH_HEAL_SOFT_RESET_GAP_MS` 命名宏（本地规范：非显然常量须可追溯） |
+| 19 | info | 注释内 `MESH_PARENT_RETRY_*/...` 的 `*/` 提前闭合注释块导致编译失败 | 编译验证捕获并修复为 `MESH_PARENT_RETRY 与 MESH_RESCAN_INTERVAL_SEC`；提示：注释中引用宏名避免带 `*/` 序列 |
+| 20 | info | `esp_mesh_lite_connect()` 为 void 返回，误赋值导致编译错误 | 编译验证捕获并修复；`disconnect()` 返回值仍检查并打日志 |
 
 ## 10. 已知限制（审查确认，本次不修）
 

@@ -42,6 +42,8 @@ typedef struct
 
 // BLE事件回调函数类型
 typedef void (*ble_scan_cb_t)(ble_device_info_t *device, int device_count);  // 扫描回调
+/* success=false 表示连接建立失败（enh_open 未被接受或建链失败，如 HCI rsn 0x3E），
+ * 区别于已建立连接后的断开（走 disconnect_cb）。调用方据此重试而非中止业务。 */
 typedef void (*ble_connect_cb_t)(bool success, const char *device_name);     // 连接回调
 typedef void (*ble_data_cb_t)(uint8_t *data, uint16_t len);                  // 数据接收回调
 typedef void (*ble_disconnect_cb_t)(void);                                   // 断开连接回调
@@ -120,6 +122,18 @@ bool ble_get_connected_device_addr(uint8_t *bda);
  * @return true: 已连接, false: 未连接
  */
 bool ble_is_connected(void);
+
+/**
+ * @brief GATT 设置阶段是否已得出结论
+ *
+ * 连接建立成功后，本模块依次完成服务发现、notify 特征注册与 CCCD 写入。
+ * 本函数反映该阶段是否已得出结论：CCCD 写结果到达（ESP_GATTC_WRITE_DESCR_EVT，
+ * 成败均算结论），或降级结论（描述符/特征缺失），或连接断开。
+ * 老化任务应在收到连接成功回调后轮询本函数并带超时：对端建链后停止响应时
+ * 快速失败重试，避免傻等固定延时。断开后自动复位为 false。
+ * @return true: 设置阶段已得出结论, false: 进行中/未开始
+ */
+bool ble_gatt_setup_done(void);
 
 /**
  * @brief 检查是否正在扫描

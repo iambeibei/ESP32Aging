@@ -29,6 +29,17 @@ static const char *TAG = "BLE_CTRL";
 #define PROFILE_NUM 1
 #define PROFILE_A_APP_ID 0
 
+/*
+ * 连接参数偏好（2026-10-16，CONNECT_EVT 时由主控端主动提议）：
+ * interval 12 × 1.25ms = 15ms（与 DUT 惯常请求值一致）；
+ * supervision timeout 2000 × 10ms = 20s——实机日志显示 DUT 建链后会请求
+ * timeout=400（仅 500ms），WiFi/BLE 射频共存下一有抖动即以 rsn 0x08
+ * （Connection Timeout）掉线。主控端提议宽松值可显著提高链路存活率，
+ * 最终生效值以 ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT 日志为准。
+ */
+#define BLE_PREF_CONN_INTERVAL 12
+#define BLE_PREF_SUPERVISION_TIMEOUT 2000
+
 bool ble_Scan_complate; // 扫描完成标志
 
 // 消息队列
@@ -48,6 +59,27 @@ static SemaphoreHandle_t s_device_list_mutex = NULL; // 互斥锁保护设备列
 static ble_scan_cb_t s_scan_cb = NULL;
 static ble_connect_cb_t s_connect_cb = NULL;
 static ble_disconnect_cb_t s_disconnect_cb = NULL;
+
+/*
+ * 连接尝试状态机（Bluedroid 回调写、老化任务经回调间接触发，均 volatile）：
+ *   s_connect_attempting    —— enh_open 已被接受，连接结果尚未交付
+ *   s_connect_result_pending—— 结果尚未经 s_connect_cb 交付；实测建立失败时
+ *                              DISCONNECT_EVT 与 OPEN_EVT(133) 会先后到达
+ *                              （间隔约 20ms），用本标志保证只上报一次。
+ * 目的：把「连接建立失败」与「已建立连接后掉线」分流——
+ *   建立失败 → s_connect_cb(false)（老化任务据此重试）；
+ *   已建立连接掉线 → s_disconnect_cb()（老化任务据此优雅中止，行为不变）。
+ */
+static volatile bool s_connect_attempting = false;
+static volatile bool s_connect_result_pending = false;
+/*
+ * GATT 设置阶段是否已得出结论：连接建立后依次进行服务发现、notify 特征
+ * 注册与 CCCD 写入；本标志在 CCCD 写结果到达（ESP_GATTC_WRITE_DESCR_EVT）
+ * 或降级结论（描述符缺失/特征缺失/断开）时置位，下一次 enh_open 受理时清除。
+ * Bluedroid 回调写、CPU1 老化任务经 ble_gatt_setup_done() 轮询读，
+ * 用于在建链后对端停止响应时快速失败重试，避免傻等固定延时。
+ */
+static volatile bool s_gatt_setup_done = false;
 
 // GATT profile结构
 typedef struct
@@ -573,6 +605,11 @@ bool ble_connect_by_name(const char *device_name)
 
     if (ret == ESP_OK)
     {
+        /* 标记连接尝试在途：结果由 CONNECT_EVT/OPEN_EVT/DISCONNECT_EVT
+         * 经 notify_connect_result() 一次性交付（成功或建立失败）。 */
+        s_connect_attempting = true;
+        s_connect_result_pending = true;
+        s_gatt_setup_done = false; // 新尝试的 GATT 设置阶段尚未开始
         ESP_LOGI(TAG, "Connecting to device: %s", device_name);
         return true;
     }
@@ -621,6 +658,11 @@ bool ble_connect_by_address(uint8_t *bda, uint8_t addr_type)
 
     if (ret == ESP_OK)
     {
+        /* 标记连接尝试在途：结果由 CONNECT_EVT/OPEN_EVT/DISCONNECT_EVT
+         * 经 notify_connect_result() 一次性交付（成功或建立失败）。 */
+        s_connect_attempting = true;
+        s_connect_result_pending = true;
+        s_gatt_setup_done = false; // 新尝试的 GATT 设置阶段尚未开始
         ESP_LOGI(TAG, "Connecting to device at address: " ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(bda));
         return true;
     }
@@ -647,6 +689,18 @@ void ble_disconnect(void)
 bool ble_is_connected(void)
 {
     return s_is_connected;
+}
+
+/*
+ * GATT 设置阶段是否已得出结论（服务发现 + notify 注册 + CCCD 写确认，
+ * 或降级结论/断开）。连接建立成功后由老化任务轮询（带超时）：
+ * 对端若建链后停止响应（CCCD 写永无回应），可快速失败重试，
+ * 不再傻等固定延时后才在通信检查中暴露。
+ * 仅 Bluedroid 回调写、任务上下文读；无锁，读取为原子字长访问。
+ */
+bool ble_gatt_setup_done(void)
+{
+    return s_gatt_setup_done;
 }
 
 const char *ble_get_connected_device_name(void)
@@ -805,6 +859,26 @@ static void ble_gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp
         gattc_profile_event_handler(event, gattc_if, param);
     }
 }
+/*
+ * 交付一次连接尝试结果（成功或失败）。DISCONNECT_EVT 与 OPEN_EVT 双到达时，
+ * 首个事件即清 pending 并交付，后续事件自然被吞，保证 once 语义。
+ * 仅在 Bluedroid 回调上下文调用：只读/写 volatile 标志并调用已注册回调，
+ * 不碰存储、MQTT 与任务（符合 .ai/coding-standard.md 回调约束）。
+ */
+static void notify_connect_result(bool success)
+{
+    if (!s_connect_result_pending)
+    {
+        return; /* 迟到/重复事件：本次尝试的结果已交付过 */
+    }
+    s_connect_result_pending = false;
+    s_connect_attempting = false;
+    if (s_connect_cb != NULL)
+    {
+        s_connect_cb(success, s_connected_name);
+    }
+}
+
 static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param)
 {
     switch (event)
@@ -833,20 +907,38 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
             xSemaphoreGive(s_device_list_mutex);
         }
 
-        // 调用连接成功回调
-        if (s_connect_cb != NULL)
-        {
-            s_connect_cb(true, s_connected_name);
-        }
+        // 连接建立成功：经 notify_connect_result 一次性交付结果
+        notify_connect_result(true);
+        s_gatt_setup_done = false; // 新的 GATT 设置阶段开始
 
         // 发送MTU请求
         esp_ble_gattc_send_mtu_req(gattc_if, param->connect.conn_id);
+
+        /*
+         * 主动提议宽松的连接参数：DUT 惯于请求 supervision timeout=400（500ms），
+         * WiFi/BLE 射频共存下一有抖动即 rsn 0x08 掉线（2026-10-16 实机日志）。
+         * 主控端提议 timeout=BLE_PREF_SUPERVISION_TIMEOUT（20s），对端通常接受；
+         * 被拒绝或对端后续再请求紧参数时，以 UPDATE_CONN_PARAMS_EVT 日志为准。
+         */
+        esp_ble_conn_update_params_t conn_params = {0};
+        memcpy(conn_params.bda, param->connect.remote_bda, sizeof(conn_params.bda));
+        conn_params.min_int = BLE_PREF_CONN_INTERVAL;
+        conn_params.max_int = BLE_PREF_CONN_INTERVAL;
+        conn_params.latency = 0;
+        conn_params.timeout = BLE_PREF_SUPERVISION_TIMEOUT;
+        esp_err_t conn_ret = esp_ble_gap_update_conn_params(&conn_params);
+        if (conn_ret != ESP_OK)
+        {
+            ESP_LOGW(TAG, "Conn param update request failed: %s", esp_err_to_name(conn_ret));
+        }
         break;
 
     case ESP_GATTC_OPEN_EVT: // 连接完成事件
         if (param->open.status != ESP_GATT_OK)
         {
             ESP_LOGE(TAG, "Open failed: %d", param->open.status);
+            /* 建立失败：经 connect 回调上报供老化任务重试，不触发断开回调 */
+            notify_connect_result(false);
         }
         break;
 
@@ -933,6 +1025,13 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
             esp_ble_gattc_register_for_notify(gattc_if, s_gattc_profile.remote_bda,
                                               char_result[0].char_handle);
         }
+        else
+        {
+            /* 无通知特征：notify 注册不会发生，GATT 设置阶段以此降级结论收尾，
+             * 避免老化任务的设置等待空转到超时。 */
+            ESP_LOGE(TAG, "Notify characteristic 0xFF01 not found");
+            s_gatt_setup_done = true;
+        }
 
         // 查找写特征
         count = 1;
@@ -947,6 +1046,10 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
 
             s_gattc_profile.write_char_handle = char_result[0].char_handle; // 写句柄赋值
             ESP_LOGI(TAG, "Write characteristic found: 0x%04x", char_result[0].char_handle);
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Write characteristic 0xFF02 not found");
         }
 
         free(char_result);
@@ -976,6 +1079,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         if (status != ESP_GATT_OK || descr_count == 0)
         {
             ESP_LOGE(TAG, "No descriptors found");
+            s_gatt_setup_done = true; /* 降级结论：不会再有 CCCD 写结果 */
             break;
         }
 
@@ -983,6 +1087,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         if (descr_result == NULL)
         {
             ESP_LOGE(TAG, "Memory allocation failed");
+            s_gatt_setup_done = true; /* 降级结论：不会再有 CCCD 写结果 */
             break;
         }
 
@@ -993,12 +1098,19 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
 
         if (status == ESP_GATT_OK && descr_count > 0)
         {
+            /* CCCD 写入发起；结果由 ESP_GATTC_WRITE_DESCR_EVT 交付 */
             esp_ble_gattc_write_char_descr(gattc_if, s_gattc_profile.conn_id,
                                            descr_result[0].handle,
                                            sizeof(notify_en),
                                            (uint8_t *)&notify_en,
                                            ESP_GATT_WRITE_TYPE_RSP,
                                            ESP_GATT_AUTH_REQ_NONE);
+        }
+        else
+        {
+            /* 描述符查找失败：不会再有 CCCD 写结果，交付降级结论 */
+            ESP_LOGE(TAG, "CCCD descriptor 0x2902 not found");
+            s_gatt_setup_done = true;
         }
 
         free(descr_result);
@@ -1041,6 +1153,9 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         {
             ESP_LOGI(TAG, "Descriptor write success");
         }
+        /* CCCD 写结果到达：GATT 设置阶段得出结论（成败均交付，由老化任务
+         * 后续通信检查判定 notify 通道是否真正可用）。 */
+        s_gatt_setup_done = true;
         break;
 
     case ESP_GATTC_WRITE_CHAR_EVT:
@@ -1055,11 +1170,17 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         break;
 
     case ESP_GATTC_DISCONNECT_EVT:
+    {
         ESP_LOGI(TAG, "Disconnected, reason: 0x%02x", param->disconnect.reason);
+        /* 断开前的连接态判定：区分「建立失败」与「已建立连接后掉线」 */
+        bool was_established = s_is_connected;
+        bool establishing = s_connect_attempting;
         s_is_connected = false;
+        s_gattc_profile.conn_id = 0; /* 清理陈旧 conn_id，避免下次误用 */
         s_gattc_profile.service_found = false;
         s_gattc_profile.notify_char_handle = 0;
         s_gattc_profile.write_char_handle = 0;
+        s_gatt_setup_done = false; /* 设置阶段随连接一同失效 */
 
         // 更新扫描列表中的连接状态
         if (s_device_list_mutex != NULL)
@@ -1075,12 +1196,32 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
             xSemaphoreGive(s_device_list_mutex);
         }
 
-        // 调用断开连接回调
-        if (s_disconnect_cb != NULL)
+        if (establishing)
         {
-            s_disconnect_cb();
+            /*
+             * 连接建立过程中断开（如 HCI rsn 0x3E 建链失败）：属建立失败，
+             * 经 connect 回调上报供老化任务重试；不触发断开回调，避免被误判为
+             * 「异常断开」而一次失败即中止老化（随后到达的 OPEN_EVT 133
+             * 会被 notify_connect_result 的 once 语义吞掉，不会二次上报）。
+             */
+            ESP_LOGW(TAG, "Disconnected during connection establishment; treating as open failure");
+            notify_connect_result(false);
+        }
+        else if (was_established)
+        {
+            // 已建立连接后掉线：调用断开连接回调（老化任务据此优雅中止，行为不变）
+            if (s_disconnect_cb != NULL)
+            {
+                s_disconnect_cb();
+            }
+        }
+        else
+        {
+            /* 未连接且无在途尝试的迟到/陈旧事件：仅记录，不误触发任何回调 */
+            ESP_LOGW(TAG, "Stale disconnect event ignored: no active connection or attempt");
         }
         break;
+    }
 
     default:
         break;
