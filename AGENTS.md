@@ -74,7 +74,7 @@ IDF_SKIP_CHECK_SUBMODULES=1 idf.py -B build/mesh-lite -D SDKCONFIG=build/mesh-li
   无证书 HTTPS 放行路径保留备用（换回 HTTPS 内网地址时自动生效，打 WRN 可识别）。
 - `version.txt` 现为 `0.0.1`（三段式对齐服务器；为 `0.0.0` 时任何服务器版本都会触发升级，
   发布正式固件前应设置真实版本号）。
-- OTA 成功路径会 `esp_restart()`，`simple_ota_check_and_update*()` 不会正常返回。
+- OTA 下载完成后**不再自动重启**（2026-10-16 起）：`simple_ota_check_and_update*()` 下载并设置启动分区后正常返回，设备继续运行旧固件，状态进入 `PENDING_RESTART`（`simple_ota_get_state()` 可查询）。重启由外部触发：向 `server/rack/<AgingNumber>/CanRestart` 发 `{"Data":{"Restart":1}}`（子节点已订阅），节点随即重启运行新固件；pending 期间重复 OTA 命令会被忽略。
 - 升级只写另一个 ota 槽，SQLite 数据库（`data_storage` 分区）与配置（`storage` 分区）不受影响。
 
 ## 关键约定速查（详见 CLAUDE.md）

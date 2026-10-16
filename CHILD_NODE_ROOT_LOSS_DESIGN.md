@@ -72,11 +72,16 @@ espressif__mesh_lite/include/esp_mesh_lite_core.h:604-625）：
 
 | 参数 | 根节点 | 子节点 | 位置 |
 |---|---|---|---|
-| keepalive | 60 s | 15 s | mqtt_app.c:46-47,644 |
-| 自动重连等待 | SDK 默认退避 | 2000 ms | mqtt_app.c:48,657 |
+| keepalive | 120 s（2026-10-16 起，原 60s） | 30 s（2026-10-16 起，原 15s） | mqtt_app.c:46-60,644 |
+| 自动重连等待 | SDK 默认退避 | 2000 ms | mqtt_app.c:61,657 |
 | 网络超时 | 10000 ms | 10000 ms | mqtt_app.c:655 |
 | 会话 | clean session，QoS1 | 同左 | mqtt_app.c:645-646 |
 | 遗嘱（LWT） | `device/public/down_line` | 同左 | mqtt_app.c:647-653 |
+
+keepalive 加长原因：子节点报文穿多跳 mesh + 每跳 NAPT，拥塞时（OTA 下载
+窗口全网并发、mesh 重扫期）PINGREQ 延迟可能超过 1.5×keepalive 被 broker
+判死；根节点 OTA 期间单条 STA 是全网漏斗同样需要余量。权衡：对端真正
+死亡时 LWT 判定变慢（根 90s→180s、子 22.5s→45s），内网 broker 场景可接受。
 
 断线不断客户端、队列与 `mqtt_rx` 任务，由 SDK 自动重连兜底
 （mqtt_app.c:459-468；DUAL_NET_DESIGN.md 第 5 节）。

@@ -102,6 +102,7 @@ typedef struct
 
 long Programld = 0;      // 老化任务ID
 uint8_t Cannextstep = 0; // 默认为0，群控模式下，收到下一步操作指令后，设置为1，表示可以执行下一步老化操作
+uint8_t CanRestart=0;// 默认为0，ota模式下，收到下一步操作指令后，设置为1，表示可以执行重启操作
 uint8_t AgingCMode = 0;
 uint8_t CycleIndex = 0;
 AgingConfig agingcfg = {0}; // 定义全局老化配置结构体
@@ -2556,17 +2557,7 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
         int len1 = app_read_MQTT_topic(TopicBuf, MQTT_TOPIC_LEN, portMAX_DELAY);
         if (len1 > 0)
         {
-            if (strstr(TopicBuf, "public/cmd/ota"))
-            {
-                // 处理OTA升级
-                ESP_LOGI(TAG, "publicOTA升级命令收到");
-                esp_err_t err = simple_ota_check_and_update_default();
-                if (err != ESP_OK)
-                {
-                    ESP_LOGE(TAG, "OTA check/update failed: %s", esp_err_to_name(err));
-                }
-            }
-            else if (strstr(TopicBuf, "ota"))
+            if (strstr(TopicBuf, "ota"))
             {
                 // 处理OTA升级
                 ESP_LOGI(TAG, "OTA升级命令收到");
@@ -2575,6 +2566,7 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                 {
                     ESP_LOGE(TAG, "OTA check/update failed: %s", esp_err_to_name(err));
                 }
+
             }
             else if (strstr(TopicBuf, "start_aging"))
             {
@@ -2862,6 +2854,30 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                     Cannextstep = (uint8_t)NextStep->valueint;
                 }
                 device_response_publish_point(Seq->valueint, 1, "CanNextstep set");
+            }
+            else if(strstr(TopicBuf, "CanRestart"))
+            {
+                cJSON *Data_obj = cJSON_GetObjectItem(pRoot, "Data");
+                cJSON *NextStep = cJSON_IsObject(Data_obj) ? cJSON_GetObjectItem(Data_obj, "Restart") : NULL;
+                if (cJSON_IsNumber(NextStep))
+                {
+                    CanRestart = (uint8_t)NextStep->valueint;
+                }
+                if(CanRestart==1)
+                {
+                    /*
+                     * 外部触发重启（2026-10-16 起 OTA 的唯一重启入口）：
+                     * OTA 下载完成后不再自动 esp_restart()，由服务器通过
+                     * rack 级 CanRestart 主题统一调度——多点位 OTA 场景下
+                     * 各节点先全部完成下载，再统一下发重启。
+                     * 重启前打印 OTA 状态并留 100ms 让日志与 publish ack 落盘。
+                     * 未下载新固件的节点重启后运行旧固件，无害。
+                     */
+                    ESP_LOGW(TAG, "CanRestart received; restarting now (ota_state=%d, pending_restart=%d)",
+                             (int)simple_ota_get_state(), simple_ota_is_pending_restart() ? 1 : 0);
+                    vTaskDelay(pdMS_TO_TICKS(5000));
+                    esp_restart();
+                }
             }
             else if (strstr(TopicBuf, "CPower")) // 只有根节点才会触发,控制开关相关代码待完善
             {
@@ -4814,7 +4830,6 @@ void Aging_Test_Task(void *arg)
                         {
                             if (app_mqtt_publish("device/%s/data/aging", g_db1_result->json_data, DEVICE_ID) > 0)
                             {
-                                
                             }
                         }
                         vTaskDelay(pdMS_TO_TICKS(1000));

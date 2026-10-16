@@ -22,6 +22,23 @@
 
 static const char *TAG = "simple_ota";
 
+/*
+ * OTA 状态机（2026-10-16）：下载完成后不再自动重启，改由外部触发
+ * （MQTT CanRestart 等）。当前仅 mqtt_rx 任务写读；置 volatile 是为
+ * 未来其他任务查询（状态上报等）可见，语义见 ota.h 状态图。
+ */
+static volatile simple_ota_state_t s_ota_state = SIMPLE_OTA_STATE_IDLE;
+
+simple_ota_state_t simple_ota_get_state(void)
+{
+    return s_ota_state;
+}
+
+bool simple_ota_is_pending_restart(void)
+{
+    return s_ota_state == SIMPLE_OTA_STATE_PENDING_RESTART;
+}
+
 typedef struct {
     int major;
     int minor;
@@ -585,8 +602,15 @@ static esp_err_t perform_http_ota(const char *firmware_url,
         return err;
     }
 
-    ESP_LOGI(TAG, "OTA successful. Restarting...");
-    esp_restart();
+    /*
+     * 2026-10-16：不再自动重启。新固件已写入非运行槽并设为启动分区，
+     * 重启由外部触发（MQTT CanRestart），以便多点位 mesh 场景下各节点
+     * 先全部完成下载再统一重启，避免自动重启打断老化/MQTT/mesh 拓扑。
+     * 重复 OTA 命令在此状态下会被 simple_ota_check_and_update() 忽略，
+     * 防止二次下载覆盖正在运行的槽位。
+     */
+    s_ota_state = SIMPLE_OTA_STATE_PENDING_RESTART;
+    ESP_LOGI(TAG, "OTA download completed and set as boot partition; restart deferred to external trigger (CanRestart)");
     return ESP_OK;
 
 ota_fail:
@@ -617,7 +641,12 @@ static esp_err_t perform_firmware_ota(const char *firmware_url,
     return ESP_ERR_NOT_SUPPORTED;
 }
 
-esp_err_t simple_ota_check_and_update(const simple_ota_config_t *config)
+/*
+ * OTA 检查与下载实现（状态管理见外层包装 simple_ota_check_and_update）。
+ * 保持原有下载链路不变：配置校验 → 本地版本 → update.json → 版本比较 →
+ * HTTP 下载 → 双槽写入 → 设置启动分区。
+ */
+static esp_err_t ota_check_and_update_impl(const simple_ota_config_t *config)
 {
     esp_err_t err = validate_config(config);
     if (err != ESP_OK) {
@@ -690,6 +719,32 @@ esp_err_t simple_ota_check_and_update(const simple_ota_config_t *config)
     ESP_LOGI(TAG, "Firmware URL: %s", firmware_url);
 
     return perform_firmware_ota(firmware_url, config);
+}
+
+/*
+ * OTA 状态管理薄包装：在每个错误返回点散落状态赋值容易漏，统一在此收敛。
+ * - PENDING_RESTART 期间收到新命令：忽略（防二次下载覆盖运行槽）；
+ * - 进入时置 RUNNING；失败置 FAILED；
+ * - 无需升级（版本不新/更旧，ESP_OK 且状态仍为 RUNNING）回 IDLE；
+ * - 下载成功时 perform_http_ota 已置 PENDING_RESTART，此处不覆盖。
+ */
+esp_err_t simple_ota_check_and_update(const simple_ota_config_t *config)
+{
+    if (s_ota_state == SIMPLE_OTA_STATE_PENDING_RESTART) {
+        ESP_LOGW(TAG, "OTA already pending restart; ignoring duplicate OTA command");
+        return ESP_OK;
+    }
+
+    s_ota_state = SIMPLE_OTA_STATE_RUNNING;
+    esp_err_t err = ota_check_and_update_impl(config);
+
+    if (err != ESP_OK) {
+        s_ota_state = SIMPLE_OTA_STATE_FAILED;
+    } else if (s_ota_state == SIMPLE_OTA_STATE_RUNNING) {
+        /* 无需升级路径：回到 IDLE（下载成功路径已是 PENDING_RESTART） */
+        s_ota_state = SIMPLE_OTA_STATE_IDLE;
+    }
+    return err;
 }
 
 esp_err_t simple_ota_check_and_update_default(void)

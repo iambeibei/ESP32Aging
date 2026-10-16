@@ -173,7 +173,9 @@ MQTT topic 含 ota
   → 触发时 build_url(QUERY): ?fileName=Light_Gateway_ESP32s3_v0.0.2.bin
   → perform_firmware_ota(): http/https 统一 → perform_http_ota()
       → apply_https_config()（与元数据同一证书策略）
-      → esp_http_client_open/read + esp_ota_begin/write/end → 重启
+      → esp_http_client_open/read + esp_ota_begin/write/end
+      → esp_ota_set_boot_partition → PENDING_RESTART，正常返回（2026-10-16
+        起不再自动重启；重启由外部 CanRestart 命令触发，见 AGENTS.md）
 ```
 
 ## 7. 实机验收
@@ -190,11 +192,18 @@ MQTT topic 含 ota
    - 当前服务器 0.0.1 == 本地 0.0.1 → `Firmware is already up to date`
 3. 服务器发布 0.0.2（或更高）后再次触发：确认
    `Firmware URL: …?fileName=…_v0.0.2.bin`、`Starting OTA download:`、
-   下载进度日志、`OTA successful. Restarting...`，重启后
-   `esp_app_desc_t.version` 为新版本。
+   下载进度日志、`OTA download completed and set as boot partition;
+   restart deferred to external trigger`——**设备不重启**，MQTT/老化继续
+   （2026-10-16 起的新语义；旧行为为 `OTA successful. Restarting...` 后自动重启）。
+   随后向 `server/rack/<AgingNumber>/CanRestart` 发 `{"Data":{"Restart":1}}`，
+   确认 `CanRestart received; restarting now` 后重启，且重启后
+   `Current firmware version` 为新版本。
 4. 子节点经根节点 NAPT 访问 7088 的回程路由需实机确认（与
    GetMissingIdNums 同一路径，属既有网络能力）。
-5. 回归：根/子节点 MQTT 主链路不受影响（本改动只碰 OTA 模块）。
+5. 回归：根/子节点 MQTT 主链路不受影响（本改动只碰 OTA 模块与 keepalive 参数）。
+6. keepalive 回归（2026-10-16）：根 120s / 子 30s；OTA 下载窗口内观察
+   MQTT 无因 PINGREQ 超时被 broker 断开（旧 15s keepalive 在拥塞多跳下
+   22.5s 判死窗偏紧）。
 
 ## 8. 代码审查记录（CERT C + FreeRTOS + 本地规范，单模型；规则组合见 `.em_skill.json`）
 

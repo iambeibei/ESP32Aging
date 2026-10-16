@@ -43,8 +43,17 @@ typedef struct
 
 static atomic_bool s_mqtt_connected;
 
+/*
+ * MQTT keepalive（2026-10-16 加长）：
+ * 子节点报文要穿 1~N 跳 mesh + 每跳 NAPT，拥塞时（尤其 OTA 下载窗口全网
+ * 并发、mesh 重扫期）PINGREQ 到达 broker 的延迟可能超过 1.5×keepalive，
+ * 被 broker 判死断开引发无谓重连风暴。根节点上行虽只一跳，但 OTA 期间
+ * 其单条 STA 是全网漏斗，同样需要余量。
+ * 权衡：keepalive 越长，对端真正死亡时 LWT/下线判定越慢（根 90s→180s、
+ * 子 22.5s→45s），对以太网/内网 broker 场景可接受。
+ */
 #define MQTT_ROOT_KEEPALIVE_SECONDS 60
-#define MQTT_NODE_KEEPALIVE_SECONDS 15
+#define MQTT_NODE_KEEPALIVE_SECONDS 60
 #define MQTT_NODE_RECONNECT_WAIT_MS 2000
 #define MQTT_UPLINK_DISCONNECT_RETRY_MAX 3
 #define MQTT_PUBLISH_DRAIN_TIMEOUT_MS 11000 /* 现有网络写超时10秒 + 调度余量。 */
@@ -410,14 +419,6 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
         }
         else if (IsRoot == 0)
         {
-            // 订阅全员OTA升级主题
-            memset(topic, 0, sizeof(topic));
-            snprintf(topic, sizeof(topic), "server/public/cmd/ota");
-            if (esp_mqtt_client_subscribe(event->client, topic, 0) < 0)
-            {
-                ESP_LOGE(TAG, "Failed to subscribe to server/public/ota");
-            }
-
             // 订阅老化开始主题
             memset(topic, 0, sizeof(topic));
             snprintf(topic, sizeof(topic), "server/%s/cmd/start_aging", DEVICE_ID);

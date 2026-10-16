@@ -28,6 +28,25 @@ extern "C" {
 #define SIMPLE_OTA_FILENAME_MAX_LEN      128
 
 /**
+ * @brief OTA 状态机（2026-10-16 起：下载完成后不再自动重启）
+ *
+ * 状态转换：
+ *   IDLE --OTA命令--> RUNNING --下载成功--> PENDING_RESTART（等待外部重启）
+ *                        |                （无需升级/版本不新）--> IDLE
+ *                        +--任何失败--> FAILED（可再次收到命令重试）
+ *
+ * PENDING_RESTART 表示新固件已写入非运行槽并设为启动分区，
+ * 重启后即运行新固件；重启由外部触发（MQTT CanRestart 命令等），
+ * 本模块不自动执行 esp_restart()。
+ */
+typedef enum {
+    SIMPLE_OTA_STATE_IDLE = 0,           /**< 空闲（初始态/无需升级后回到此态） */
+    SIMPLE_OTA_STATE_RUNNING,            /**< 检查/下载进行中 */
+    SIMPLE_OTA_STATE_PENDING_RESTART,    /**< 下载完成，等待外部触发重启 */
+    SIMPLE_OTA_STATE_FAILED,             /**< 本次检查/下载失败 */
+} simple_ota_state_t;
+
+/**
  * @brief URL 拼接风格
  *
  * PATH  : 目录拼接，base + '/' + name（旧静态目录形态，如 http://ip:port/OTABin/）。
@@ -64,23 +83,49 @@ typedef struct {
 esp_err_t simple_ota_get_running_version(char *version, size_t version_size);
 
 /**
+ * @brief 查询 OTA 状态机当前状态
+ *
+ * 供外部（MQTT 命令处理、状态上报等）判断：
+ * 是否已下载完成等待重启（SIMPLE_OTA_STATE_PENDING_RESTART）、
+ * 是否正在进行（RUNNING）等。任何任务上下文可调用，无阻塞。
+ *
+ * @return 当前 simple_ota_state_t
+ */
+simple_ota_state_t simple_ota_get_state(void);
+
+/**
+ * @brief 是否已下载完成并等待外部触发重启
+ *
+ * 便捷查询：返回 true 表示新固件已写入非运行槽并设为启动分区，
+ * 重启（由外部执行）后即运行新固件。
+ *
+ * @return true: 等待重启; false: 其他状态
+ */
+bool simple_ota_is_pending_restart(void);
+
+/**
  * @brief 检查服务器版本并在需要时执行 OTA
  *
- * - 服务器版本 > 本地版本：执行 OTA，成功后设备重启，本函数不会正常返回。
- * - 服务器版本 <= 本地版本：不升级，返回 ESP_OK。
- * - 网络、JSON、版本格式或 OTA 出错：返回对应错误码。
+ * - 服务器版本 > 本地版本：下载并写入非运行槽、设为启动分区，完成后进入
+ *   PENDING_RESTART 状态并正常返回 ESP_OK（**不再自动重启**，重启由外部
+ *   通过 CanRestart 等机制触发）。
+ * - 服务器版本 <= 本地版本：不升级，返回 ESP_OK，状态回 IDLE。
+ * - 状态为 PENDING_RESTART 时收到新的 OTA 命令：忽略（防止二次下载覆盖
+ *   正在运行的槽位），返回 ESP_OK。
+ * - 网络、JSON、版本格式或 OTA 出错：返回对应错误码，状态置 FAILED。
  *
  * @param config OTA 配置
- * @return ESP_OK 无需升级；升级成功会重启；失败返回错误码
+ * @return ESP_OK 无需升级/已下载完成（等待重启）或重复命令被忽略；失败返回错误码
  */
 esp_err_t simple_ota_check_and_update(const simple_ota_config_t *config);
 
 /**
  * @brief 使用默认服务器地址检查更新
  *
- * 默认地址：SIMPLE_OTA_DEFAULT_BASE_URL + SIMPLE_OTA_DEFAULT_METADATA_FILE
+ * 默认地址由 lg_url_build(LG_URL_OTA_BASE_URL_FMT, ...) 运行时构建
+ * （IP 取自 baseconfig.json 的 SERVER_IP）。
  *
- * @return ESP_OK 无需升级；升级成功会重启；失败返回错误码
+ * @return 语义同 simple_ota_check_and_update()
  */
 esp_err_t simple_ota_check_and_update_default(void);
 
