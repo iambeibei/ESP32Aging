@@ -391,6 +391,14 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
             ESP_LOGE(TAG, "Failed to subscribe to ota");
         }
 
+        // 订阅服务，重启主题，多点位ota升级时统一重启
+        memset(topic, 0, sizeof(topic));
+        snprintf(topic, sizeof(topic), "server/rack/%s/CanRestart", AgingNumber);
+        if (esp_mqtt_client_subscribe(event->client, topic, 0) < 0)
+        {
+            ESP_LOGE(TAG, "Failed to subscribe to CanRestart");
+        }
+
         // 订阅修改配置主题
         memset(topic, 0, sizeof(topic));
         snprintf(topic, sizeof(topic), "server/%s/cmd/set_config", DEVICE_ID);
@@ -481,14 +489,6 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
             if (esp_mqtt_client_subscribe(event->client, topic, 0) < 0)
             {
                 ESP_LOGE(TAG, "Failed to subscribe to Cannextstep");
-            }
-
-            // 订阅服务，重启主题，多点位ota升级时统一重启
-            memset(topic, 0, sizeof(topic));
-            snprintf(topic, sizeof(topic), "server/rack/%s/CanRestart", AgingNumber);
-            if (esp_mqtt_client_subscribe(event->client, topic, 0) < 0)
-            {
-                ESP_LOGE(TAG, "Failed to subscribe to CanRestart");
             }
         }
 

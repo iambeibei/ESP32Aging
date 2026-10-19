@@ -39,16 +39,24 @@ bool simple_ota_is_pending_restart(void)
     return s_ota_state == SIMPLE_OTA_STATE_PENDING_RESTART;
 }
 
+/*
+ * 默认 OTA 配置构造（定义在文件后部，simple_ota_check_and_update_default 先行使用）。
+ */
+static esp_err_t build_default_ota_config(char *base_url,
+                                          size_t base_url_size,
+                                          simple_ota_config_t *config);
+
 typedef struct {
     int major;
     int minor;
     int patch;
 } ota_semver_t;
 
-typedef struct {
-    char version[SIMPLE_OTA_VERSION_MAX_LEN];
-    char file[SIMPLE_OTA_FILENAME_MAX_LEN];
-} ota_metadata_t;
+/*
+ * 内部元数据别名：ota.h 的 simple_ota_metadata_t 是同一布局的公开类型
+ * （mesh_ota 子节点路径复用），此处保留别名避免改动既有函数签名。
+ */
+typedef simple_ota_metadata_t ota_metadata_t;
 
 typedef struct {
     char data[SIMPLE_OTA_METADATA_MAX_LEN];
@@ -752,24 +760,173 @@ esp_err_t simple_ota_check_and_update_default(void)
     /*
      * 服务器 IP 运行时取自 baseconfig.json 的 SERVER_IP（与 MQTT broker 同一
      * 机制），端口/路径为编译期模板；换服务器 IP 无需重新编译 app。
+     * 配置构造与 simple_ota_fetch_metadata / simple_ota_probe_firmware_size
+     * 共用 build_default_ota_config()，保证三条路径同源同策略。
      */
     char base_url[LG_URL_MAX_LEN];
-    esp_err_t build_err = lg_url_build(LG_URL_OTA_BASE_URL_FMT, base_url, sizeof(base_url));
-    if (build_err != ESP_OK) {
-        ESP_LOGE(TAG, "Build OTA base URL failed: %s", esp_err_to_name(build_err));
-        return build_err;
+    simple_ota_config_t config;
+    esp_err_t err = build_default_ota_config(base_url, sizeof(base_url), &config);
+    if (err != ESP_OK) {
+        return err;
     }
 
-    simple_ota_config_t config = {
+    return simple_ota_check_and_update(&config);
+}
+
+/*
+ * 默认 OTA 配置构造：运行时 SERVER_IP + 编译期端口/路径 + QUERY 风格 +
+ * 无证书放行策略（与既有默认入口完全一致）。
+ * base_url 由调用方提供存储，其生命周期必须覆盖 config 的使用期。
+ * 调用上下文：任务上下文（内部走 lg_url_build，无网络 I/O）。
+ */
+static esp_err_t build_default_ota_config(char *base_url,
+                                          size_t base_url_size,
+                                          simple_ota_config_t *config)
+{
+    if (base_url == NULL || config == NULL || base_url_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = lg_url_build(LG_URL_OTA_BASE_URL_FMT, base_url, base_url_size);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Build OTA base URL failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    *config = (simple_ota_config_t){
         .base_url = base_url,
         .metadata_file = SIMPLE_OTA_DEFAULT_METADATA_FILE,
         .cert_pem = NULL,
-        /* 内网 IP + HTTPS 下载接口：证书 CN 校验必然失败，与仓库内访问同一
-         * 服务器的 test_http_post_record_query() 策略一致（无证书放行）。 */
+        /* 内网 IP + 下载接口：CN 校验必然失败，与默认入口同策略无证书放行。 */
         .skip_cert_common_name_check = true,
         .use_crt_bundle = false,
         .url_style = SIMPLE_OTA_URL_STYLE_QUERY,
     };
+    return ESP_OK;
+}
 
-    return simple_ota_check_and_update(&config);
+esp_err_t simple_ota_fetch_metadata(simple_ota_metadata_t *out_metadata)
+{
+    if (out_metadata == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char base_url[LG_URL_MAX_LEN];
+    simple_ota_config_t config;
+    esp_err_t err = build_default_ota_config(base_url, sizeof(base_url), &config);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    char json[SIMPLE_OTA_METADATA_MAX_LEN];
+    err = download_metadata_json(&config, json, sizeof(json));
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    return parse_metadata_json(json, out_metadata);
+}
+
+esp_err_t simple_ota_probe_firmware_size(const char *file_name, size_t *out_size_bytes)
+{
+    if (file_name == NULL || out_size_bytes == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* 与下载路径同一文件名校验，提前拒绝非法输入。 */
+    if (!validate_firmware_filename(file_name)) {
+        ESP_LOGE(TAG, "Invalid firmware file name: %s", file_name);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char base_url[LG_URL_MAX_LEN];
+    simple_ota_config_t config;
+    esp_err_t err = build_default_ota_config(base_url, sizeof(base_url), &config);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    char firmware_url[SIMPLE_OTA_URL_MAX_LEN];
+    err = build_url(base_url, file_name, config.url_style, firmware_url, sizeof(firmware_url));
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    esp_http_client_config_t http_config = {
+        .url = firmware_url,
+        .event_handler = http_event_handler,
+        .user_data = NULL, /* fetch_headers 不触发 ON_DATA；无累积缓冲需求。 */
+        .timeout_ms = 10000,
+        /* 探测完即关，不保持连接。 */
+        .keep_alive_enable = false,
+        .skip_cert_common_name_check = config.skip_cert_common_name_check,
+    };
+
+    err = apply_https_config(&http_config, &config);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    esp_http_client_handle_t client = esp_http_client_init(&http_config);
+    if (client == NULL) {
+        ESP_LOGE(TAG, "Failed to initialize HTTP client");
+        return ESP_FAIL;
+    }
+
+    err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open firmware URL for size probe: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        return err;
+    }
+
+    int64_t content_length = esp_http_client_fetch_headers(client);
+    int status_code = esp_http_client_get_status_code(client);
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (status_code != 200) {
+        ESP_LOGE(TAG, "Firmware probe HTTP status: %d", status_code);
+        return ESP_FAIL;
+    }
+
+    if (content_length <= 0) {
+        ESP_LOGE(TAG, "Firmware size unknown or chunked");
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    ESP_LOGI(TAG, "Firmware size probe: %lld bytes", (long long)content_length);
+    *out_size_bytes = (size_t)content_length;
+    return ESP_OK;
+}
+
+bool simple_ota_version_is_newer(const char *server_version)
+{
+    if (server_version == NULL) {
+        return false;
+    }
+
+    char current_version[SIMPLE_OTA_VERSION_MAX_LEN];
+    esp_err_t err = simple_ota_get_running_version(current_version, sizeof(current_version));
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    ota_semver_t current_semver;
+    ota_semver_t server_semver;
+    if (!parse_semver(current_version, &current_semver) ||
+        !parse_semver(server_version, &server_semver)) {
+        ESP_LOGE(TAG,
+                 "Version compare failed: local=%s server=%s",
+                 current_version,
+                 server_version);
+        return false;
+    }
+
+    return compare_semver(&server_semver, &current_semver) > 0;
+}
+
+void simple_ota_set_state(simple_ota_state_t state)
+{
+    s_ota_state = state;
 }

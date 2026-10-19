@@ -35,6 +35,7 @@ idf_component_register(SRCS "main.c"
                             "APP/MQTT/mqtt_app.c"
                             "APP/HTTP/GetProto.c"
                             "APP/OTA/ota.c"
+                            "APP/OTA/mesh_ota.c"
 
                             INCLUDE_DIRS 
                             "Communication/Uart"

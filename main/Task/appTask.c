@@ -41,6 +41,7 @@
 #include "SelfRecovery.h"
 #include "task_config.h"
 #include "ota.h"
+#include "mesh_ota.h"
 
 #pragma region 全局状态与任务辅助
 
@@ -2559,14 +2560,9 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
         {
             if (strstr(TopicBuf, "ota"))
             {
-                // 处理OTA升级
+                // 处理OTA升级（Mesh-Lite 原生分发适配层入口，非阻塞）
                 ESP_LOGI(TAG, "OTA升级命令收到");
-                esp_err_t err = simple_ota_check_and_update_default();
-                if (err != ESP_OK)
-                {
-                    ESP_LOGE(TAG, "OTA check/update failed: %s", esp_err_to_name(err));
-                }
-
+                mesh_ota_handle_mqtt_command();
             }
             else if (strstr(TopicBuf, "start_aging"))
             {
@@ -5418,6 +5414,20 @@ void app_task_init(void)
                     ESP_LOGE(TAG, "dual_net init failed: %s", esp_err_to_name(dn_err));
                     storage_write_record_cyclic(current_log_pn(), "dual_net_init failed");
                 }
+            }
+
+            /*
+             * Mesh-Lite 原生 OTA 适配层：注册 LAN OTA 文件传输回调与 OTA 事件，
+             * 建 cmd/dl 双任务。必须在 mesh_init_Custom() 成功之后（依赖
+             * esp_mesh_lite 与默认事件循环），且早于 net_init 建 MQTT
+             * （ota 命令经 mqtt_rx 入口进入适配层）。未启用
+             * CONFIG_ESP_MESH_LITE_OTA_ENABLE 时仅告警不阻断启动。
+             */
+            esp_err_t mo_err = mesh_ota_init();
+            if (mo_err != ESP_OK)
+            {
+                ESP_LOGE(TAG, "mesh_ota_init failed: %s", esp_err_to_name(mo_err));
+                storage_write_record_cyclic(current_log_pn(), "mesh_ota_init failed");
             }
 
             ret1 = create_cpu1_task(Init_ByNetwork_Flag,

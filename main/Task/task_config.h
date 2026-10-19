@@ -68,6 +68,16 @@
 #define LG_STACK_MESH_HEALTH       3072
 #define LG_PRIO_MESH_HEALTH        2
 
+/* Mesh-Lite 原生 OTA 适配层（main/APP/OTA/mesh_ota.c）：
+ * cmd_task：命令分流（层级错峰 + mesh 内发起 + 重试调度），
+ *            负载等同原 mqtt_rx 的 OTA 路径（update.json + cJSON + 探测）；
+ * dl_task ：根节点外网下载（simple_ota 全链 + 2048B 读缓冲 + esp_ota_write），
+ *            仅根节点路径唤醒，子节点空闲待命。 */
+#define LG_STACK_MESH_OTA          8192
+#define LG_PRIO_MESH_OTA           7
+#define LG_STACK_MESH_OTA_DL       8192
+#define LG_PRIO_MESH_OTA_DL        4
+
 #define LG_STACK_NET_MONITOR       3072
 #define LG_PRIO_NET_MONITOR        3
 
