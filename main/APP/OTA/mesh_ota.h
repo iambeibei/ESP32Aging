@@ -32,8 +32,8 @@ extern "C" {
  * @brief 初始化 Mesh-Lite 原生 OTA 适配层
  *
  * 注册 LAN OTA 文件传输三回调（provide/get/get_done）+ OTA 事件处理器，
- * 并创建 cmd_task / dl_task 两个 CPU1 任务（所有节点统一创建，子节点的
- * dl_task 空闲待命，仅根节点路径唤醒）。
+ * 并创建 CPU1 任务：cmd_task 所有节点创建；dl_task 仅根节点创建
+ * （DL_EVT_START 唯一置位点在根节点路径，子节点无外网下载需求）。
  *
  * 调用上下文：app_task_init，mesh_init_Custom() 成功后调用一次；不可重入
  * （内部 init-once 静态守卫）。未启用 CONFIG_ESP_MESH_LITE_OTA_ENABLE 时

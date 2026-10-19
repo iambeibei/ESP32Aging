@@ -30,6 +30,7 @@
  */
 
 #include <string.h>
+#include <time.h>
 
 #include "esp_app_format.h"
 #include "esp_err.h"
@@ -39,12 +40,16 @@
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "esp_random.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "mesh_ota.h"
+#include "mqtt_app.h"
+#include "Json_data.h"
+#include "ConfigData.h"
 #include "ota.h"
 #include "task_config.h"
 
@@ -72,6 +77,12 @@ static const char *TAG = "mesh_ota";
 /* 根节点外网下载等待上限：防 dl_task 异常时 cmd_task 永久挂起。 */
 #define LG_MESH_OTA_ROOT_DL_TIMEOUT_MS (10u * 60u * 1000u)
 
+/*
+ * 方案 A：根下载完成到 esp_restart 的延迟。等待串口日志与 MQTT 在途
+ * 报文落盘（对齐 CanRestart 分支重启前等待范式）。
+ */
+#define LG_MESH_OTA_ROOT_RESTART_DELAY_MS 3000
+
 /* 防御下限：读不到层级时按最小子节点层处理（根恒为 1）。 */
 #define LG_MESH_OTA_MIN_CHILD_LEVEL 2
 
@@ -92,8 +103,9 @@ static const char *TAG = "mesh_ota";
 /* 以下为实现主体；Kconfig 关闭时仅保留文件末尾的对外降级 stub。 */
 
 /* cmd_task 事件位 */
-#define CMD_EVT_REQUEST BIT0 /* MQTT ota 命令到达（mesh_ota_handle_mqtt_command） */
-#define CMD_EVT_RETRY   BIT1 /* OTA 失败/需重试（事件处理器或本任务置位） */
+#define CMD_EVT_REQUEST       BIT0 /* MQTT ota 命令到达（mesh_ota_handle_mqtt_command） */
+#define CMD_EVT_RETRY         BIT1 /* OTA 失败/需重试（事件处理器或本任务置位） */
+#define CMD_EVT_PUBLISH_OTACP BIT2 /* OTA 完成，待 cmd_task 发布 OTACP（仅子节点） */
 
 /* dl_task 事件位 */
 #define DL_EVT_START BIT0 /* 唤醒 dl_task 开始外网下载（cmd_task 根路径置位） */
@@ -132,6 +144,9 @@ static struct {
 static simple_ota_metadata_t s_metadata;
 static size_t s_firmware_size_bytes;
 static bool s_metadata_valid;
+
+/* OTACP 发布去重：done 回调与 OTA_FINISH(SUCCESS) 兜底可能双置位，只发一次。 */
+static bool s_otacp_published;
 
 /* 已执行的重试次数（首试为 0）。 */
 static uint8_t s_retry_count;
@@ -377,6 +392,12 @@ static esp_err_t get_file_done_cb(void)
      */
     provide_cache_invalidate();
     simple_ota_set_state(SIMPLE_OTA_STATE_PENDING_RESTART);
+    /*
+     * 通知 cmd_task 发布 OTACP（仅子节点走本路径；根由方案 A 先行重启）。
+     * 本回调可能位于闭源库任务上下文，不可直接做阻塞 MQTT 发布，
+     * 原因见 mesh_ota_publish_otacp 注释。
+     */
+    xEventGroupSetBits(s_cmd_events, CMD_EVT_PUBLISH_OTACP);
     ESP_LOGI(TAG, "Mesh OTA complete; pending restart (CanRestart trigger)");
     return ESP_OK;
 }
@@ -420,6 +441,11 @@ static void mesh_ota_event_handler(void *arg, esp_event_base_t base,
              */
             if (simple_ota_get_state() == SIMPLE_OTA_STATE_RUNNING) {
                 simple_ota_set_state(SIMPLE_OTA_STATE_PENDING_RESTART);
+                /*
+                 * 非常规顺序（done 回调未到）：兜底通知发布 OTACP，与
+                 * done 路径经 s_otacp_published 去重，不会双发。
+                 */
+                xEventGroupSetBits(s_cmd_events, CMD_EVT_PUBLISH_OTACP);
             }
         } else {
             ESP_LOGE(TAG, "Mesh OTA event: finish, fail, reason=%d", (int)reason);
@@ -470,8 +496,68 @@ static void schedule_retry(void)
 }
 
 /*
+ * OTACP 完成上报（仅子节点；根先行重启本身即完成信号，不发送）。
+ *
+ * 复用老化完成同构 JSON 构造函数 create_json_agingComplete()（Json_data.c）：
+ *   {"Seq":<time(NULL)>,"Data":{"IsComplete":1,"AgingNumber":"<n>"}}
+ * topic：device/%s/event/OTACP（对齐 agingComplete 的 TaskCP 范式，
+ * appTask.c publish_aging_complete）。
+ *
+ * 调用上下文：仅 cmd_task。绝不可在 get_file_done_cb / OTA 事件等闭源库
+ * 上下文调用——esp_mqtt_client_publish 最坏阻塞 10s（network timeout），
+ * 会拖垮库任务；故回调里只置 CMD_EVT_PUBLISH_OTACP 位，由此处统一发布。
+ */
+static void mesh_ota_publish_otacp(void)
+{
+    /* 去重：本 OTA 周期已发布过则跳过（done 与 FINISH 双路径置位）。 */
+    if (s_otacp_published) {
+        return;
+    }
+
+    /* AgingNumber 空值防护：配置缺失时不发送，避免 %s 收到 NULL。 */
+    if (AgingNumber == NULL || AgingNumber[0] == '\0') {
+        ESP_LOGE(TAG, "OTACP publish skipped: AgingNumber is empty");
+        return;
+    }
+
+    char *json_str = create_json_agingComplete(time(NULL), 1, AgingNumber);
+    if (json_str == NULL) {
+        ESP_LOGE(TAG, "OTACP publish skipped: create JSON failed");
+        return;
+    }
+
+    int ret = app_mqtt_publish("device/%s/event/OTACP", json_str, DEVICE_ID);
+    free(json_str);
+
+    if (ret < 0) {
+        /*
+         * 发布失败不回滚 PENDING_RESTART：新固件已写入并设为启动分区，
+         * 服务器可经重发命令/其他通道获知状态；此处仅记录，不置去重标志
+         * （FINISH 兜底再次置位时可重试发布）。
+         */
+        ESP_LOGE(TAG, "OTACP publish failed (ret=%d); OTA remains pending restart", ret);
+        return;
+    }
+
+    s_otacp_published = true;
+    ESP_LOGI(TAG, "OTACP published: IsComplete=1, AgingNumber=%s", AgingNumber);
+}
+
+/*
  * 根节点路径：暂停子节点 OTA 请求（库内排队）→ 唤醒 dl_task 外网下载
- * 唯一 1 份 → 恢复子节点。下载成败均恢复，失败汇入重试调度。
+ * 唯一 1 份 → 【方案 A】先行重启供数。
+ *
+ * 方案 A 依据（2026-10-19 1 根 1 子 gate 实测，见
+ * MESH_LITE_OTA_INTEGRATION.md）：闭源库要求供数方 running 分区版本 ==
+ * 子节点请求版本，根"已下载未重启"态（新固件在另一 ota 槽、running 仍是
+ * 旧版）会被库拒绝供数。因此根下载完成后必须重启才能让子节点的 mesh 内
+ * 请求命中 provide_file_cb——子的就绪在库约束下依赖根先重启。
+ *
+ * 根不发送 OTACP：先行重启本身即为完成信号；OTACP 仅子节点发送。
+ * 重启前延迟等待串口日志与 MQTT 在途报文落盘（对齐 CanRestart 分支
+ * 重启前等待范式，appTask.c）。
+ *
+ * 失败/超时路径：恢复子节点并汇入重试调度，根保持旧固件继续运行。
  * 调用上下文：cmd_task。
  */
 static void handle_root_path(void)
@@ -494,24 +580,28 @@ static void handle_root_path(void)
                                            pdMS_TO_TICKS(LG_MESH_OTA_ROOT_DL_TIMEOUT_MS));
 
     if (bits & DL_EVT_DONE) {
-        ESP_LOGI(TAG, "Root OTA download completed; resume children");
-    } else {
-        ESP_LOGE(TAG, "Root OTA download failed or timed out; resume children for retry");
-        /* dl_task 失败时 simple_ota 状态已为 FAILED；超时路径防御性置位。 */
-        if (bits == 0) {
-            simple_ota_set_state(SIMPLE_OTA_STATE_FAILED);
-        }
+        ESP_LOGW(TAG,
+                 "Root OTA completed; restarting root in %u ms to serve new firmware "
+                 "to children (children keep running until CanRestart)",
+                 (unsigned)LG_MESH_OTA_ROOT_RESTART_DELAY_MS);
+        vTaskDelay(pdMS_TO_TICKS(LG_MESH_OTA_ROOT_RESTART_DELAY_MS));
+        esp_restart();
+        /* 不返回：esp_restart 不会回到本函数。 */
     }
 
-    /* 无论成败都恢复子节点：放行库内排队请求（届时根已就绪或走重试）。 */
+    /* 失败/超时路径：根保持旧固件，恢复子节点走重试。 */
+    ESP_LOGE(TAG, "Root OTA download failed or timed out; resume children for retry");
+    /* dl_task 失败时 simple_ota 状态已为 FAILED；超时路径防御性置位。 */
+    if (bits == 0) {
+        simple_ota_set_state(SIMPLE_OTA_STATE_FAILED);
+    }
+
     err = esp_mesh_lite_ota_notify_child_node_restart();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "notify_child_node_restart failed: %s", esp_err_to_name(err));
     }
 
-    if (!(bits & DL_EVT_DONE)) {
-        schedule_retry();
-    }
+    schedule_retry();
 }
 
 /*
@@ -602,10 +692,22 @@ static void mesh_ota_cmd_task(void *arg)
 
     for (;;) {
         EventBits_t bits = xEventGroupWaitBits(s_cmd_events,
-                                               CMD_EVT_REQUEST | CMD_EVT_RETRY,
+                                               CMD_EVT_REQUEST | CMD_EVT_RETRY | CMD_EVT_PUBLISH_OTACP,
                                                pdTRUE,
                                                pdFALSE,
                                                portMAX_DELAY);
+
+        /*
+         * OTACP 发布独立于命令流，优先处理（cmd_task 上下文，publish 可阻塞）。
+         * 回调只置位不发布的原因见 mesh_ota_publish_otacp 注释。
+         */
+        if (bits & CMD_EVT_PUBLISH_OTACP) {
+            mesh_ota_publish_otacp();
+            if ((bits & (CMD_EVT_REQUEST | CMD_EVT_RETRY)) == 0) {
+                continue;
+            }
+        }
+
         bool is_retry = (bits & CMD_EVT_RETRY) != 0;
 
         /*
@@ -650,6 +752,8 @@ static void mesh_ota_cmd_task(void *arg)
             }
         } else {
             s_retry_count = 0;
+            /* 新 OTA 周期（服务器新命令）：允许本周期再次发布 OTACP。 */
+            s_otacp_published = false;
         }
         simple_ota_set_state(SIMPLE_OTA_STATE_RUNNING);
 
@@ -732,6 +836,9 @@ esp_err_t mesh_ota_init(void)
         return err;
     }
 
+    /*
+     * cmd_task：所有节点创建（命令分流 + 错峰 + 重试 + OTACP 发布调度）。
+     */
     if (xTaskCreatePinnedToCore(mesh_ota_cmd_task, "mesh_ota_cmd",
                                 LG_STACK_MESH_OTA, NULL, LG_PRIO_MESH_OTA,
                                 NULL, LG_APP_CPU_CORE) != pdPASS) {
@@ -739,11 +846,20 @@ esp_err_t mesh_ota_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    if (xTaskCreatePinnedToCore(mesh_ota_dl_task, "mesh_ota_dl",
-                                LG_STACK_MESH_OTA_DL, NULL, LG_PRIO_MESH_OTA_DL,
-                                NULL, LG_APP_CPU_CORE) != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create mesh_ota_dl task");
-        return ESP_ERR_NO_MEM;
+    /*
+     * dl_task：仅根节点创建。DL_EVT_START 唯一置位点在根节点路径
+     * （handle_root_path）；子节点 extern_url_ota_cb 为禁用桩，永不触发
+     * 外网下载，故子节点无需该任务（每子省 LG_STACK_MESH_OTA_DL 栈 + TCB）。
+     * IsRoot 在 readconfig 阶段已加载，本调用点（mesh_init 成功后）可安全读取。
+     * 注意：根/子为同一固件，该函数在子节点固件中仍被编译保留，仅不执行创建。
+     */
+    if (IsRoot == 1) {
+        if (xTaskCreatePinnedToCore(mesh_ota_dl_task, "mesh_ota_dl",
+                                    LG_STACK_MESH_OTA_DL, NULL, LG_PRIO_MESH_OTA_DL,
+                                    NULL, LG_APP_CPU_CORE) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create mesh_ota_dl task");
+            return ESP_ERR_NO_MEM;
+        }
     }
 
     s_initialized = true;

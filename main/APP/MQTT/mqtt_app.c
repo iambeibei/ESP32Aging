@@ -13,6 +13,7 @@
 #include "esp_app_desc.h"
 #include "appTask.h"
 #include "dual_net.h"
+#include "mesh.h"
 
 static const char *TAG = "mesh_mqtt";
 
@@ -347,6 +348,9 @@ static char *create_up_line_json(int seq, const char *dev_id)
     cJSON_AddStringToObject(data, "Version", app_version);
     // 添加老化架号
     cJSON_AddStringToObject(data, "AgingNumber", AgingNumber);
+    // 添加 Mesh 层级：根节点=1，子节点≥2（库未就绪时可能为 0）。
+    // 服务器据此区分节点层级与 mesh 拓扑形态。
+    cJSON_AddNumberToObject(data, "MeshLevel", mesh_get_current_level());
 
     // 6. 生成 JSON 字符串（紧凑格式，无缩进）
     char *json_str = cJSON_PrintUnformatted(root);

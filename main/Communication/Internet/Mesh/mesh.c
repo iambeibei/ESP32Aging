@@ -48,16 +48,21 @@
 /*
  * mesh-lite 父节点重连/重扫节奏（esp_mesh_lite_set_wifi_reconnect_interval 单位：秒）。
  * 库默认「5s×2 次重连当前父，失败后每 10s 重扫」。
- * 历史取舍（CHILD_NODE_ROOT_LOSS_DESIGN.md 7.3）：曾调到 10s×3/30s，
- * 压 BLE 老化链路射频争用与闭源重扫路径暴露，但中间父断开时
- * 「30s 只重连原父 + 30s 才重扫」使子节点长时间卡在重连循环
- * （根已满时每轮撞满员根被 deauth，见现场根日志 max connection, deauth!）。
- * 2026-10-16 折中：5s×2（重连窗口 30s→10s）+ 15s 重扫，
- * 重扫暴露介于原设计与库默认之间；配合无父 watchdog（见
- * MESH_PARENT_LOST_SOFT_RESET_MS）做有界自愈，不再依赖拖长节奏兜底。
+ * 历史取舍（CHILD_NODE_ROOT_LOSS_DESIGN.md 7.3）：曾调到 10s×3/30s 压 BLE 老化链路
+ * 射频争用与闭源重扫路径暴露；2026-10-16 折中为 5s×2/15s（重连窗口 30s→10s），
+ * 加快中间父永久断开时的重扫发现，配合无父 watchdog 兜底。
+ *
+ * 2026-10-19 OTA 适配（本次）：父节点重启恢复期约 25~40s（外网下载完成 + 3s 延迟 +
+ * 重启入网 + SoftAP 就绪，见 MESH_LITE_OTA_INTEGRATION.md 方案 A），10s 重连窗口
+ * 覆盖不到，子节点会在父恢复前提前进入重扫、多绕一轮 OTA 重试（90s）。故加长到
+ * 10s×5=50s：父恢复 SoftAP 时子仍在重连原父窗口内，直接命中、OTA 传输中断面最小。
+ * 代价：中间父永久故障时换父延迟从约 10s 增至约 50s（15s 重扫兜底节奏不变，
+ * 仍有界；无父 watchdog 的 180s 软复位线不受影响）。根节点侧无负面：根 STA 30s 内
+ * 恢复则 failover 的 30s 触发线不会误触发（FAILOVER_LOST_IP_MS），>30s 故障照旧切换。
+ * 后续「逐层重启」方案落地时需重新评估本组参数。
  */
-#define MESH_PARENT_RETRY_INTERVAL_SEC 5
-#define MESH_PARENT_RETRY_COUNT        2
+#define MESH_PARENT_RETRY_INTERVAL_SEC 10
+#define MESH_PARENT_RETRY_COUNT        5
 #define MESH_RESCAN_INTERVAL_SEC       15
 
 /* 子节点健康监视周期：父丢失态 5s 一条（掉线属异常态），恢复后 60s 心跳。 */
@@ -142,6 +147,11 @@ void mesh_root_manage_sta_reconnect(bool wired_preferred, bool sta_has_ip)
         ESP_LOGI(TAG, "有线上行失效：恢复根节点 STA 重连");
         esp_mesh_lite_connect();
     }
+}
+
+uint8_t mesh_get_current_level(void)
+{
+    return esp_mesh_lite_get_level();
 }
 
 /* dual_net 初始化成功后由它发布根节点标志；初始化前/失败时保留 STA 兜底。
