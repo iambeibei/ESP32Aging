@@ -35,10 +35,10 @@ LAN OTA 文件传输逐级分发；根 WiFi 出口流量 N×2.1MB → 1×2.1MB�
               provide_file_cb           get_file_cb            get_file_done_cb
               （供数方按 fw_version      （惰性 begin +           （end + set_boot
                 匹配分区读出，带缓存）     write_with_offset）       → PENDING_RESTART
-                                                                    → 置 CMD_EVT_PUBLISH_OTACP）
+                                                                    → 置 CMD_EVT_RESTART）
                                                                               │
-                                                                    cmd_task 发布 OTACP
-                                                                    device/<DEVICE_ID>/event/OTACP
+                                                                    cmd_task 延迟 3s 后重启
+                                                                    （根+子：完成即重启）
 ```
 
 模块：`main/APP/OTA/mesh_ota.c/h` 为唯一耦合点（同时依赖 esp_mesh_lite 与 ota.c）；
@@ -71,13 +71,17 @@ otadata 已指向、running 仍旧版）被拒。子请求穿透约 91s 后失�
 由此：mesh 内分发成立的前提是**根先重启运行新固件**。方案 A = 根下载完成 → 延迟 3s
 （日志/MQTT 报文落盘，对齐 CanRestart 前等待范式）→ `esp_restart()`；重启后
 running=新版本，子节点 mesh 内请求命中根 `provide_file_cb`（双路径的第一条）。
-子节点保持错峰 + 重试 + CanRestart 统一点火不变。
 
-**运维流程（重要）**：先给根发 ota → 根自动重启上线 → 再给子节点发 ota → mesh 内分发
-→ 全部就绪后 CanRestart 统一点子。根重启瞬间的拓扑瞬断由
+**完成即重启（2026-10-19 用户决策，替代原 CanRestart 统一点火）**：根与子下载/
+分发完成后均延迟 `LG_MESH_OTA_RESTART_DELAY_MS`（3s）自行 `esp_restart()`，不再等待
+CanRestart 统一点火，亦**不再上报 OTACP**（原 OTACP 上报已整体移除）；服务器以上线
+报文（`device/public/up_line` 的 `Version` 字段）获知节点已升级。子节点重启前正在
+运行的老化任务由 NVS SelfRecovery 瞬断恢复、SQLite 补发，数据不丢；其下 L3 的重连
+由 50s 重连窗口（mesh.c `MESH_PARENT_RETRY_*`）覆盖子重启恢复期。
+
+**运维流程（重要）**：先给根发 ota → 根自动重启上线 → 再给子节点发 ota → mesh 内
+分发 → 各子完成即自行重启。根/子重启瞬间的拓扑瞬断由
 `CHILD_NODE_ROOT_LOSS_DESIGN.md` 的既有自愈机制兜底（子节点不异常重启、老化数据不丢）。
-
-**根不发送 OTACP**：先行重启本身即完成信号；OTACP 仅子节点发送。
 
 ### 3.3 三层时序保护（无兜底后的可靠性）
 
@@ -95,15 +99,19 @@ running=新版本，子节点 mesh 内请求命中根 `provide_file_cb`（双路
 次为另一 ota 槽（覆盖中间父"已下载未重启"的级联场景）；匹配结果按 fw_version 缓存
 （短临界区），读取按分区边界钳位、64KB 对齐 padding 段填 0xFF。
 
-### 3.5 OTACP 完成上报（仅子节点）
+### 3.5 完成即重启（2026-10-19 决策，OTACP 上报已移除）
 
-- topic：`device/<DEVICE_ID>/event/OTACP`；payload 复用老化完成同构构造函数
-  `create_json_agingComplete(time(NULL), 1, AgingNumber)`（Json_data.c）：
-  `{"Seq":<ts>,"Data":{"IsComplete":1,"AgingNumber":"<n>"}}`；
-- 发布位置：回调（`get_file_done_cb`/OTA_FINISH 兜底）只置 `CMD_EVT_PUBLISH_OTACP` 位，
-  由 cmd_task 统一发布——闭源库任务上下文不可做最坏 10s 的阻塞 MQTT 发布；
-- 去重：`s_otacp_published` 单周期去重（done 与 FINISH 双路径不双发）；新 OTA 周期
-  （服务器新命令）重置；发布失败不回滚 PENDING_RESTART（服务器可重发命令查询）。
+根与子下载/分发完成后均延迟 `LG_MESH_OTA_RESTART_DELAY_MS`（3s）自行重启：
+
+- **触发**：`get_file_done_cb` 成功末尾置 `CMD_EVT_RESTART`（OTA_FINISH(SUCCESS) 非常规
+  顺序兜底同样置位，双置位无害——第一次 `esp_restart` 后系统即重置）；
+- **执行**：cmd_task 主循环统一处理——状态闸门（仅 PENDING_RESTART）→ WRN 日志 →
+  `vTaskDelay(3s)`（串口日志与 MQTT 在途报文落盘）→ `esp_restart()`；闭源库回调上下文
+  不做延迟/重启；
+- **服务器感知**：节点重启后 MQTT 重连发上线报文（`device/public/up_line`），其中
+  `Version` 字段（取自 app_desc）即升级完成信号，另含 `MeshLevel` 层级字段；
+- **原 OTACP 上报已整体移除**（`mesh_ota_publish_otacp`/`CMD_EVT_PUBLISH_OTACP`/
+  去重标志均已删除）；CanRestart 订阅与处理保留但不再参与 OTA 流程（幂等，无害）。
 
 ## 4. 可标定常量（mesh_ota.c 顶部）
 
@@ -132,12 +140,13 @@ running=新版本，子节点 mesh 内请求命中根 `provide_file_cb`（双路
 - 根：pause → 外网下载 2096688B/160s → set_boot → 方案 A 重启路径就绪（本次为 gate 版本，
   未含先行重启与 OTACP，见 3.2 决策依据）。
 - 子：错峰/探测/transmit_file_start/禁用桩命中全部符合设计；库供数判定条件已证实。
-- 待复测项：方案 A 先行重启 + OTACP 上报 + 重试命中窗口。
+- 待复测项：方案 A 先行重启 + 完成即重启（子节点）+ 重试命中窗口。
 
 ### 6.2 1 根 5 子全场（待执行）
 
 按 3.2 运维流程：先升根 → 根上线 → 5 子同时发 ota → 观察错峰打散、根出口仅 1 份、
-禁用桩不命中（除时序边缘）、OTACP 5 条到服务器、CanRestart 统一点火后全网新版本。
+禁用桩不命中（除时序边缘）、各子完成后 3s 自行重启、重启后上线报文 Version=新版本，
+全网完成升级。
 
 ### 6.3 50 节点扩展（待执行）
 

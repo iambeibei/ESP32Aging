@@ -10,7 +10,10 @@
  *   - 子节点：transmit_file_start() 走 mesh 内逐级请求/分发，
  *     extern_url_ota_cb 为禁用桩（mesh 内拿不到即失败，无外网兜底）；
  *   - 根节点：notify_child_node_pause() → dl_task 外网下载唯一 1 份 →
- *     notify_child_node_restart()。
+ *     完成后重启供数。
+ *   根与子下载/分发完成后均延迟 LG_MESH_OTA_RESTART_DELAY_MS 自行重启
+ *   （2026-10-19 决策：不再等待 CanRestart 统一点火，亦不上报 OTACP；
+ *   服务器以上线报文 up_line 的 Version 字段获知节点已升级）。
  *
  * 可靠性补偿（无兜底后的必要措施）：
  *   - 层级错峰：(level-1)×LG_MESH_OTA_LEVEL_STAGGER_SEC + rand(0,15s)；
