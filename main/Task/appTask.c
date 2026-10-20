@@ -51,6 +51,17 @@
 #define MAX_EXTERNAL_DEVICE_COUNT 6
 #define AGING_UPLOAD_PN_MAX_LEN 64
 
+/*
+ * 老化启动 mesh 层级错峰基数（秒）。
+ * 全网同时下发 start_aging 时，各节点启动老化后会经 http_auto 并发拉取
+ * 设备协议（test_http_getproto_New），根出口与服务器同时受压；按
+ * mesh_get_current_level() × 本基数延时后再启动，层深的节点后启动，
+ * 天然打散该峰值。根(level=1) 2s、L2 4s … max_level=6 时 12s，有界。
+ * 使用点与同步阻塞说明见 start_aging_with_ready_pn()。
+ */
+#define LG_AGING_START_STAGGER_BASE_SEC 2
+#define LG_GETPROTO_TIMEOUT_MS 10000
+
 #define NVS_KEY_CURRENT_PN "bt_name"
 #define NVS_KEY_READY_PN "bt_name_Ready"
 #define NVS_KEY_NEW_PN_READY "new_pn_ready"
@@ -103,7 +114,7 @@ typedef struct
 
 long Programld = 0;      // 老化任务ID
 uint8_t Cannextstep = 0; // 默认为0，群控模式下，收到下一步操作指令后，设置为1，表示可以执行下一步老化操作
-uint8_t CanRestart=0;// 默认为0，ota模式下，收到下一步操作指令后，设置为1，表示可以执行重启操作
+uint8_t CanRestart = 0;  // 默认为0，ota模式下，收到下一步操作指令后，设置为1，表示可以执行重启操作
 uint8_t AgingCMode = 0;
 uint8_t CycleIndex = 0;
 AgingConfig agingcfg = {0}; // 定义全局老化配置结构体
@@ -2450,6 +2461,32 @@ static bool start_aging_with_ready_pn(const char *aging_json, int start_seq)
         return false;
     }
 
+    /*
+     * mesh 层级错峰（2026-10-20）：全网同时下发 start_aging 时，各节点启动
+     * 老化后会经 http_auto 并发拉取设备协议（test_http_getproto_New），根
+     * WiFi 出口与服务器同时受压。按层级 ×LG_AGING_START_STAGGER_BASE_SEC
+     * 延时后再启动，层深的节点后启动，打散协议拉取与启动峰值。
+     *
+     * 调用上下文：mqtt_rx 任务（parse_jsonCommand_MQTT 的调用者），同步阻塞
+     * 上限 12s（MESH_MAX_LEVEL=6 × 2s）。评估：老化启动为低频操作（一次老化
+     * 周期一次），既有路径本就含 SPIFFS/NVS 写阻塞，12s 内到达其他命令概率
+     * 极低，故不引入异步化（避免改动 WAIT_PN/挂起 seq 状态机）。
+     * 拒绝路径（空 JSON/RUNNING/无 PN）均在延时前返回，不受影响。
+     * 三个启动入口（直接 start_aging / set_pn 触发 pending / 掉电恢复）均
+     * 经本函数，自动继承错峰。
+     *
+     * level=0（库未就绪的异常态）防御性按 1 处理：保证最小 2s 错峰且不零延时。
+     */
+    uint8_t stagger_level = mesh_get_current_level();
+    if (stagger_level == 0)
+    {
+        stagger_level = 1;
+    }
+    uint32_t stagger_ms = (uint32_t)stagger_level *
+                          (uint32_t)LG_AGING_START_STAGGER_BASE_SEC * 1000u;
+
+    vTaskDelay(pdMS_TO_TICKS(stagger_ms));
+
     /* 在真正创建老化任务前先保证完整工艺JSON已经落盘。 */
     esp_err_t ret = save_json_to_spiffs("Aging.json", aging_json);
     if (ret != ESP_OK)
@@ -2851,7 +2888,7 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                 }
                 device_response_publish_point(Seq->valueint, 1, "CanNextstep set");
             }
-            else if(strstr(TopicBuf, "CanRestart"))
+            else if (strstr(TopicBuf, "CanRestart"))
             {
                 cJSON *Data_obj = cJSON_GetObjectItem(pRoot, "Data");
                 cJSON *NextStep = cJSON_IsObject(Data_obj) ? cJSON_GetObjectItem(Data_obj, "Restart") : NULL;
@@ -2859,7 +2896,7 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                 {
                     CanRestart = (uint8_t)NextStep->valueint;
                 }
-                if(CanRestart==1)
+                if (CanRestart == 1)
                 {
                     /*
                      * 外部触发重启（2026-10-16 起 OTA 的唯一重启入口）：
@@ -3939,7 +3976,13 @@ static bool aging_command_json_parse(const char *packet_copy)
         goto start_failed;
     }
 
-    if (!WaitAgingDeviceProtocolReady(10000))
+    uint8_t stagger_level = mesh_get_current_level();
+    if (stagger_level == 0)
+    {
+        stagger_level = 1;
+    }
+    uint32_t stagger_ms = (uint32_t)stagger_level * (uint32_t)LG_GETPROTO_TIMEOUT_MS * 1000u;
+    if (!WaitAgingDeviceProtocolReady(stagger_ms))
     {
         aging_error_log("Protocol loading timeout, ProtoID=%lld", Aging_device[0].ProtoID);
         IsAgingDevice = 0;

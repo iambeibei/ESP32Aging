@@ -447,6 +447,19 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
                 ESP_LOGE(TAG, "Failed to subscribe to stop_aging");
             }
 
+            // 订阅广播停止老化主题：一键停止本架（AgingNumber）全部点位。
+            // 与定点 stop_aging 功能相同——parse_jsonCommand_MQTT 以
+            // strstr(TopicBuf, "stop_aging") 分发，本主题天然命中该分支，
+            // 且 stop_aging 处理为幂等操作，定点+广播双通道重复执行无害。
+            // 下发侧约定：payload 须含数值 Seq 字段（命令入口门，见
+            // parse_jsonCommand_MQTT），格式与定点 stop_aging 一致。
+            memset(topic, 0, sizeof(topic));
+            snprintf(topic, sizeof(topic), "server/%s/public/cmd/stop_aging", AgingNumber);
+            if (esp_mqtt_client_subscribe(event->client, topic, 0) < 0)
+            {
+                ESP_LOGE(TAG, "Failed to subscribe to public stop_aging");
+            }
+
             // 订阅设置目标PN主题
             memset(topic, 0, sizeof(topic));
             snprintf(topic, sizeof(topic), "server/%s/cmd/set_pn", DEVICE_ID);
