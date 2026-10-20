@@ -15,9 +15,13 @@
  *   （2026-10-19 决策：不再等待 CanRestart 统一点火，亦不上报 OTACP；
  *   服务器以上线报文 up_line 的 Version 字段获知节点已升级）。
  *
- * 可靠性补偿（无兜底后的必要措施）：
- *   - 层级错峰：(level-1)×LG_MESH_OTA_LEVEL_STAGGER_SEC + rand(0,15s)；
- *   - 失败有限重试：LG_MESH_OTA_RETRY_MAX 次 @LG_MESH_OTA_RETRY_INTERVAL_SEC。
+ * 可靠性补偿（无外网兜底后的必要措施）：
+ *   - 失败有限重试：LG_MESH_OTA_RETRY_MAX 次 @LG_MESH_OTA_RETRY_INTERVAL_SEC，
+ *     复用首次 metadata，不重复外网请求；
+ *   - 根下载期间 pause/restart 让子节点请求在库内排队。
+ *   升级时序由上位机分级下发完全控制（先根、根重启上线后再逐层下发子节点），
+ *   设备侧不做层级错峰（2026-10-20 移除）；服务器若同时全层下发，子首次
+ *   请求失败后由重试兜底命中。
  */
 
 #pragma once

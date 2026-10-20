@@ -22,9 +22,8 @@ LAN OTA 文件传输逐级分发；根 WiFi 出口流量 N×2.1MB → 1×2.1MB�
                                                     mesh_ota cmd_task
                                               ┌──────────────┴──────────────┐
                                     level>1 子节点                    level=1 根节点
-                                    错峰 (level-1)×60s+抖动            pause children
-                                    fetch update.json + 版本门          dl_task 外网下载 1 份
-                                    probe Content-Length 作 size         ↓ 成功
+                                    fetch update.json + 版本门          pause children
+                                    probe Content-Length 作 size         dl_task 外网下载 1 份
                                     transmit_file_start               WRN 日志 → 3s → esp_restart
                                     （extern_url_ota_cb=禁用桩）        （方案 A：先行重启供数）
                                               │
@@ -83,15 +82,22 @@ CanRestart 统一点火，亦**不再上报 OTACP**（原 OTACP 上报已整体�
 分发 → 各子完成即自行重启。根/子重启瞬间的拓扑瞬断由
 `CHILD_NODE_ROOT_LOSS_DESIGN.md` 的既有自愈机制兜底（子节点不异常重启、老化数据不丢）。
 
-### 3.3 三层时序保护（无兜底后的可靠性）
+### 3.3 时序控制与兜底（无外网兜底后的可靠性）
 
-- 层级错峰 `delay(level) = (level-1)×LG_MESH_OTA_LEVEL_STAGGER_SEC + rand(0, 15s)`；
+**升级时序由上位机分级下发完全控制**（2026-10-20 起，设备侧层级错峰已移除）：
+先给根发 ota → 根下载完成自动重启上线 → 上位机确认根上线（up_line 报文 Version）→
+再逐层下发子节点。设备侧收到子路径命令后立即发起 mesh 内请求，无延时。
+
+设备侧保留的两层兜底：
+
 - 根下载期间 `notify_child_node_pause/restart` 让子节点请求在库内排队（官方范式）；
 - 失败有限重试 `LG_MESH_OTA_RETRY_MAX=2` 次 @`LG_MESH_OTA_RETRY_INTERVAL_SEC=90s`，
   重试复用首次 metadata/size，不重复外网请求。
 
-**重试覆盖时序窗**（gate 数据）：子首次请求约 t=116s（60s 错峰 + 库 91s 穿透周期失败），
-根就绪约 t=195s（外网下载 160s + 重启入网 ~30s）；90s 间隔的第二次重试（t≈296s）命中。
+**重试覆盖时序窗**（gate 数据）：若上位机同时全层下发（未分级），子首次请求会撞上
+根未就绪（库 91s 穿透周期后禁用桩 FAIL），根就绪约 t=195s（外网下载 160s + 重启
+入网 ~30s）；90s 间隔的第二次重试（t≈296s）命中——功能正确，多一轮失败日志。
+分级下发时子节点零失败直达。
 
 ### 3.4 提供方分区匹配（双路径 + 缓存）
 
@@ -117,10 +123,11 @@ CanRestart 统一点火，亦**不再上报 OTACP**（原 OTACP 上报已整体�
 
 | 常量 | 初值 | 标定方法 |
 |---|---|---|
-| `LG_MESH_OTA_LEVEL_STAGGER_SEC` | 60 | 实机抓两值：根日志外网下载首末进度时间戳差、子节点 OTA PROGRESS 10%→90% 时间戳差；步长 = max(两值)×1.5 |
-| `LG_MESH_OTA_STAGGER_JITTER_SEC` | 15 | 同层请求峰值打散，一般无需调 |
-| `LG_MESH_OTA_RETRY_MAX` / `LG_MESH_OTA_RETRY_INTERVAL_SEC` | 2 / 90 | 覆盖"根下载+重启"全程即可 |
+| `LG_MESH_OTA_RETRY_MAX` / `LG_MESH_OTA_RETRY_INTERVAL_SEC` | 2 / 90 | 覆盖"根下载+重启"全程即可（上位机未分级下发时兜底） |
 | `LG_MESH_OTA_ROOT_RESTART_DELAY_MS` | 3000 | 日志落盘等待，一般无需调 |
+
+> 注：原层级错峰常量（`LG_MESH_OTA_LEVEL_STAGGER_SEC` / `_JITTER_SEC`）已于 2026-10-20
+> 移除——升级时序由上位机分级下发控制，见 3.3。
 
 ## 5. 兼容性与约束
 
@@ -139,16 +146,16 @@ CanRestart 统一点火，亦**不再上报 OTACP**（原 OTACP 上报已整体�
 
 - 根：pause → 外网下载 2096688B/160s → set_boot → 方案 A 重启路径就绪（本次为 gate 版本，
   未含先行重启与 OTACP，见 3.2 决策依据）。
-- 子：错峰/探测/transmit_file_start/禁用桩命中全部符合设计；库供数判定条件已证实。
+- 子：探测/transmit_file_start/禁用桩命中全部符合设计；库供数判定条件已证实。
 - 待复测项：方案 A 先行重启 + 完成即重启（子节点）+ 重试命中窗口。
 
 ### 6.2 1 根 5 子全场（待执行）
 
-按 3.2 运维流程：先升根 → 根上线 → 5 子同时发 ota → 观察错峰打散、根出口仅 1 份、
-禁用桩不命中（除时序边缘）、各子完成后 3s 自行重启、重启后上线报文 Version=新版本，
-全网完成升级。
+按 3.2/3.3 运维流程：上位机先给根发 ota → 根自动重启上线（up_line Version=新版本）→
+再给 5 子同时发 ota（分级下发，子侧零错峰直达）→ 观察根出口仅 1 份、禁用桩不命中、
+各子完成后 3s 自行重启、重启后上线报文 Version=新版本，全网完成升级。
 
 ### 6.3 50 节点扩展（待执行）
 
-多层树（根 5 槽/层，1+5+15~20+29）：错峰顺序与层级天然一致（L2 最短、L4 最长），
+多层树（根 5 槽/层，1+5+15~20+29）：上位机按层级分级下发（L2 → L3 → L4），
 中间父级联缓存分摊供数压力；穿透请求为逻辑转发，根 SoftAP 满员不影响分发。

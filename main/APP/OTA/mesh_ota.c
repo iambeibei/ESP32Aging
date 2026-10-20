@@ -4,7 +4,7 @@
  *
  * 对外接口与设计说明见 mesh_ota.h；总体架构：
  *
- *   mqtt_rx ──通知──▶ cmd_task ──子节点: 错峰 + update.json + transmit_file_start
+ *   mqtt_rx ──通知──▶ cmd_task ──子节点: update.json + transmit_file_start
  *                        │         ──根节点: pause → 唤醒 dl_task（仅根创建）
  *                        ▼
  *                  Mesh-Lite 库（闭源）：逐级请求 / LAN OTA 传输 / OTA 事件
@@ -45,7 +45,6 @@
 #include "esp_mesh_lite.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
-#include "esp_random.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -63,15 +62,6 @@ static const char *TAG = "mesh_ota";
 /* 可标定常量（现场按实测修正，见 MESH_LITE_OTA_INTEGRATION.md 标定方法）        */
 /* -------------------------------------------------------------------------- */
 
-/*
- * 每层级错峰步长。标定值 = max(根外网下载耗时, mesh 一跳传输耗时) × 1.5。
- * 初值 60s 依据：2.1MB 固件 + 笔记本热点最差外网 ~45s + 一跳 mesh ~30~60s。
- */
-#define LG_MESH_OTA_LEVEL_STAGGER_SEC 60
-
-/* 同层启动抖动：打散同层节点对父节点的射频请求峰值。 */
-#define LG_MESH_OTA_STAGGER_JITTER_SEC 15
-
 /* 失败自动重试次数（首次 + 重试共 3 次尝试）。 */
 #define LG_MESH_OTA_RETRY_MAX 2
 
@@ -86,9 +76,6 @@ static const char *TAG = "mesh_ota";
  * 等待串口日志与 MQTT 在途报文落盘（对齐 CanRestart 分支重启前等待范式）。
  */
 #define LG_MESH_OTA_RESTART_DELAY_MS 3000
-
-/* 防御下限：读不到层级时按最小子节点层处理（根恒为 1）。 */
-#define LG_MESH_OTA_MIN_CHILD_LEVEL 2
 
 /* PROGRESS 事件限频步长（百分比）。 */
 #define LG_MESH_OTA_PROGRESS_LOG_STEP_PCT 10
@@ -560,36 +547,21 @@ static void handle_root_path(void)
 }
 
 /*
- * 子节点路径：层级错峰（(level-1)×步长 + 抖动）→ 首试拉 update.json +
- * 版本门 + Content-Length 探测 → transmit_file_start（extern 禁用桩）。
- * 之后由库驱动 get_file_cb/get_file_done 与 OTA_FINISH 事件收尾。
- * 重试复用首次 metadata/size，不重复外网请求。
+ * 子节点路径：收到命令即拉取 update.json → 版本门 → Content-Length 探测 →
+ * transmit_file_start（extern 禁用桩）。之后由库驱动 get_file_cb/get_file_done
+ * 与 OTA_FINISH 事件收尾。重试复用首次 metadata/size，不重复外网请求。
+ *
+ * 2026-10-20：去掉设备侧层级错峰延时——升级时序由上位机分级下发完全控制
+ * （先根、根重启上线后再逐层下发子节点）。设备侧保留的时序兜底：根下载期间
+ * pause/restart 让请求在库内排队、失败 90s×2 重试、库穿透机制；服务器若
+ * 同时全层下发，子首次请求失败后由重试兜底命中（多一轮失败日志，功能正确）。
+ *
  * 调用上下文：cmd_task；重试间隔延迟已由 cmd_task 主循环统一处理。
  */
 static void handle_child_path(void)
 {
-    uint8_t level = esp_mesh_lite_get_level();
-    if (level < LG_MESH_OTA_MIN_CHILD_LEVEL) {
-        /* 防御：非根却读不到层级时按最小子节点层处理。 */
-        level = LG_MESH_OTA_MIN_CHILD_LEVEL;
-    }
-
-    /* 层级错峰 + 同层抖动。 */
-    uint32_t stagger_ms = (uint32_t)(level - 1) * (uint32_t)LG_MESH_OTA_LEVEL_STAGGER_SEC * 1000u;
-    uint32_t jitter_ms = (uint32_t)esp_random() %
-                         ((uint32_t)LG_MESH_OTA_STAGGER_JITTER_SEC * 1000u + 1u);
-    uint32_t delay_ms = stagger_ms + jitter_ms;
-
-    ESP_LOGI(TAG, "Child OTA: level=%u, stagger %u.%03us before mesh request",
-             (unsigned)level, (unsigned)(delay_ms / 1000u), (unsigned)(delay_ms % 1000u));
-    vTaskDelay(pdMS_TO_TICKS(delay_ms));
-
-    /* 错峰期间状态可能被改变（重复命令/CanRestart 前的其他流程）。 */
-    if (simple_ota_get_state() != SIMPLE_OTA_STATE_RUNNING) {
-        ESP_LOGW(TAG, "Child OTA aborted during stagger: state=%d",
-                 (int)simple_ota_get_state());
-        return;
-    }
+    ESP_LOGI(TAG, "Child OTA: level=%u, requesting firmware via mesh (server-controlled timing)",
+             (unsigned)esp_mesh_lite_get_level());
 
     /* 首试获取参数；重试复用。 */
     if (!s_metadata_valid) {
@@ -800,7 +772,8 @@ esp_err_t mesh_ota_init(void)
     }
 
     /*
-     * cmd_task：所有节点创建（命令分流 + 错峰 + 重试 + 完成即重启调度）。
+     * cmd_task：所有节点创建（命令分流 + mesh 内发起 + 重试 + 完成即重启调度）。
+     * 升级时序由上位机分级下发控制，设备侧无错峰延时（2026-10-20 移除）。
      */
     if (xTaskCreatePinnedToCore(mesh_ota_cmd_task, "mesh_ota_cmd",
                                 LG_STACK_MESH_OTA, NULL, LG_PRIO_MESH_OTA,
@@ -826,11 +799,10 @@ esp_err_t mesh_ota_init(void)
     }
 
     s_initialized = true;
-    ESP_LOGI(TAG, "mesh_ota initialized: stagger=%us/level jitter<=%us retry=%ux@%us",
-             (unsigned)LG_MESH_OTA_LEVEL_STAGGER_SEC,
-             (unsigned)LG_MESH_OTA_STAGGER_JITTER_SEC,
+    ESP_LOGI(TAG, "mesh_ota initialized: retry=%ux@%us, restart_delay=%ums (server-controlled timing)",
              (unsigned)LG_MESH_OTA_RETRY_MAX,
-             (unsigned)LG_MESH_OTA_RETRY_INTERVAL_SEC);
+             (unsigned)LG_MESH_OTA_RETRY_INTERVAL_SEC,
+             (unsigned)LG_MESH_OTA_RESTART_DELAY_MS);
     return ESP_OK;
 #endif /* CONFIG_ESP_MESH_LITE_OTA_ENABLE */
 }

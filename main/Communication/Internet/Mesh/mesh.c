@@ -65,6 +65,15 @@
 #define MESH_PARENT_RETRY_COUNT        5
 #define MESH_RESCAN_INTERVAL_SEC       15
 
+/*
+ * 父节点满员拒绝快通道阈值（2026-10-20，用户决策）：
+ * 子节点连续 N 次因父满员类原因（见 is_parent_reject_reason）断开即经
+ * mesh_heal_reject_fast_path() 重启，不等 180s 无父 watchdog。按库重连
+ * 节奏（10s×5/15s 重扫），N=5 约 50~100s 触发。复用 watchdog 的 RTC
+ * 重启预算（MESH_RESTART_MAX_PER_CYCLE）防"根持续满员时无限重启"。
+ */
+#define MESH_PARENT_REJECT_RESTART_THRESHOLD 5
+
 /* 子节点健康监视周期：父丢失态 5s 一条（掉线属异常态），恢复后 60s 心跳。 */
 #define MESH_HEALTH_LOST_INTERVAL_MS 5000
 #define MESH_HEALTH_OK_INTERVAL_MS   60000
@@ -124,6 +133,13 @@ static RTC_NOINIT_ATTR atomic_uint_least32_t s_heal_restart_count;
 /* 最近一次 STA 断开原因：事件任务写、健康监视任务读。
  * atomic_uint 的 4 字节对齐访问在 Xtensa 上原子；仅用于诊断，不作为控制依据。 */
 static atomic_uint s_last_sta_disconnect_reason;
+
+/*
+ * 连续父满员拒绝计数：事件任务写（STA_DISCONNECTED 分支）、健康监视任务读
+ * （mesh_heal_reject_fast_path），__atomic_* RELAXED 同步。仅子节点累加
+ * （根无父概念，由 root_failover_task 管理）；GOT_IP 清零保证"连续"语义。
+ */
+static atomic_uint s_parent_reject_count;
 
 /* 只有 net_monitor 访问此标志；SDK 调用可产生新的断开事件，先标记再调用。
  * disconnect 返回失败时内部可能已暂停重连，仍须在有线失效时执行一次 connect。
@@ -235,6 +251,52 @@ static void mesh_heal_watchdog(bool online, TickType_t now)
 }
 
 /*
+ * 父满员拒绝快通道（2026-10-20）：与 mesh_heal_watchdog 并列的独立分支，
+ * 不改 watchdog 既有 L1/L2/L3 逻辑。连续 MESH_PARENT_REJECT_RESTART_THRESHOLD
+ * 次因父满员类原因（is_parent_reject_reason）断开即重启——比 watchdog 的
+ * 180s 无父软复位更快恢复「多节点同时上电撞满员父」现场。
+ *
+ * 复用 watchdog 的 RTC 重启预算（s_heal_restart_count /
+ * MESH_RESTART_MAX_PER_CYCLE）：根持续满员时重启也无济于事，预算耗尽后
+ * 清零计数并交回 watchdog L3（继续扫描、无上行存活），防疯循环。
+ *
+ * 调用上下文：仅子节点、仅由 mesh_health_task 串行调用（掉线态 5s 周期，
+ * 故重启最多延迟 5s 执行）；计数器 s_parent_reject_count 由事件任务累加、
+ * 本函数消费（__atomic_* RELAXED 同步）。
+ */
+static void mesh_heal_reject_fast_path(void)
+{
+    unsigned rejects = __atomic_load_n(&s_parent_reject_count, __ATOMIC_RELAXED);
+    if (rejects < MESH_PARENT_REJECT_RESTART_THRESHOLD) {
+        return;
+    }
+
+    /* 与 watchdog L2 同一 RTC 预算约束：跨重启延续，上电/Brownout 清零。 */
+    unsigned long restarts = __atomic_load_n(&s_heal_restart_count, __ATOMIC_RELAXED);
+    if (restarts >= MESH_RESTART_MAX_PER_CYCLE) {
+        /*
+         * 预算耗尽：清零计数避免本分支反复进入，交回 watchdog L3 的
+         * 限频日志 + 继续扫描策略。清零后需再累计满阈值才会再来，
+         * 不会刷屏。
+         */
+        __atomic_store_n(&s_parent_reject_count, 0, __ATOMIC_RELAXED);
+        ESP_LOGW(TAG,
+                 "Parent rejected %u times; restart budget exhausted (%lu/%u); "
+                 "keep scanning, no more restarts this power cycle",
+                 rejects, (unsigned long)restarts, (unsigned)MESH_RESTART_MAX_PER_CYCLE);
+        return;
+    }
+
+    __atomic_store_n(&s_heal_restart_count, (atomic_uint_least32_t)(restarts + 1), __ATOMIC_RELAXED);
+    ESP_LOGW(TAG,
+             "Parent rejected %u consecutive times (full/reject); restarting node (%lu/%u this power cycle)",
+             rejects, (unsigned long)(restarts + 1), (unsigned)MESH_RESTART_MAX_PER_CYCLE);
+    vTaskDelay(pdMS_TO_TICKS(MESH_HEAL_SOFT_RESET_GAP_MS)); /* 给日志落盘留时间 */
+    esp_restart();
+    /* 不会到达 */
+}
+
+/*
  * 子节点 mesh 健康监视（仅 IsRoot==0 创建）。
  * 常规职责：只读状态 + 打心跳日志（父丢失态 5s 一条、恢复后 60s 一条），
  * 为「根掉线时子节点必须存活」提供现场证据（CHILD_NODE_ROOT_LOSS_DESIGN.md
@@ -270,6 +332,13 @@ static void mesh_health_task(void *arg)
 
         /* 无父自愈：分级 escalate（软复位 → 重启 → 放弃），只看父链路。 */
         mesh_heal_watchdog(online, now);
+
+        /*
+         * 父满员拒绝快通道：连续被父满员拒绝达阈值即重启（复用 RTC 预算），
+         * 与 watchdog 并列——两者都只看父链路，触发条件互不重叠
+         * （watchdog 管"无父超时"，快通道管"连续被拒"）。
+         */
+        mesh_heal_reject_fast_path();
 
         /* 按当前态周期休眠：在线时 60s 一轮，无需每 5s 空转唤醒。 */
         vTaskDelay(pdMS_TO_TICKS(interval_ms));
@@ -337,6 +406,28 @@ static void sntp_sync_task(void *arg)
     vTaskDelete(NULL);
 }
 
+/*
+ * 父节点满员拒绝类断开原因（ESP Wi-Fi reason code，esp_wifi_types.h）：
+ *   2  AUTH_EXPIRE   认证阶段 AP 无响应——满员 SoftAP 忽略 auth 的典型表现
+ *   4  ASSOC_EXPIRE  关联阶段超时
+ *   5  ASSOC_TOOMANY AP 关联数已满（iot_bridge "max connection" 现场特征）
+ *   6  NOT_AUTHED    未认证即尝试关联被拒
+ * 仅子节点使用（根无父概念）。现场实测若命中其他 reason，按串口
+ * "STA disconnected, reason=N" 日志扩展本集合。
+ */
+static bool is_parent_reject_reason(uint8_t reason)
+{
+    switch (reason) {
+    case 2:
+    case 4:
+    case 5:
+    case 6:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static void network_event_handler(void *arg, esp_event_base_t base,
                                   int32_t event_id, void *event_data)
 {
@@ -354,6 +445,11 @@ static void network_event_handler(void *arg, esp_event_base_t base,
          */
         mesh_update_network_flag(true);
         s_failover_attempts = 0;
+        /*
+         * 成功拿到 IP：清零连续满员拒绝计数，保证"连续被拒"语义
+         * （中间成功过即重新累计，见 mesh_heal_reject_fast_path）。
+         */
+        __atomic_store_n(&s_parent_reject_count, 0, __ATOMIC_RELAXED);
         ESP_LOGI(TAG, "STA IP " IPSTR ", level=%u, role=%s",
                  IP2STR(&event->ip_info.ip), esp_mesh_lite_get_level(),
                  IsRoot ? "root" : "node");
@@ -383,6 +479,22 @@ static void network_event_handler(void *arg, esp_event_base_t base,
             }
             ESP_LOGW(TAG, "STA disconnected, reason=%u, ssid=%.*s; local Mesh-Lite remains active",
                      (unsigned)disc->reason, (int)print_len, (const char *)disc->ssid);
+
+            /*
+             * 父满员拒绝计数（仅子节点；根连路由器无父概念）。累计值由
+             * mesh_health_task 的 mesh_heal_reject_fast_path 消费（达阈值
+             * MESH_PARENT_REJECT_RESTART_THRESHOLD 重启）。非拒绝类断开
+             * （库正常换父/重扫等）不计数，避免误触。
+             * 事件上下文仅一次原子加与比较，无阻塞。
+             */
+            if (IsRoot != 1 && is_parent_reject_reason((uint8_t)disc->reason)) {
+                unsigned rejects = __atomic_fetch_add(&s_parent_reject_count, 1, __ATOMIC_RELAXED) + 1;
+                if (rejects < MESH_PARENT_REJECT_RESTART_THRESHOLD) {
+                    ESP_LOGW(TAG, "Parent rejected (reason=%u), consecutive=%u/%u; waiting",
+                             (unsigned)disc->reason, rejects,
+                             (unsigned)MESH_PARENT_REJECT_RESTART_THRESHOLD);
+                }
+            }
         } else {
             ESP_LOGW(TAG, "STA uplink lost; local Mesh-Lite remains active");
         }

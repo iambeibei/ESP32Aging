@@ -60,6 +60,16 @@
  * 使用点与同步阻塞说明见 start_aging_with_ready_pn()。
  */
 #define LG_AGING_START_STAGGER_BASE_SEC 2
+
+/*
+ * AgingDeviceCheck 状态（老化设备连接/通信检查）最大尝试次数。
+ * 每轮 = 一轮完整 BLE 扫描（10s）+ 连接 + GATT 设置 + 通信检查，
+ * 任一环节失败计一次；达本次数仍失败 → agingError + 终止老化任务。
+ * 2026-10-20 由 6 次（FailCount > 5）上调为 15 次（用户决策）：
+ * 现场 DUT 上电晚/被占用时连接建立失败需多轮重试，且每轮失败后有
+ * 3s 退避（appTask.c AgingDeviceCheck 蓝牙分支）。
+ */
+#define AGING_DEVICE_CHECK_MAX_ATTEMPTS 15
 #define LG_GETPROTO_TIMEOUT_MS 10000
 
 #define NVS_KEY_CURRENT_PN "bt_name"
@@ -4314,7 +4324,11 @@ void Aging_Test_Task(void *arg)
                 return;
             }
 
-            if (FailCount > 5)
+            /*
+             * 老化设备连接/通信检查尝试上限（BLE 路径含每轮扫描+连接+GATT+通信
+             * 检查）。FailCount 每轮 ++，故 >= MAX 即"已尝试满 MAX 次仍失败"。
+             */
+            if (FailCount >= AGING_DEVICE_CHECK_MAX_ATTEMPTS)
             {
                 aging_error_log("Aging-device connection or communication check failed after %u attempts, communication=%s",
                                 (unsigned)FailCount,
