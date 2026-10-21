@@ -66,13 +66,25 @@
 #define MESH_RESCAN_INTERVAL_SEC       15
 
 /*
- * 父节点满员拒绝快通道阈值（2026-10-20，用户决策）：
- * 子节点连续 N 次因父满员类原因（见 is_parent_reject_reason）断开即经
- * mesh_heal_reject_fast_path() 重启，不等 180s 无父 watchdog。按库重连
- * 节奏（10s×5/15s 重扫），N=5 约 50~100s 触发。复用 watchdog 的 RTC
- * 重启预算（MESH_RESTART_MAX_PER_CYCLE）防"根持续满员时无限重启"。
+ * 父节点连接失败快通道阈值（2026-10-20 新增，2026-10-21 去掉 reason 过滤）：
+ * 连续 N 次与父节点的连接失败即经 mesh_heal_connect_fail_fast_path() 重启，
+ * 不等 180s 无父 watchdog。按库重连节奏（10s×5/15s 重扫），N=5 约 50~100s
+ * 触发。复用 watchdog 的 RTC 重启预算（MESH_RESTART_MAX_PER_CYCLE）防
+ * "父持续满载时无限重启"。
+ *
+ * 为什么去掉 reason 过滤（2026-10-21，现场反馈"一直重连不重启"）：满员父的
+ * deauth reason 由 iot_bridge SoftAP + WiFi 栈发出，实测值不可预先枚举
+ * （初版集合 {2,4,5,6} 曾漏掉现场实际码导致计数不累加）；且正常换父成功会
+ * 经 GOT_IP 稳定在线后清零，误伤可控，故任何断开都计数。
  */
-#define MESH_PARENT_REJECT_RESTART_THRESHOLD 5
+#define MESH_PARENT_FAIL_RESTART_THRESHOLD 5
+
+/*
+ * "稳定在线"判定窗：距上次 GOT_IP 达到该时长才算真正恢复，连接失败计数
+ * 重新从 1 计；窗口内的"连上秒级又被踢"不清零、继续累计——防止满员父
+ * 短暂放行再挤掉的循环永远凑不满阈值（2026-10-21 现场反馈的嫌疑 2）。
+ */
+#define MESH_PARENT_STABLE_ONLINE_MS 10000
 
 /* 子节点健康监视周期：父丢失态 5s 一条（掉线属异常态），恢复后 60s 心跳。 */
 #define MESH_HEALTH_LOST_INTERVAL_MS 5000
@@ -135,11 +147,19 @@ static RTC_NOINIT_ATTR atomic_uint_least32_t s_heal_restart_count;
 static atomic_uint s_last_sta_disconnect_reason;
 
 /*
- * 连续父满员拒绝计数：事件任务写（STA_DISCONNECTED 分支）、健康监视任务读
- * （mesh_heal_reject_fast_path），__atomic_* RELAXED 同步。仅子节点累加
- * （根无父概念，由 root_failover_task 管理）；GOT_IP 清零保证"连续"语义。
+ * 连续父节点连接失败计数：事件任务写（STA_DISCONNECTED/LOST_IP 分支）、
+ * 健康监视任务读（mesh_heal_connect_fail_fast_path），__atomic_* RELAXED
+ * 同步。仅子节点累加（根连路由器无父概念，由 root_failover_task 管理）。
+ * 清零规则见 note_parent_connect_failure() 的"稳定在线"判定。
  */
-static atomic_uint s_parent_reject_count;
+static atomic_uint s_parent_fail_count;
+
+/*
+ * 最近一次 GOT_IP 的 tick：仅事件任务访问（GOT_IP 写、断开分支读，默认
+ * 事件循环单任务串行，无需原子），用于"稳定在线"判定——
+ * 秒级连踢不清零计数，稳定后才算真正恢复。
+ */
+static TickType_t s_last_got_ip_tick;
 
 /* 只有 net_monitor 访问此标志；SDK 调用可产生新的断开事件，先标记再调用。
  * disconnect 返回失败时内部可能已暂停重连，仍须在有线失效时执行一次 connect。
@@ -251,23 +271,28 @@ static void mesh_heal_watchdog(bool online, TickType_t now)
 }
 
 /*
- * 父满员拒绝快通道（2026-10-20）：与 mesh_heal_watchdog 并列的独立分支，
- * 不改 watchdog 既有 L1/L2/L3 逻辑。连续 MESH_PARENT_REJECT_RESTART_THRESHOLD
- * 次因父满员类原因（is_parent_reject_reason）断开即重启——比 watchdog 的
- * 180s 无父软复位更快恢复「多节点同时上电撞满员父」现场。
+ * 父节点连接失败快通道（2026-10-20 新增，2026-10-21 重构去掉 reason 过滤）：
+ * 与 mesh_heal_watchdog 并列的独立分支，不改 watchdog 既有 L1/L2/L3 逻辑。
+ * 连续 MESH_PARENT_FAIL_RESTART_THRESHOLD 次连接失败即重启——比 watchdog
+ * 的 180s 无父软复位更快恢复「多节点同时上电撞满员父」现场（现场反馈
+ * "一直重连不重启"：初版 reason 过滤漏掉实际断开码，已改为任何断开都计数，
+ * 并以稳定在线窗防"连上秒级被踢"的计数清零循环）。
+ *
+ * 重启语义是"重新选父"而非"重试"：重启后库走 fresh 扫描、绕开 RTC 原父
+ * 偏好，有机会选到非满载的替代父。
  *
  * 复用 watchdog 的 RTC 重启预算（s_heal_restart_count /
- * MESH_RESTART_MAX_PER_CYCLE）：根持续满员时重启也无济于事，预算耗尽后
+ * MESH_RESTART_MAX_PER_CYCLE）：父持续满载时重启也无济于事，预算耗尽后
  * 清零计数并交回 watchdog L3（继续扫描、无上行存活），防疯循环。
  *
  * 调用上下文：仅子节点、仅由 mesh_health_task 串行调用（掉线态 5s 周期，
- * 故重启最多延迟 5s 执行）；计数器 s_parent_reject_count 由事件任务累加、
+ * 故重启最多延迟 5s 执行）；计数器 s_parent_fail_count 由事件任务累加、
  * 本函数消费（__atomic_* RELAXED 同步）。
  */
-static void mesh_heal_reject_fast_path(void)
+static void mesh_heal_connect_fail_fast_path(void)
 {
-    unsigned rejects = __atomic_load_n(&s_parent_reject_count, __ATOMIC_RELAXED);
-    if (rejects < MESH_PARENT_REJECT_RESTART_THRESHOLD) {
+    unsigned fails = __atomic_load_n(&s_parent_fail_count, __ATOMIC_RELAXED);
+    if (fails < MESH_PARENT_FAIL_RESTART_THRESHOLD) {
         return;
     }
 
@@ -279,18 +304,18 @@ static void mesh_heal_reject_fast_path(void)
          * 限频日志 + 继续扫描策略。清零后需再累计满阈值才会再来，
          * 不会刷屏。
          */
-        __atomic_store_n(&s_parent_reject_count, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&s_parent_fail_count, 0, __ATOMIC_RELAXED);
         ESP_LOGW(TAG,
-                 "Parent rejected %u times; restart budget exhausted (%lu/%u); "
+                 "Parent connection failed %u times; restart budget exhausted (%lu/%u); "
                  "keep scanning, no more restarts this power cycle",
-                 rejects, (unsigned long)restarts, (unsigned)MESH_RESTART_MAX_PER_CYCLE);
+                 fails, (unsigned long)restarts, (unsigned)MESH_RESTART_MAX_PER_CYCLE);
         return;
     }
 
     __atomic_store_n(&s_heal_restart_count, (atomic_uint_least32_t)(restarts + 1), __ATOMIC_RELAXED);
     ESP_LOGW(TAG,
-             "Parent rejected %u consecutive times (full/reject); restarting node (%lu/%u this power cycle)",
-             rejects, (unsigned long)(restarts + 1), (unsigned)MESH_RESTART_MAX_PER_CYCLE);
+             "Parent connection failed %u consecutive times; restarting node (%lu/%u this power cycle)",
+             fails, (unsigned long)(restarts + 1), (unsigned)MESH_RESTART_MAX_PER_CYCLE);
     vTaskDelay(pdMS_TO_TICKS(MESH_HEAL_SOFT_RESET_GAP_MS)); /* 给日志落盘留时间 */
     esp_restart();
     /* 不会到达 */
@@ -334,11 +359,11 @@ static void mesh_health_task(void *arg)
         mesh_heal_watchdog(online, now);
 
         /*
-         * 父满员拒绝快通道：连续被父满员拒绝达阈值即重启（复用 RTC 预算），
-         * 与 watchdog 并列——两者都只看父链路，触发条件互不重叠
-         * （watchdog 管"无父超时"，快通道管"连续被拒"）。
+         * 父连接失败快通道：连续连接失败达阈值即重启（复用 RTC 预算，
+         * 重启=重新选父），与 watchdog 并列——两者都只看父链路，触发条件
+         * 互不重叠（watchdog 管"无父超时"，快通道管"连续连接失败"）。
          */
-        mesh_heal_reject_fast_path();
+        mesh_heal_connect_fail_fast_path();
 
         /* 按当前态周期休眠：在线时 60s 一轮，无需每 5s 空转唤醒。 */
         vTaskDelay(pdMS_TO_TICKS(interval_ms));
@@ -407,24 +432,36 @@ static void sntp_sync_task(void *arg)
 }
 
 /*
- * 父节点满员拒绝类断开原因（ESP Wi-Fi reason code，esp_wifi_types.h）：
- *   2  AUTH_EXPIRE   认证阶段 AP 无响应——满员 SoftAP 忽略 auth 的典型表现
- *   4  ASSOC_EXPIRE  关联阶段超时
- *   5  ASSOC_TOOMANY AP 关联数已满（iot_bridge "max connection" 现场特征）
- *   6  NOT_AUTHED    未认证即尝试关联被拒
- * 仅子节点使用（根无父概念）。现场实测若命中其他 reason，按串口
- * "STA disconnected, reason=N" 日志扩展本集合。
+ * 记录一次父节点连接失败（2026-10-20 新增，2026-10-21 重构）：
+ * 任何 STA 断开/LOST_IP 都计数（去掉初版 reason 过滤的原因见
+ * MESH_PARENT_FAIL_RESTART_THRESHOLD 注释）；"稳定在线"判定——
+ * 距上次 GOT_IP >= MESH_PARENT_STABLE_ONLINE_MS 算真正恢复、计数从 1 重新
+ * 开始，否则（秒级"连上又被踢"）继续累计，由 mesh_health_task 的
+ * mesh_heal_connect_fail_fast_path 消费（达阈值重启=重新选父）。
+ *
+ * 调用上下文：默认事件循环任务（network_event_handler），与 GOT_IP 写
+ * s_last_got_ip_tick 串行；仅子节点计数（根无父概念）。
  */
-static bool is_parent_reject_reason(uint8_t reason)
+static void note_parent_connect_failure(void)
 {
-    switch (reason) {
-    case 2:
-    case 4:
-    case 5:
-    case 6:
-        return true;
-    default:
-        return false;
+    if (IsRoot == 1) {
+        return;
+    }
+
+    TickType_t now_tick = xTaskGetTickCount();
+    bool stable_before = (s_last_got_ip_tick != 0) &&
+                         ((now_tick - s_last_got_ip_tick) >= pdMS_TO_TICKS(MESH_PARENT_STABLE_ONLINE_MS));
+
+    unsigned prev_fails = __atomic_load_n(&s_parent_fail_count, __ATOMIC_RELAXED);
+    unsigned fails = stable_before ? 1u : (prev_fails + 1u);
+    __atomic_store_n(&s_parent_fail_count, fails, __ATOMIC_RELAXED);
+
+    if (fails < MESH_PARENT_FAIL_RESTART_THRESHOLD) {
+        ESP_LOGW(TAG,
+                 "Parent connection failed (reason=%u), consecutive=%u/%u",
+                 (unsigned)__atomic_load_n(&s_last_sta_disconnect_reason, __ATOMIC_RELAXED),
+                 fails,
+                 (unsigned)MESH_PARENT_FAIL_RESTART_THRESHOLD);
     }
 }
 
@@ -446,10 +483,12 @@ static void network_event_handler(void *arg, esp_event_base_t base,
         mesh_update_network_flag(true);
         s_failover_attempts = 0;
         /*
-         * 成功拿到 IP：清零连续满员拒绝计数，保证"连续被拒"语义
-         * （中间成功过即重新累计，见 mesh_heal_reject_fast_path）。
+         * 成功拿到 IP：清零连续连接失败计数，并记录"稳定在线"起点。
+         * 距本次 GOT_IP 不足 MESH_PARENT_STABLE_ONLINE_MS 的再次断开不清零
+         * （秒级连踢继续累计），见 note_parent_connect_failure()。
          */
-        __atomic_store_n(&s_parent_reject_count, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&s_parent_fail_count, 0, __ATOMIC_RELAXED);
+        s_last_got_ip_tick = xTaskGetTickCount();
         ESP_LOGI(TAG, "STA IP " IPSTR ", level=%u, role=%s",
                  IP2STR(&event->ip_info.ip), esp_mesh_lite_get_level(),
                  IsRoot ? "root" : "node");
@@ -481,22 +520,15 @@ static void network_event_handler(void *arg, esp_event_base_t base,
                      (unsigned)disc->reason, (int)print_len, (const char *)disc->ssid);
 
             /*
-             * 父满员拒绝计数（仅子节点；根连路由器无父概念）。累计值由
-             * mesh_health_task 的 mesh_heal_reject_fast_path 消费（达阈值
-             * MESH_PARENT_REJECT_RESTART_THRESHOLD 重启）。非拒绝类断开
-             * （库正常换父/重扫等）不计数，避免误触。
-             * 事件上下文仅一次原子加与比较，无阻塞。
+             * 父节点连接失败计数（仅子节点；根连路由器无父概念）。任何断开
+             * 都计数（去掉 reason 过滤的依据见 MESH_PARENT_FAIL_RESTART_THRESHOLD
+             * 注释）；稳定在线判定与消费方见 note_parent_connect_failure()。
              */
-            if (IsRoot != 1 && is_parent_reject_reason((uint8_t)disc->reason)) {
-                unsigned rejects = __atomic_fetch_add(&s_parent_reject_count, 1, __ATOMIC_RELAXED) + 1;
-                if (rejects < MESH_PARENT_REJECT_RESTART_THRESHOLD) {
-                    ESP_LOGW(TAG, "Parent rejected (reason=%u), consecutive=%u/%u; waiting",
-                             (unsigned)disc->reason, rejects,
-                             (unsigned)MESH_PARENT_REJECT_RESTART_THRESHOLD);
-                }
-            }
+            note_parent_connect_failure();
         } else {
             ESP_LOGW(TAG, "STA uplink lost; local Mesh-Lite remains active");
+            /* 曾有 IP 又丢失同样计一次连接失败（秒级连踢场景的主要来源）。 */
+            note_parent_connect_failure();
         }
     }
 }

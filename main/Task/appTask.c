@@ -70,6 +70,14 @@
  * 3s 退避（appTask.c AgingDeviceCheck 蓝牙分支）。
  */
 #define AGING_DEVICE_CHECK_MAX_ATTEMPTS 15
+
+/*
+ * PN 门拒绝（reject_start_aging_missing_pn）同因上报的最小间隔。
+ * 服务器重试/批量重复下发 start_aging 时，每条拒绝的 event/state 与本地
+ * 日志经 mesh 上行的共振曾导致链路瞬断（23 节点 50ms 间隔批量下发现场）；
+ * reply（cmd/reply/point 协议契约）与串口日志不受限，仅状态/日志限频。
+ */
+#define LG_REJECT_REPORT_MIN_INTERVAL_MS 10000
 #define LG_GETPROTO_TIMEOUT_MS 10000
 
 #define NVS_KEY_CURRENT_PN "bt_name"
@@ -80,6 +88,7 @@
 #define NVS_KEY_START_SEQ "start_seq"
 #define NVS_KEY_DEVICE_NUMBER "device_number"
 #define NVS_KEY_SAFE_CODE "safe_code"
+#define NVS_KEY_SQLITE_RESET "sqlite_reset_flag"
 
 // 型号直接代码写死,现在待定
 const char DEVICE_TYPE[12] = "Point";
@@ -2436,9 +2445,23 @@ static void reject_start_aging_missing_pn(int start_seq)
     device_response_publish_point(start_seq, 0, AGING_START_REPLY_NO_PN);
     ESP_LOGW(TAG, "start_aging rejected: PN is not set, seq=%d", start_seq);
 
-    aging_state_publish("agingError");
-
-    aging_error_log("Start aging rejected: PN is not set, please send set_pn first, cmd_seq=%d", start_seq);
+    /*
+     * 同因拒绝的 MQTT 状态与本地日志限频（2026-10-21）：reply 是协议契约
+     * （服务器按 Seq 等应答），串口日志零射频成本，两者每条保留；仅
+     * aging_state_publish/aging_error_log 受 10s 窗口约束，防止服务器
+     * 重试时"每节点 2 条 publish"经 mesh 上行共振放大导致链路瞬断。
+     * 首条必发（s_last_reject_report_tick==0 判据），单次拒绝行为不变。
+     * 调用上下文：mqtt_rx 任务，静态 tick 单写者，无需同步。
+     */
+    static TickType_t s_last_reject_report_tick = 0;
+    TickType_t now_tick = xTaskGetTickCount();
+    if (s_last_reject_report_tick == 0 ||
+        (now_tick - s_last_reject_report_tick) >= pdMS_TO_TICKS(LG_REJECT_REPORT_MIN_INTERVAL_MS))
+    {
+        s_last_reject_report_tick = now_tick;
+        aging_state_publish("agingError");
+        aging_error_log("Start aging rejected: PN is not set, please send set_pn first, cmd_seq=%d", start_seq);
+    }
 }
 
 /*
@@ -2576,6 +2599,46 @@ static bool start_aging_with_ready_pn(const char *aging_json, int start_seq)
     return true;
 }
 
+/*
+ * MQTT 命令 Seq 去重（2026-10-21）：
+ * 服务器重试（未收到 reply）或重复下发会产生相同 Seq 的命令，直接忽略，
+ * 防止重复执行业务（如重复 start_aging 会重复消耗 PN/创建老化任务）。
+ *
+ * 环形记录最近 MQTT_SEQ_DEDUP_CAPACITY 个已处理 Seq；正常命令流 Seq 单调
+ * （时间戳/计数器）不会在容量内重访，仅重试会命中。命中后静默忽略——不回
+ * reply、不上 MQTT、不执行业务；服务器未收 ack 的后续同 Seq 重试同样被
+ * 收敛，直至服务器侧放弃。
+ *
+ * 同步：仅由 mqtt_rx 任务经 parse_jsonCommand_MQTT 单线调用（单写者），
+ * 无需同步原语。s_mqtt_seq_history_count 使未写位置不参与比较，避免
+ * Seq=0 与静态零初始化误撞。
+ */
+#define MQTT_SEQ_DEDUP_CAPACITY 16
+static int s_mqtt_seq_history[MQTT_SEQ_DEDUP_CAPACITY];
+static size_t s_mqtt_seq_history_count;
+static size_t s_mqtt_seq_next;
+
+static bool mqtt_seq_is_duplicate(int seq)
+{
+    for (size_t i = 0; i < s_mqtt_seq_history_count; ++i) {
+        if (s_mqtt_seq_history[i] == seq) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void mqtt_seq_record(int seq)
+{
+    if (s_mqtt_seq_history_count < MQTT_SEQ_DEDUP_CAPACITY) {
+        s_mqtt_seq_history[s_mqtt_seq_history_count++] = seq;
+        return;
+    }
+    /* 满员后环形覆盖最旧条目。 */
+    s_mqtt_seq_history[s_mqtt_seq_next] = seq;
+    s_mqtt_seq_next = (s_mqtt_seq_next + 1) % MQTT_SEQ_DEDUP_CAPACITY;
+}
+
 // Json数据解析
 // 不带crc
 
@@ -2605,6 +2668,19 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
         int len1 = app_read_MQTT_topic(TopicBuf, MQTT_TOPIC_LEN, portMAX_DELAY);
         if (len1 > 0)
         {
+            /*
+             * Seq 去重（2026-10-21）：命中已处理过的 Seq 直接忽略。
+             * 位置约束：必须在 app_read_MQTT_topic 之后——topic 队列是 FIFO，
+             * 不取出会与后续命令错位；取出后命中即走 cleanup（已解析的
+             * packet_copy/pRoot 由 cleanup 统一释放）。
+             */
+            if (mqtt_seq_is_duplicate(Seq->valueint)) {
+                ESP_LOGW(TAG, "Duplicate MQTT command seq=%d ignored, topic=%.*s",
+                         Seq->valueint, len1, TopicBuf);
+                goto cleanup;
+            }
+            mqtt_seq_record(Seq->valueint);
+
             if (strstr(TopicBuf, "ota"))
             {
                 // 处理OTA升级（Mesh-Lite 原生分发适配层入口，非阻塞）
@@ -3119,6 +3195,32 @@ void Init_ByNetwork_Flag(void *arg)
                 storage_write_record_cyclic(current_log_pn(), "Failed to create MQTT receive task");
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 continue;
+            }
+
+            /*
+             * SQLite 重置延迟上报：SqLite_Init 远早于 MQTT 建立，重置结果
+             * （sqlite_mount_fail/db_rebuilt/rebuild_fail）写入了 NVS 标志。
+             * 此处 MQTT 已就绪，读取并上报后清除——保证"缓存已丢"对服务器
+             * 可见（断网补发契约：服务器需知晓该节点存在补发缺口）。
+             * 上报失败则保留标志，下次重启重报，不静默丢弃。
+             */
+            char sqlite_reset_flag[32] = {0};
+            if (SelfRecovery_Read_str(NVS_KEY_SQLITE_RESET, sqlite_reset_flag,
+                                      sizeof(sqlite_reset_flag)) == ESP_OK &&
+                sqlite_reset_flag[0] != '\0')
+            {
+                char warn_msg[96] = {0};
+                (void)snprintf(warn_msg, sizeof(warn_msg), "SQLite cache reset: %s, ts=%lld",
+                               sqlite_reset_flag, (long long)time(NULL));
+                if (app_mqtt_publish("device/%s/event/warn", warn_msg, DEVICE_ID) < 0)
+                {
+                    storage_write_record_cyclic(current_log_pn(), "SQLite reset warn publish failed");
+                }
+                else
+                {
+                    SelfRecovery_Write_str(NVS_KEY_SQLITE_RESET, "");
+                }
+                ESP_LOGW(TAG, "SQLite reset reported: %s", warn_msg);
             }
 
             if (IsRoot == 1)

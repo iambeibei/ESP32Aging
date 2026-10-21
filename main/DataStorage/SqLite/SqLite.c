@@ -21,13 +21,37 @@
 #include "SqLite.h"
 #include "app_mem.h"
 #include "sqllib1.h"
+#include "SelfRecovery.h"
 
 static const char *TAG = "SQLITE";
+
+/*
+ * mount 偶发失败重试：吸收 flash 读取延迟、wear-levelling 句柄竞争等
+ * 瞬时失败。仅覆盖 mount 阶段——DB 文件级损坏是持久性的，重试无意义，
+ * 直接进入重建流程（见 SqLite_Init）。
+ */
+#define SQLITE_MOUNT_RETRY_COUNT        3
+#define SQLITE_MOUNT_RETRY_INTERVAL_MS  2000
+
+/* 重置结果 NVS 标志值（SqLite_Init 写、Init_ByNetwork_Flag 读后上报并清除）。
+ * key 字符串必须与 appTask.c 的 NVS_KEY_SQLITE_RESET 一致。 */
+#define NVS_KEY_SQLITE_RESET "sqlite_reset_flag"
+
+#define SQLITE_RESET_FLAG_MOUNT_FAIL   "sqlite_mount_fail"
+#define SQLITE_RESET_FLAG_DB_REBUILT   "sqlite_db_rebuilt"
+#define SQLITE_RESET_FLAG_REBUILD_FAIL "sqlite_rebuild_fail"
 
 static wl_handle_t s_wl_handle = WL_INVALID_HANDLE;
 static SemaphoreHandle_t s_sqlite_mutex = NULL;
 static sqlite3 *s_db = NULL;
 static bool s_db_ready = false;
+
+/*
+ * 每上电重置守卫：mount 重建分区与 DB 重建各只允许一次，防止"重置后再次
+ * 失败→再重置"的循环（分区硬件级损坏时重启也无济于事，保持禁用更诚实）。
+ * SqLite_Init 在 app_task_init 早期只被调用一次，本标志为防御性约束。
+ */
+static bool s_reset_done_this_boot = false;
 
 char db1_name[96];
 QueryResult *g_db1_result=NULL;
@@ -394,6 +418,43 @@ void unmount_fatfs_storage(void)
     }
 
     sqlite_unlock();
+}
+
+/*
+ * 强制重建分区（format_if_mount_failed=true）。
+ *
+ * 仅由 SqLite_Init 在 mount 重试耗尽后调用一次（每上电守卫保证）。
+ * 语义：放弃"非空分区绝不格式化"的保护哲学——mount 持续失败说明文件
+ * 系统级损坏、数据已不可读，保留分区只会让节点永久禁用 SQLite，
+ * 丢失后续全部老化记录。用户明确决策接受该损失以恢复存储能力。
+ *
+ * 调用上下文：SqLite_Init（app_task_init 早期，任务上下文），不可重入。
+ */
+static esp_err_t mount_fatfs_storage_reset(void)
+{
+    esp_vfs_fat_mount_config_t reset_config = {
+        .format_if_mount_failed = true,
+        .max_files = 8,
+        .allocation_unit_size = 4096,
+    };
+
+    esp_err_t ret = esp_vfs_fat_spiflash_mount_rw_wl(
+        FATFS_BASE_PATH,
+        FATFS_PARTITION_LABEL,
+        &reset_config,
+        &s_wl_handle);
+
+    if (ret != ESP_OK)
+    {
+        s_wl_handle = WL_INVALID_HANDLE;
+        ESP_LOGE(TAG, "FATFS reset mount (format) failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_LOGW(TAG,
+             "FATFS partition was reformatted after persistent mount failure; "
+             "all previous cache records are lost");
+    return ESP_OK;
 }
 
 void print_fatfs_usage(void)
@@ -2050,6 +2111,22 @@ int InsertJsonRecord(int seq_no, const char *pn, bool pushed, const char *json_d
 /* 初始化入口                                                                   */
 /* -------------------------------------------------------------------------- */
 
+/*
+ * 重置结果写 NVS 标志。
+ * SqLite_Init 远早于 MQTT 建立（app_task_init 早期），此处 publish 必然失败，
+ * 故由 Init_ByNetwork_Flag 在网络就绪后读取本标志经 event/warn 上报并清除，
+ * 保证"缓存已丢"对服务器可见（断网补发契约不被打断）。
+ */
+static void sqlite_write_reset_flag(const char *flag)
+{
+    esp_err_t ret = SelfRecovery_Write_str(NVS_KEY_SQLITE_RESET, flag);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to persist SQLite reset flag '%s': %s",
+                 flag, esp_err_to_name(ret));
+    }
+}
+
 void SqLite_Init(void)
 {
     ESP_LOGI(TAG, "Initializing SqLite");
@@ -2064,10 +2141,50 @@ void SqLite_Init(void)
         }
     }
 
-    esp_err_t ret = mount_fatfs_storage();
-    if (ret != ESP_OK)
+    /*
+     * 阶段 1：mount，带偶发失败重试。正常路径第一次即成功，行为与历史一致。
+     */
+    esp_err_t ret = ESP_FAIL;
+    for (int attempt = 1; attempt <= SQLITE_MOUNT_RETRY_COUNT; ++attempt)
     {
-        ESP_LOGE(TAG, "FATFS mount failed; SQLite is disabled to preserve existing data");
+        ret = mount_fatfs_storage();
+        if (ret == ESP_OK)
+        {
+            break;
+        }
+        ESP_LOGW(TAG, "FATFS mount attempt %d/%d failed: %s",
+                 attempt, SQLITE_MOUNT_RETRY_COUNT, esp_err_to_name(ret));
+        if (attempt < SQLITE_MOUNT_RETRY_COUNT)
+        {
+            vTaskDelay(pdMS_TO_TICKS(SQLITE_MOUNT_RETRY_INTERVAL_MS));
+        }
+    }
+
+    /*
+     * 阶段 2a：mount 持续失败 → 文件系统级损坏，数据已不可读。
+     * 用户决策：格式化重建分区恢复存储能力（覆盖"非空绝不格式化"哲学，
+     * 依据见 mount_fatfs_storage_reset 注释），每上电仅一次。
+     */
+    if (ret != ESP_OK && !s_reset_done_this_boot)
+    {
+        s_reset_done_this_boot = true;
+        ESP_LOGW(TAG,
+                 "FATFS mount failed %d times; reformatting partition as last resort "
+                 "(SQLite cache rebuild, user-approved)",
+                 SQLITE_MOUNT_RETRY_COUNT);
+        ret = mount_fatfs_storage_reset();
+        if (ret != ESP_OK)
+        {
+            sqlite_write_reset_flag(SQLITE_RESET_FLAG_MOUNT_FAIL);
+            ESP_LOGE(TAG, "FATFS reset mount failed; SQLite is disabled this boot");
+            return;
+        }
+    }
+    else if (ret != ESP_OK)
+    {
+        /* 守卫已消耗（本次上电已重建过仍失败）：保持禁用，不再重置。 */
+        sqlite_write_reset_flag(SQLITE_RESET_FLAG_MOUNT_FAIL);
+        ESP_LOGE(TAG, "FATFS mount failed and reset already used this boot; SQLite is disabled");
         return;
     }
 
@@ -2082,6 +2199,61 @@ void SqLite_Init(void)
 
     int rc = init_database_locked();
     sqlite_unlock();
+
+    /*
+     * 阶段 2b：DB 文件级损坏（quick_check/schema/后校验失败）。
+     * rename 留档 .corrupt 后重建空库——文件系统完好时不动分区，最小化
+     * 破坏面；.corrupt 供事后取数（人工维修时清理）。
+     * journal/wal/shm 一并清理：防止新库打开时回滚旧 hot journal。
+     */
+    if (rc != SQLITE_OK && !s_reset_done_this_boot)
+    {
+        s_reset_done_this_boot = true;
+        ESP_LOGW(TAG,
+                 "SQLite init failed (rc=%d); rebuilding database from scratch "
+                 "(unpushed cache records are lost)", rc);
+
+        char corrupt_path[128];
+        int n = snprintf(corrupt_path, sizeof(corrupt_path), "%s.corrupt", DB_FILE_PATH);
+        if (n > 0 && n < (int)sizeof(corrupt_path))
+        {
+            if (rename(DB_FILE_PATH, corrupt_path) != 0)
+            {
+                ESP_LOGW(TAG, "rename to .corrupt failed (errno=%d); removing damaged file", errno);
+                (void)unlink(DB_FILE_PATH);
+            }
+            else
+            {
+                ESP_LOGW(TAG, "Damaged database preserved as %s", corrupt_path);
+            }
+        }
+        else
+        {
+            ESP_LOGW(TAG, "Corrupt path too long; removing damaged database file");
+            (void)unlink(DB_FILE_PATH);
+        }
+        (void)unlink(DB_FILE_PATH "-journal");
+        (void)unlink(DB_FILE_PATH "-wal");
+        (void)unlink(DB_FILE_PATH "-shm");
+
+        if (!sqlite_lock())
+        {
+            sqlite_write_reset_flag(SQLITE_RESET_FLAG_REBUILD_FAIL);
+            return;
+        }
+        rc = init_database_locked();
+        sqlite_unlock();
+
+        if (rc == SQLITE_OK)
+        {
+            sqlite_write_reset_flag(SQLITE_RESET_FLAG_DB_REBUILT);
+            ESP_LOGW(TAG, "SQLite database rebuilt empty; pending restart records were lost");
+        }
+        else
+        {
+            sqlite_write_reset_flag(SQLITE_RESET_FLAG_REBUILD_FAIL);
+        }
+    }
 
     if (rc != SQLITE_OK)
     {
