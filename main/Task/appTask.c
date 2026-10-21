@@ -4,6 +4,7 @@
 #include <stdatomic.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_err.h"
@@ -54,10 +55,11 @@
 /*
  * 老化启动 mesh 层级错峰基数（秒）。
  * 全网同时下发 start_aging 时，各节点启动老化后会经 http_auto 并发拉取
- * 设备协议（test_http_getproto_New），根出口与服务器同时受压；按
+ * 设备协议（request_device_protocol），根出口与服务器同时受压；按
  * mesh_get_current_level() × 本基数延时后再启动，层深的节点后启动，
  * 天然打散该峰值。根(level=1) 2s、L2 4s … max_level=6 时 12s，有界。
- * 使用点与同步阻塞说明见 start_aging_with_ready_pn()。
+ * 使用点与同步阻塞说明见 parse_jsonCommand_MQTT() 的 start_aging 分支
+ * （2026-10-21 从 start_aging_with_ready_pn 移至命令入口，识别到指令即延时）。
  */
 #define LG_AGING_START_STAGGER_BASE_SEC 2
 
@@ -237,6 +239,12 @@ static BaseType_t create_cpu1_task(TaskFunction_t task_fn, const char *task_name
     }
 
     return ret;
+}
+
+BaseType_t app_create_mqtt_service_task(TaskFunction_t task_fn, TaskHandle_t *task_handle)
+{
+    return create_cpu1_task(task_fn, "mqtt_service", LG_STACK_MQTT_SERVICE,
+                            LG_PRIO_MQTT_SERVICE, task_handle);
 }
 
 static void print_task_stack_watermark(const char *name, TaskHandle_t task_handle)
@@ -1848,10 +1856,51 @@ void app_ble_data_handle(void *arg)
 #pragma endregion
 
 #pragma region HTTP协议导入与接收任务
-uint8_t CurentDevicenum = 0;
-uint8_t IsAgingDevice = 0; // 0表示不是老化设备，1表示是老化设备
+/* 保护 HTTP 请求代次、协议安装与老化设备释放；不跨网络等待持锁。 */
+static StaticSemaphore_t s_protocol_lifecycle_storage;
+static SemaphoreHandle_t s_protocol_lifecycle_mutex;
+static uint32_t s_external_protocol_generation[MAX_EXTERNAL_DEVICE_COUNT];
+static uint32_t s_aging_protocol_generation;
 
-#define HTTP_DATA_Cache 1024 * 8
+static uint32_t *protocol_generation_slot(const HttpProtocolTarget *target)
+{
+    if (target->kind == HTTP_PROTOCOL_AGING && target->device_index == 0)
+        return &s_aging_protocol_generation;
+    if (target->kind == HTTP_PROTOCOL_EXTERNAL && target->device_index < MAX_EXTERNAL_DEVICE_COUNT)
+        return &s_external_protocol_generation[target->device_index];
+    return NULL;
+}
+
+static void protocol_generation_advance(uint32_t *generation)
+{
+    if (++*generation == 0) ++*generation;
+}
+
+static void protocol_lifecycle_unlock(void)
+{
+    if (xSemaphoreGive(s_protocol_lifecycle_mutex) != pdTRUE)
+        ESP_LOGE(TAG, "Protocol lifecycle unlock failed");
+}
+
+static esp_err_t request_device_protocol(HttpProtocolTargetKind kind, uint8_t index)
+{
+    if (s_protocol_lifecycle_mutex == NULL ||
+        xSemaphoreTake(s_protocol_lifecycle_mutex, portMAX_DELAY) != pdTRUE)
+        return ESP_ERR_INVALID_STATE;
+    HttpProtocolTarget target = {.kind = kind, .device_index = index};
+    uint32_t *generation = protocol_generation_slot(&target);
+    Externaldevice *device = kind == HTTP_PROTOCOL_AGING ? Aging_device :
+        (read_devices != NULL && index < read_device_count ? &read_devices[index] : NULL);
+    if (generation == NULL || device == NULL || device->ProtoID == 0) {
+        protocol_lifecycle_unlock();
+        return ESP_ERR_INVALID_ARG;
+    }
+    protocol_generation_advance(generation);
+    target.generation = *generation;
+    target.proto_id = device->ProtoID;
+    protocol_lifecycle_unlock();
+    return http_get_protocol(&target);
+}
 
 static esp_err_t import_scpi_protocol_to_device(Externaldevice *device, const char *json_text)
 {
@@ -1958,322 +2007,61 @@ static esp_err_t import_can_protocol_to_device(Externaldevice *device, const cha
     return ESP_OK;
 }
 
-void parse_jsonCommand_HTTP(const char *packet, int len)
+/* 完整响应按请求归属安装；迟到响应不得落到另一轮老化或另一台外接设备。 */
+static void parse_http_protocol_response(const HttpProtocolResponse *response)
 {
-    cJSON *pRoot = NULL;
-    cJSON *data_obj = NULL;
-    char *protocol_json = NULL;
-
-    if (packet == NULL || len <= 0)
-    {
-        ESP_LOGE(TAG, "Invalid HTTP packet");
+    cJSON *root = cJSON_Parse(response->data);
+    if (root == NULL) {
+        ESP_LOGW(TAG, "Invalid HTTP protocol JSON");
         return;
     }
-
-    // 如果 packet 已经保证以 \0 结尾，可以继续使用 cJSON_Parse
-    pRoot = cJSON_Parse(packet);
-
-    if (pRoot == NULL)
-    {
-        ESP_LOGE(TAG, "Failed to parse HTTP JSON");
-        goto cleanup;
+    cJSON *data = cJSON_GetObjectItem(root, "data");
+    cJSON *type = cJSON_GetObjectItem(data, "protocolTypeStr");
+    char *json = cJSON_IsObject(data) && cJSON_IsString(type) ? cJSON_PrintUnformatted(data) : NULL;
+    if (json == NULL) {
+        ESP_LOGW(TAG, "HTTP protocol response has no valid data/type");
+        cJSON_Delete(root);
+        return;
     }
-
-    /*
-     * 当前接口格式：
-     *
-     * {
-     *   "code":1,
-     *   "message":"成功",
-     *   "data":{
-     *       ...
-     *   }
-     * }
-     *
-     * 所以 data 是 Object，不是 String
-     */
-    data_obj = cJSON_GetObjectItem(pRoot, "data");
-
-    if (!cJSON_IsObject(data_obj))
-    {
-        ESP_LOGE(TAG, "data field is not a valid object");
-        goto cleanup;
-    }
-
-    cJSON *proto = cJSON_GetObjectItem(data_obj, "protocolTypeStr");
-
-    if (!cJSON_IsString(proto) || proto->valuestring == NULL)
-    {
-        ESP_LOGE(TAG, "No valid protocolTypeStr found in JSON");
-        goto cleanup;
-    }
-
-    ESP_LOGI(TAG, "Parsed protocolTypeStr: %s", proto->valuestring);
-
-    /*
-     * 因为下面的 import_xxx_protocol_to_device()
-     * 原本接收 JSON 字符串，
-     * 所以把 data 对象重新转换成 JSON 字符串
-     */
-    protocol_json = cJSON_PrintUnformatted(data_obj);
-
-    if (protocol_json == NULL)
-    {
-        ESP_LOGE(TAG, "Failed to serialize protocol data");
-        goto cleanup;
-    }
-
-    if (strcmp(proto->valuestring, "SCPI") == 0)
-    {
-        if (IsAgingDevice == 0)
-        {
-            esp_err_t ret =
-                import_scpi_protocol_to_device(
-                    &read_devices[CurentDevicenum],
-                    protocol_json);
-
-            if (ret != ESP_OK)
-            {
-                read_devices[CurentDevicenum].HaveProtocol = false;
-                goto cleanup;
-            }
+    if (xSemaphoreTake(s_protocol_lifecycle_mutex, portMAX_DELAY) == pdTRUE) {
+        const HttpProtocolTarget *target = &response->target;
+        uint32_t *generation = protocol_generation_slot(target);
+        Externaldevice *device = NULL;
+        /* 先判断代次，再读取可能已释放并重新分配的 Aging_device。 */
+        if (generation != NULL && *generation == target->generation) {
+            if (target->kind == HTTP_PROTOCOL_AGING) device = Aging_device;
+            else if (read_devices != NULL && target->device_index < read_device_count)
+                device = &read_devices[target->device_index];
         }
-        else if (IsAgingDevice == 1)
-        {
-            if (Aging_device == NULL)
-            {
-                ESP_LOGE(TAG,
-                         "Aging_device is NULL when SCPI protocol received");
-
-                IsAgingDevice = 0;
-                goto cleanup;
-            }
-
-            esp_err_t ret =
-                import_scpi_protocol_to_device(
-                    &Aging_device[0],
-                    protocol_json);
-
-            if (ret != ESP_OK)
-            {
-                Aging_device[0].HaveProtocol = false;
-                IsAgingDevice = 0;
-                goto cleanup;
-            }
-
-            IsAgingDevice = 0;
+        if (device == NULL || device->ProtoID != target->proto_id) {
+            ESP_LOGW(TAG, "Discard stale HTTP protocol: target=%d index=%u generation=%lu",
+                     target->kind, target->device_index, (unsigned long)target->generation);
+        } else {
+            esp_err_t err = ESP_ERR_NOT_SUPPORTED;
+            if (strcmp(type->valuestring, "SCPI") == 0) err = import_scpi_protocol_to_device(device, json);
+            else if (strcmp(type->valuestring, "MODBUS") == 0) err = import_modbus_protocol_to_device(device, json);
+            else if (strcmp(type->valuestring, "BLUETTICAN") == 0) err = import_can_protocol_to_device(device, json);
+            if (err != ESP_OK) ESP_LOGW(TAG, "Protocol import failed: %s", esp_err_to_name(err));
         }
-    }
-    else if (strcmp(proto->valuestring, "MODBUS") == 0)
-    {
-        if (IsAgingDevice == 0)
-        {
-            esp_err_t ret =
-                import_modbus_protocol_to_device(
-                    &read_devices[CurentDevicenum],
-                    protocol_json);
-
-            if (ret != ESP_OK)
-            {
-                goto cleanup;
-            }
-        }
-        else if (IsAgingDevice == 1)
-        {
-            if (Aging_device == NULL)
-            {
-                ESP_LOGE(TAG,
-                         "Aging_device is NULL when MODBUS protocol received");
-
-                IsAgingDevice = 0;
-                goto cleanup;
-            }
-
-            esp_err_t ret =
-                import_modbus_protocol_to_device(
-                    &Aging_device[0],
-                    protocol_json);
-
-            if (ret != ESP_OK)
-            {
-                Aging_device[0].HaveProtocol = false;
-                IsAgingDevice = 0;
-                goto cleanup;
-            }
-
-            IsAgingDevice = 0;
-        }
-    }
-    else if (strcmp(proto->valuestring, "BLUETTICAN") == 0)
-    {
-        if (IsAgingDevice == 0)
-        {
-            esp_err_t ret =
-                import_can_protocol_to_device(
-                    &read_devices[CurentDevicenum],
-                    protocol_json);
-
-            if (ret != ESP_OK)
-            {
-                goto cleanup;
-            }
-        }
-        else if (IsAgingDevice == 1)
-        {
-            if (Aging_device == NULL)
-            {
-                ESP_LOGE(TAG,
-                         "Aging_device is NULL when CAN protocol received");
-
-                IsAgingDevice = 0;
-                goto cleanup;
-            }
-
-            esp_err_t ret =
-                import_can_protocol_to_device(
-                    &Aging_device[0],
-                    protocol_json);
-
-            if (ret != ESP_OK)
-            {
-                Aging_device[0].HaveProtocol = false;
-                IsAgingDevice = 0;
-                goto cleanup;
-            }
-
-            IsAgingDevice = 0;
-        }
-    }
-    else
-    {
-        ESP_LOGW(TAG,
-                 "Unknown protocolTypeStr: %s",
-                 proto->valuestring);
-    }
-
-cleanup:
-
-    if (protocol_json != NULL)
-    {
-        cJSON_free(protocol_json);
-    }
-
-    if (pRoot != NULL)
-    {
-        cJSON_Delete(pRoot);
-    }
+        protocol_lifecycle_unlock();
+    } else ESP_LOGE(TAG, "Protocol lifecycle lock failed");
+    cJSON_free(json);
+    cJSON_Delete(root);
 }
 
-// 数据接收处理
 static void app_HTTP_Rdata_handle(void *arg)
 {
-    char *json_str = app_malloc_prefer_psram(HTTP_DATA_Cache);
-    if (json_str == NULL)
-    {
-        ESP_LOGE(TAG, "Failed to allocate memory for HTTP json_str");
-        s_http_rx_task_handle = NULL;
-        vTaskDelete(NULL);
-        return;
-    }
-
-    int json_str_len = 0;
-    char Databuf[1025] = {0};
-    TickType_t last_recv_time = xTaskGetTickCount();       // 记录上次收到数据的时间
-    const TickType_t timeout_ticks = pdMS_TO_TICKS(10000); // 累积超时时间：10秒
-
-    while (1)
-    {
-        memset(Databuf, 0, sizeof(Databuf));
-        int datalen = app_read_HTTP_data(Databuf, sizeof(Databuf), pdMS_TO_TICKS(5000)); // 等待5秒接收HTTP数据
-
-        if (datalen > 0)
-        {
-            // 收到有效数据，更新时间戳
-            last_recv_time = xTaskGetTickCount();
-            // 检查是否是完整包
-            if (is_complete_packet(Databuf, datalen))
-            {
-                // 如果累积缓冲区有数据，说明之前的数据不完整
-                if (json_str_len > 0)
-                {
-                    ESP_LOGW(TAG, "Previous incomplete data discarded, new complete packet received");
-                    json_str_len = 0;
-                    memset(json_str, 0, HTTP_DATA_Cache);
-                }
-
-                ESP_LOGI(TAG, "Complete JSON packet: %s", Databuf);
-                parse_jsonCommand_HTTP(Databuf, datalen);
-            }
-            else
-            {
-                // 检查累积后是否溢出
-                if (json_str_len + datalen >= HTTP_DATA_Cache)
-                {
-                    ESP_LOGE(TAG, "Buffer overflow! Discarding accumulated %d bytes", json_str_len);
-                    json_str_len = 0;
-                    memset(json_str, 0, HTTP_DATA_Cache);
-
-                    // 当前数据可能已经是完整包
-                    if (is_complete_packet(Databuf, datalen))
-                    {
-                        ESP_LOGI(TAG, "Current data is a complete packet");
-                        parse_jsonCommand_HTTP(Databuf, datalen);
-                    }
-                    else
-                    {
-                        // 重新开始累积
-                        strncpy(json_str, Databuf, datalen);
-                        json_str_len = datalen;
-                        json_str[json_str_len] = '\0';
-                        ESP_LOGI(TAG, "Start new accumulation: %d bytes", json_str_len);
-                    }
-                }
-                else
-                {
-                    // 追加到累积缓冲区
-                    strncpy(json_str + json_str_len, Databuf, datalen);
-                    json_str_len += datalen;
-                    json_str[json_str_len] = '\0';
-
-                    // 检查累积后是否完整
-                    if (is_complete_packet(json_str, json_str_len))
-                    {
-                        ESP_LOGI(TAG, "Accumulated complete JSON: %s", json_str);
-                        parse_jsonCommand_HTTP(json_str, json_str_len);
-                        json_str_len = 0;
-                        memset(json_str, 0, HTTP_DATA_Cache);
-                    }
-                    else
-                    {
-                        ESP_LOGD(TAG, "Still incomplete, accumulated %d bytes", json_str_len);
-                    }
-                }
-            }
-        }
-        else if (datalen <= 0)
-        {
-            // 读取超时，没有新数据
-            if (json_str_len > 0)
-            {
-                // 检查累积缓冲区的数据是否已超时（长时间未完成）
-                TickType_t now = xTaskGetTickCount();
-                if ((now - last_recv_time) >= timeout_ticks)
-                {
-
-                    ESP_LOGI(TAG, "Timeout waiting for complete JSON, discarding %d bytes", json_str_len);
-
-                    json_str_len = 0;
-
-                    memset(json_str, 0, HTTP_DATA_Cache);
-                }
-            }
-        }
-        if (datalen >= 0 && datalen < HTTP_DATA_Cache)
-        {
-            Databuf[datalen] = '\0';
+    for (;;) {
+        HttpProtocolResponse response = {0};
+        esp_err_t err = http_receive_protocol(&response, pdMS_TO_TICKS(5000));
+        if (err == ESP_OK) {
+            parse_http_protocol_response(&response);
+            http_protocol_response_release(&response);
+        } else if (err != ESP_ERR_TIMEOUT) {
+            ESP_LOGW(TAG, "HTTP response queue unavailable: %s", esp_err_to_name(err));
+            vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
-    free(json_str);
 }
 
 // 根据外接设备的协议ID自动获取协议
@@ -2286,7 +2074,7 @@ static void app_HTTP_Auto_GetProtocol(void *arg)
         {
             if (read_devices[i].ProtoID != 0 && read_devices[i].HaveProtocol == false) // 非老化设备的协议获取
             {
-                esp_err_t err = test_http_getproto_New(read_devices[i].ProtoID);
+                esp_err_t err = request_device_protocol(HTTP_PROTOCOL_EXTERNAL, (uint8_t)i);
                 if (err != ESP_OK)
                 {
                     storage_write_record_cyclic(current_log_pn(), "Failed to get protocol from server");
@@ -2295,7 +2083,6 @@ static void app_HTTP_Auto_GetProtocol(void *arg)
                 {
                     checkflag = 1;
                     read_devices[i].LastProtoID = read_devices[i].ProtoID;
-                    CurentDevicenum = i;
                 }
             }
             vTaskDelay(pdMS_TO_TICKS(1000)); // 每秒检查一次
@@ -2494,32 +2281,6 @@ static bool start_aging_with_ready_pn(const char *aging_json, int start_seq)
         return false;
     }
 
-    /*
-     * mesh 层级错峰（2026-10-20）：全网同时下发 start_aging 时，各节点启动
-     * 老化后会经 http_auto 并发拉取设备协议（test_http_getproto_New），根
-     * WiFi 出口与服务器同时受压。按层级 ×LG_AGING_START_STAGGER_BASE_SEC
-     * 延时后再启动，层深的节点后启动，打散协议拉取与启动峰值。
-     *
-     * 调用上下文：mqtt_rx 任务（parse_jsonCommand_MQTT 的调用者），同步阻塞
-     * 上限 12s（MESH_MAX_LEVEL=6 × 2s）。评估：老化启动为低频操作（一次老化
-     * 周期一次），既有路径本就含 SPIFFS/NVS 写阻塞，12s 内到达其他命令概率
-     * 极低，故不引入异步化（避免改动 WAIT_PN/挂起 seq 状态机）。
-     * 拒绝路径（空 JSON/RUNNING/无 PN）均在延时前返回，不受影响。
-     * 三个启动入口（直接 start_aging / set_pn 触发 pending / 掉电恢复）均
-     * 经本函数，自动继承错峰。
-     *
-     * level=0（库未就绪的异常态）防御性按 1 处理：保证最小 2s 错峰且不零延时。
-     */
-    uint8_t stagger_level = mesh_get_current_level();
-    if (stagger_level == 0)
-    {
-        stagger_level = 1;
-    }
-    uint32_t stagger_ms = (uint32_t)stagger_level *
-                          (uint32_t)LG_AGING_START_STAGGER_BASE_SEC * 1000u;
-
-    vTaskDelay(pdMS_TO_TICKS(stagger_ms));
-
     /* 在真正创建老化任务前先保证完整工艺JSON已经落盘。 */
     esp_err_t ret = save_json_to_spiffs("Aging.json", aging_json);
     if (ret != ESP_OK)
@@ -2712,6 +2473,38 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                     ESP_LOGW(TAG, "start_aging command missing programId, seq=%d", start_seq);
                     goto cleanup;
                 }
+
+                /*
+                 * mesh 层级错峰（2026-10-21 从 start_aging_with_ready_pn 移至此处，
+                 * 用户决策：识别到老化指令即延时）：仅对格式合法的老化命令生效
+                 * （Data/ProgramId 校验已通过，非法命令仍立即拒绝不等候），按
+                 * 层级 ×LG_AGING_START_STAGGER_BASE_SEC 延时后再走 RUNNING/PN 门
+                 * 与启动——打散全网同时启动的协议拉取与启动峰值；无 PN 的拒绝
+                 * reply 同样被错峰，缓解批量下发时的 mesh 上行共振（拒绝状态/日志
+                 * 另有 10s 限频，见 reject_start_aging_missing_pn）。
+                 *
+                 * 调用上下文：mqtt_rx 任务，同步阻塞上限 12s（max_level=6×2s）。
+                 * 前提（用户确认的现场用法）：老化指令下发时无其他指令输入——
+                 * 批量/重试场景下本节点后续命令在 MQTT 队列排队，超过入队超时
+                 * （100ms）会丢，由服务器重试 + Seq 去重收敛。
+                 * 掉电恢复路径（Init_ByNetwork_Flag 直调 start_aging_with_ready_pn）
+                 * 不经此处，单节点恢复事件不错峰。
+                 *
+                 * level=0（库未就绪的异常态）防御性按 1：保底最小 2s 错峰。
+                 */
+                uint8_t stagger_level = mesh_get_current_level();
+                if (stagger_level == 0)
+                {
+                    stagger_level = 1;
+                }
+                uint32_t stagger_ms = (uint32_t)stagger_level *
+                                      (uint32_t)LG_AGING_START_STAGGER_BASE_SEC * 1000u;
+                aging_runtime_log("Start aging stagger: level=%u, delay %u.%03us before processing",
+                                  (unsigned)stagger_level,
+                                  (unsigned)(stagger_ms / 1000u),
+                                  (unsigned)(stagger_ms % 1000u));
+                vTaskDelay(pdMS_TO_TICKS(stagger_ms));
+
                 /*
                  * RUNNING时必须先拒绝，不能先修改PN_Code、Ready PN或Aging.json，
                  * 否则可能把正在运行的上一台设备错误切换到下一台PN。
@@ -3917,14 +3710,14 @@ static bool WaitAgingDeviceProtocolReady(uint32_t timeout_ms)
 
     while ((xTaskGetTickCount() - start_tick) < timeout_tick)
     {
-        if (Aging_device != NULL &&
+        if (xSemaphoreTake(s_protocol_lifecycle_mutex, portMAX_DELAY) != pdTRUE) return false;
+        bool ready = Aging_device != NULL &&
             Aging_device[0].HaveProtocol == true &&
             (Aging_device[0].scpi_protocol != NULL ||
              Aging_device[0].modbusprotocol.item_count > 0 ||
-             Aging_device[0].canprotocol.item_count > 0))
-        {
-            return true;
-        }
+             Aging_device[0].canprotocol.item_count > 0);
+        protocol_lifecycle_unlock();
+        if (ready) return true;
 
         vTaskDelay(pdMS_TO_TICKS(100));
     }
@@ -3934,8 +3727,13 @@ static bool WaitAgingDeviceProtocolReady(uint32_t timeout_ms)
 
 static void AgingDevice_RuntimeFree(void)
 {
-    if (Aging_device == NULL)
-    {
+    if (xSemaphoreTake(s_protocol_lifecycle_mutex, portMAX_DELAY) != pdTRUE) {
+        ESP_LOGE(TAG, "Protocol lifecycle lock failed on free");
+        return;
+    }
+    protocol_generation_advance(&s_aging_protocol_generation);
+    if (Aging_device == NULL) {
+        protocol_lifecycle_unlock();
         return;
     }
 
@@ -3957,6 +3755,7 @@ static void AgingDevice_RuntimeFree(void)
 
     free(Aging_device);
     Aging_device = NULL;
+    protocol_lifecycle_unlock();
 }
 
 // 老化指令 Json 处理；返回 true 表示老化任务已成功创建。
@@ -4040,10 +3839,15 @@ static bool aging_command_json_parse(const char *packet_copy)
                       agingcfg.devices[0].ProtoID,
                       agingcfg.devices[0].Communication);
 
+    if (xSemaphoreTake(s_protocol_lifecycle_mutex, portMAX_DELAY) != pdTRUE) {
+        aging_error_log("Protocol lifecycle lock failed during device creation");
+        goto start_failed;
+    }
     Aging_device = (Externaldevice *)app_malloc_prefer_psram(sizeof(Externaldevice));
     if (Aging_device == NULL)
     {
         aging_error_log("Aging device memory allocation failed");
+        protocol_lifecycle_unlock();
         goto start_failed;
     }
 
@@ -4060,6 +3864,7 @@ static bool aging_command_json_parse(const char *packet_copy)
                              agingcfg.devices[0].Communication))
     {
         aging_error_log("Aging device communication mode is too long");
+        protocol_lifecycle_unlock();
         goto start_failed;
     }
 
@@ -4071,20 +3876,20 @@ static bool aging_command_json_parse(const char *packet_copy)
     {
         aging_error_log("Aging device hardware initialization failed, communication=%s",
                         Aging_device[0].CommunicationMode);
+        protocol_lifecycle_unlock();
         goto start_failed;
     }
 
     aging_runtime_log("Aging device hardware initialized, communication=%s", Aging_device[0].CommunicationMode);
+    protocol_lifecycle_unlock();
 
-    IsAgingDevice = 1;
-    esp_err_t http_ret = test_http_getproto_New(Aging_device[0].ProtoID);
+    esp_err_t http_ret = request_device_protocol(HTTP_PROTOCOL_AGING, 0);
 
     if (http_ret != ESP_OK)
     {
         aging_error_log("Protocol request failed, ProtoID=%lld, error=%s",
                         Aging_device[0].ProtoID,
                         esp_err_to_name(http_ret));
-        IsAgingDevice = 0;
         goto start_failed;
     }
 
@@ -4097,11 +3902,9 @@ static bool aging_command_json_parse(const char *packet_copy)
     if (!WaitAgingDeviceProtocolReady(stagger_ms))
     {
         aging_error_log("Protocol loading timeout, ProtoID=%lld", Aging_device[0].ProtoID);
-        IsAgingDevice = 0;
         goto start_failed;
     }
 
-    IsAgingDevice = 0;
     aging_runtime_log("Aging device protocol loaded, ProtoID=%lld, ProtoType=%u",
                       Aging_device[0].ProtoID,
                       Aging_device[0].ProtoType);
@@ -4123,7 +3926,6 @@ static bool aging_command_json_parse(const char *packet_copy)
     return true;
 
 start_failed:
-    IsAgingDevice = 0;
     agingState = AgingIdle;
     agingDataAMode = IdleState;
     AgingDevice_RuntimeFree();
@@ -5497,6 +5299,11 @@ void app_AgingData_Upload_handle(void *arg)
 
 void app_task_init(void)
 {
+    s_protocol_lifecycle_mutex = xSemaphoreCreateMutexStatic(&s_protocol_lifecycle_storage);
+    if (s_protocol_lifecycle_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create protocol lifecycle mutex");
+        return;
+    }
     // 初始化NVS
     ESP_ERROR_CHECK(nvs_flash_init());
     // 初始化SPIFFS,存配置相关的

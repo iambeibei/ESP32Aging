@@ -1,6 +1,8 @@
 #pragma once
 
 #include <stdint.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -28,6 +30,9 @@ typedef enum
 
 
 void app_task_init();
+
+/** 任务上下文的 MQTT 服务建任务封装；复用现有句柄，不可在 ISR 调用。 */
+BaseType_t app_create_mqtt_service_task(TaskFunction_t task_fn, TaskHandle_t *task_handle);
 
 void Config_Report(int cmd_seq);
 

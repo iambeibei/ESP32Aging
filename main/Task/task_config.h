@@ -40,6 +40,10 @@
 #define LG_STACK_MQTT_RX           8192
 #define LG_PRIO_MQTT_RX            7
 
+/* MQTT 上线组包、文件读取与恢复调度；栈覆盖配置序列化调用链。 */
+#define LG_STACK_MQTT_SERVICE      8192
+#define LG_PRIO_MQTT_SERVICE       4
+
 #define LG_STACK_HTTP_RX           3072
 #define LG_PRIO_HTTP_RX            7
 

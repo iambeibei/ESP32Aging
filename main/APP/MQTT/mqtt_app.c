@@ -4,6 +4,9 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_random.h"
+#include "app_mem.h"
+#include "Json_data.h"
 #include "esp_netif.h"
 #include "esp_tls.h"
 #include "mqtt_client.h"
@@ -43,19 +46,28 @@ typedef struct
 } mqtt_data_msg_t;
 
 static atomic_bool s_mqtt_connected;
+static atomic_uint s_deleted_count;
+static atomic_uint s_rejected_count;
+static atomic_uint s_last_outbox_bytes;
 
-/*
- * MQTT keepalive（2026-10-16 加长）：
- * 子节点报文要穿 1~N 跳 mesh + 每跳 NAPT，拥塞时（尤其 OTA 下载窗口全网
- * 并发、mesh 重扫期）PINGREQ 到达 broker 的延迟可能超过 1.5×keepalive，
- * 被 broker 判死断开引发无谓重连风暴。根节点上行虽只一跳，但 OTA 期间
- * 其单条 STA 是全网漏斗，同样需要余量。
- * 权衡：keepalive 越长，对端真正死亡时 LWT/下线判定越慢（根 90s→180s、
- * 子 22.5s→45s），对以太网/内网 broker 场景可接受。
- */
+/* 根/子节点保活均为60秒。多跳抖动由恢复调度处理，保活时间不代替拥塞控制。 */
 #define MQTT_ROOT_KEEPALIVE_SECONDS 60
 #define MQTT_NODE_KEEPALIVE_SECONDS 60
-#define MQTT_NODE_RECONNECT_WAIT_MS 2000
+/* 重连与上线重试的随机区间：[2,4]、[4,8]、[8,16]、[16,32]、[30,60]秒。 */
+#define MQTT_RETRY_STABLE_MS 30000
+#define MQTT_INITIAL_JITTER_MS 3000
+#define MQTT_CONFIG_JITTER_MS 5000
+#define MQTT_SUBACK_WARN_MS 10000
+#define MQTT_SERVICE_POLL_MS 100
+#define MQTT_OUTBOX_LIMIT_BYTES (64U * 1024U)
+#define MQTT_OUTBOX_NORMAL_BYTES (56U * 1024U)
+#define MQTT_RUNTIME_QUEUE_LEN 3
+#define MQTT_RUNTIME_PAYLOAD_BYTES 256
+#define MQTT_ACK_MAP_BYTES (65536U / 2U)
+#define MQTT_ACK_PUBLISHED 1U
+#define MQTT_ACK_SUBSCRIBED 2U
+#define MQTT_ACK_REJECTED 4U
+#define MQTT_ACK_DELETED 8U
 #define MQTT_UPLINK_DISCONNECT_RETRY_MAX 3
 #define MQTT_PUBLISH_DRAIN_TIMEOUT_MS 11000 /* 现有网络写超时10秒 + 调度余量。 */
 
@@ -88,6 +100,88 @@ static SemaphoreHandle_t s_mqtt_lifecycle_mutex;
 static bool s_mqtt_mutex_initializing;
 /* 仅生命周期锁持有者访问；回调使用 event->client，不获取此锁。 */
 static bool s_client_started;
+static StaticSemaphore_t s_mqtt_admission_storage;
+static SemaphoreHandle_t s_mqtt_admission_mutex;
+static TaskHandle_t s_mqtt_service_task;
+static QueueHandle_t s_runtime_queue;
+/* 启动期分配、模块终生持有，优先 PSRAM。半字节/消息 ID 可无损捕捉接口返回前
+ * 的确认，不依赖有限事件队列（大量业务 PUBACK 可把上线确认挤出普通队列）。
+ * 仅 capture 期间写；清表时先关闭 capture，在临界区外 memset。 */
+static uint8_t *s_ack_map;
+static struct {
+    uint32_t epoch;
+    TickType_t connected_tick;
+    bool capture;
+    int pending_id;
+    uint8_t flags;
+    uint8_t subscribe_count;
+} s_service_ack;
+static uint32_t s_connection_epoch;
+static uint8_t s_node_retry_step;
+static bool s_node_retry_scheduled;
+static TickType_t s_node_retry_due;
+static bool s_node_first_start;
+
+typedef struct {
+    uint32_t epoch;
+    char topic[MQTT_TOPIC_ITEM_CAPACITY];
+    char payload[MQTT_RUNTIME_PAYLOAD_BYTES];
+} MqttRuntimeLog;
+
+static esp_err_t mqtt_init_locked(void);
+
+static void mqtt_service_wake(void)
+{
+    /* 任务在客户端创建前建立，终生不删除；首次调度前的通知也可保留。 */
+    if (s_mqtt_service_task != NULL)
+        xTaskNotifyGive(s_mqtt_service_task);
+}
+
+static uint32_t mqtt_retry_delay_ms(uint8_t *step)
+{
+    static const uint32_t minimum_ms[] = {2000, 4000, 8000, 16000, 30000};
+    unsigned index = *step < 4 ? *step : 4;
+    if (*step < 4) (*step)++;
+    return minimum_ms[index] + esp_random() % (minimum_ms[index] + 1U);
+}
+
+static bool mqtt_due(TickType_t now, TickType_t deadline)
+{
+    return (int32_t)(now - deadline) >= 0;
+}
+
+static uint8_t mqtt_ack_flags_locked(int msg_id)
+{
+    if (msg_id <= 0 || msg_id > UINT16_MAX) return 0;
+    return (s_ack_map[(unsigned)msg_id / 2U] >> (((unsigned)msg_id & 1U) * 4U)) & 15U;
+}
+
+/* 只复制标量，SDK 回调不取生命周期锁或准入锁，不持有 event/data 指针。 */
+static void mqtt_service_ack_event(esp_mqtt_event_handle_t event, uint8_t flags)
+{
+    portENTER_CRITICAL(&s_mqtt_state_lock);
+    if (event->client == s_client && s_mqtt_control.phase == MQTT_APP_CONNECTED &&
+        s_service_ack.epoch == s_connection_epoch) {
+        if (s_service_ack.capture && event->msg_id > 0 && event->msg_id <= UINT16_MAX) {
+            unsigned shift = ((unsigned)event->msg_id & 1U) * 4U;
+            s_ack_map[(unsigned)event->msg_id / 2U] |= flags << shift;
+        }
+        if (event->msg_id == s_service_ack.pending_id)
+            s_service_ack.flags |= flags;
+    }
+    portEXIT_CRITICAL(&s_mqtt_state_lock);
+    mqtt_service_wake();
+}
+
+static bool mqtt_session_current(uint32_t epoch)
+{
+    portENTER_CRITICAL(&s_mqtt_state_lock);
+    bool current = s_client != NULL && atomic_load(&s_mqtt_connected) &&
+                   s_mqtt_control.phase == MQTT_APP_CONNECTED && !s_mqtt_control.switch_pending &&
+                   epoch == s_connection_epoch;
+    portEXIT_CRITICAL(&s_mqtt_state_lock);
+    return current;
+}
 
 static SemaphoreHandle_t mqtt_lifecycle_mutex(void)
 {
@@ -113,11 +207,13 @@ static esp_err_t mqtt_lifecycle_init(void)
     s_mqtt_mutex_initializing = true;
     portEXIT_CRITICAL(&s_mqtt_state_lock);
     SemaphoreHandle_t mutex = xSemaphoreCreateMutexStatic(&s_mqtt_lifecycle_storage);
+    SemaphoreHandle_t admission = xSemaphoreCreateMutexStatic(&s_mqtt_admission_storage);
     portENTER_CRITICAL(&s_mqtt_state_lock);
     s_mqtt_lifecycle_mutex = mutex;
+    s_mqtt_admission_mutex = admission;
     s_mqtt_mutex_initializing = false;
     portEXIT_CRITICAL(&s_mqtt_state_lock);
-    return mutex != NULL ? ESP_OK : ESP_ERR_NO_MEM;
+    return mutex != NULL && admission != NULL ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
 static void mqtt_lifecycle_unlock(SemaphoreHandle_t mutex)
@@ -185,7 +281,7 @@ static void mqtt_request_immediate_reconnect(esp_mqtt_client_handle_t client)
     portEXIT_CRITICAL(&s_mqtt_state_lock);
     if (!request)
         return;
-    /* 每次上行变化只加速一次；失败后沿用 SDK 自动重连退避，避免拒绝连接时忙循环。 */
+    /* 每次上行变化只加速一次；失败后沿用 SDK 自动重连等待，避免拒绝连接时忙循环。 */
     esp_err_t err = esp_mqtt_client_reconnect(client);
     if (err != ESP_OK)
     {
@@ -256,6 +352,7 @@ static void mqtt_before_connect(esp_mqtt_client_handle_t client)
 /* 返回 true 才发布上线/恢复订阅。过期连接只请求断开，不让它被误报为切换成功。 */
 static bool mqtt_connected(esp_mqtt_client_handle_t client)
 {
+    TickType_t now = xTaskGetTickCount();
     portENTER_CRITICAL(&s_mqtt_state_lock);
     bool usable = client == s_client && s_mqtt_control.phase != MQTT_APP_STOPPING &&
                   s_mqtt_control.phase != MQTT_APP_STOPPED;
@@ -271,9 +368,16 @@ static bool mqtt_connected(esp_mqtt_client_handle_t client)
             s_mqtt_control.disconnect_requested = false;
             s_mqtt_control.disconnect_failures = 0;
             atomic_store(&s_mqtt_connected, true);
+            s_connection_epoch++;
+            s_service_ack.epoch = s_connection_epoch;
+            s_service_ack.connected_tick = now;
+            s_service_ack.capture = false;
+            s_service_ack.pending_id = 0;
+            s_service_ack.flags = 0;
         }
     }
     portEXIT_CRITICAL(&s_mqtt_state_lock);
+    mqtt_service_wake();
     if (stale)
     {
         ESP_LOGI(TAG, "连接期间出口已变化，重新建立 MQTT 连接");
@@ -284,11 +388,19 @@ static bool mqtt_connected(esp_mqtt_client_handle_t client)
 
 static void mqtt_disconnected(esp_mqtt_client_handle_t client)
 {
+    TickType_t now = xTaskGetTickCount();
     portENTER_CRITICAL(&s_mqtt_state_lock);
     bool running = client == s_client && s_mqtt_control.phase != MQTT_APP_STOPPING &&
                    s_mqtt_control.phase != MQTT_APP_STOPPED;
     if (running)
     {
+        if (IsRoot == 0 && s_mqtt_control.phase == MQTT_APP_CONNECTED &&
+            now - s_service_ack.connected_tick >= pdMS_TO_TICKS(MQTT_RETRY_STABLE_MS))
+            s_node_retry_step = 0;
+        s_connection_epoch++;
+        s_service_ack.capture = false;
+        s_service_ack.pending_id = 0;
+        s_node_retry_scheduled = false;
         atomic_store(&s_mqtt_connected, false);
         s_mqtt_control.phase = MQTT_APP_WAIT_RECONNECT;
         s_mqtt_control.disconnect_requested = false;
@@ -296,6 +408,7 @@ static void mqtt_disconnected(esp_mqtt_client_handle_t client)
     portEXIT_CRITICAL(&s_mqtt_state_lock);
     if (running)
         mqtt_request_immediate_reconnect(client);
+    mqtt_service_wake();
 }
 
 /**
@@ -378,138 +491,8 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
                  (void *)event->client, ++s_mqtt_connect_count,
                  IsRoot == 1 ? dual_net_get_active_interface() : "MESH_STA");
 
-        char *json = create_up_line_json(time(NULL), DEVICE_ID);
-        if (json != NULL)
-        {
-            app_mqtt_publish("device/public/up_line", json, NULL);
-            free(json);
-        }
-
-        char topic[64] = {0};
-
-        // 订阅定点OTA升级主题
-        memset(topic, 0, sizeof(topic));
-        snprintf(topic, sizeof(topic), "server/%s/cmd/ota", DEVICE_ID);
-        if (esp_mqtt_client_subscribe(event->client, topic, 0) < 0)
-        {
-            ESP_LOGE(TAG, "Failed to subscribe to ota");
-        }
-
-        // 订阅服务，重启主题，多点位ota升级时统一重启
-        memset(topic, 0, sizeof(topic));
-        snprintf(topic, sizeof(topic), "server/rack/%s/CanRestart", AgingNumber);
-        if (esp_mqtt_client_subscribe(event->client, topic, 0) < 0)
-        {
-            ESP_LOGE(TAG, "Failed to subscribe to CanRestart");
-        }
-
-        // 订阅修改配置主题
-        memset(topic, 0, sizeof(topic));
-        snprintf(topic, sizeof(topic), "server/%s/cmd/set_config", DEVICE_ID);
-        if (esp_mqtt_client_subscribe(event->client, topic, 0) < 0)
-        {
-            ESP_LOGE(TAG, "Failed to subscribe to set_config");
-        }
-
-        // 订阅读取配置主题
-        memset(topic, 0, sizeof(topic));
-        snprintf(topic, sizeof(topic), "server/%s/cmd/get_config", DEVICE_ID);
-        if (esp_mqtt_client_subscribe(event->client, topic, 0) < 0)
-        {
-            ESP_LOGE(TAG, "Failed to subscribe to get_config");
-        }
-
-        // 订阅控制电源主题(只有根节点需要订阅)
-        if (IsRoot == 1)
-        {
-            memset(topic, 0, sizeof(topic));
-            snprintf(topic, sizeof(topic), "server/%s/cmd/CPower", DEVICE_ID);
-            if (esp_mqtt_client_subscribe(event->client, topic, 0) < 0)
-            {
-                ESP_LOGE(TAG, "Failed to subscribe to CPower");
-            }
-        }
-        else if (IsRoot == 0)
-        {
-            // 订阅老化开始主题
-            memset(topic, 0, sizeof(topic));
-            snprintf(topic, sizeof(topic), "server/%s/cmd/start_aging", DEVICE_ID);
-            if (esp_mqtt_client_subscribe(event->client, topic, 0) < 0)
-            {
-                ESP_LOGE(TAG, "Failed to subscribe to start_aging");
-            }
-
-            // 订阅老化停止主题
-            memset(topic, 0, sizeof(topic));
-            snprintf(topic, sizeof(topic), "server/%s/cmd/stop_aging", DEVICE_ID);
-            if (esp_mqtt_client_subscribe(event->client, topic, 0) < 0)
-            {
-                ESP_LOGE(TAG, "Failed to subscribe to stop_aging");
-            }
-
-            // 订阅广播停止老化主题：一键停止本架（AgingNumber）全部点位。
-            // 与定点 stop_aging 功能相同——parse_jsonCommand_MQTT 以
-            // strstr(TopicBuf, "stop_aging") 分发，本主题天然命中该分支，
-            // 且 stop_aging 处理为幂等操作，定点+广播双通道重复执行无害。
-            // 下发侧约定：payload 须含数值 Seq 字段（命令入口门，见
-            // parse_jsonCommand_MQTT），格式与定点 stop_aging 一致。
-            memset(topic, 0, sizeof(topic));
-            snprintf(topic, sizeof(topic), "server/%s/public/cmd/stop_aging", AgingNumber);
-            if (esp_mqtt_client_subscribe(event->client, topic, 0) < 0)
-            {
-                ESP_LOGE(TAG, "Failed to subscribe to public stop_aging");
-            }
-
-            // 订阅设置目标PN主题
-            memset(topic, 0, sizeof(topic));
-            snprintf(topic, sizeof(topic), "server/%s/cmd/set_pn", DEVICE_ID);
-            if (esp_mqtt_client_subscribe(event->client, topic, 0) < 0)
-            {
-                ESP_LOGE(TAG, "Failed to subscribe to set_pn");
-            }
-
-            // 订阅获取设备状态主题
-            memset(topic, 0, sizeof(topic));
-            snprintf(topic, sizeof(topic), "server/%s/cmd/get_state", DEVICE_ID);
-            if (esp_mqtt_client_subscribe(event->client, topic, 0) < 0)
-            {
-                ESP_LOGE(TAG, "Failed to subscribe to get_state");
-            }
-
-            // 订阅获取缺失数据主题
-            memset(topic, 0, sizeof(topic));
-            snprintf(topic, sizeof(topic), "server/%s/cmd/get_lost_aging", DEVICE_ID);
-            if (esp_mqtt_client_subscribe(event->client, topic, 0) < 0)
-            {
-                ESP_LOGE(TAG, "Failed to subscribe to get_lost_aging");
-            }
-
-            // 订阅远程日志上报主题
-            memset(topic, 0, sizeof(topic));
-            snprintf(topic, sizeof(topic), "server/%s/cmd/remote_log", DEVICE_ID);
-            if (esp_mqtt_client_subscribe(event->client, topic, 0) < 0)
-            {
-                ESP_LOGE(TAG, "Failed to subscribe to remote_log");
-            }
-
-            // 订阅本地日志上报主题
-            memset(topic, 0, sizeof(topic));
-            snprintf(topic, sizeof(topic), "server/%s/cmd/local_log", DEVICE_ID);
-            if (esp_mqtt_client_subscribe(event->client, topic, 0) < 0)
-            {
-                ESP_LOGE(TAG, "Failed to subscribe to local_log");
-            }
-
-            // 订阅服务器下发的下一步操作主题，群控模式下才会有这个主题
-            memset(topic, 0, sizeof(topic));
-            snprintf(topic, sizeof(topic), "server/rack/%s/CanNextstep", AgingNumber);
-            if (esp_mqtt_client_subscribe(event->client, topic, 0) < 0)
-            {
-                ESP_LOGE(TAG, "Failed to subscribe to Cannextstep");
-            }
-        }
-
-        Config_Report(100);
+        /* 订阅、上线与配置上报由 CPU1 服务任务按确认事件推进。 */
+        mqtt_service_wake();
         break;
     }
 
@@ -526,7 +509,14 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
 
     case MQTT_EVENT_SUBSCRIBED:
     {
-        ESP_LOGI(TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
+        bool accepted = event->data != NULL && event->data_len > 0;
+        portENTER_CRITICAL(&s_mqtt_state_lock);
+        unsigned expected = s_service_ack.subscribe_count;
+        portEXIT_CRITICAL(&s_mqtt_state_lock);
+        accepted = accepted && event->data_len == expected;
+        for (int i = 0; i < event->data_len && accepted; ++i)
+            accepted = (uint8_t)event->data[i] <= 2U;
+        mqtt_service_ack_event(event, accepted ? MQTT_ACK_SUBSCRIBED : MQTT_ACK_REJECTED);
         break;
     }
 
@@ -538,9 +528,15 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
 
     case MQTT_EVENT_PUBLISHED:
     {
-        ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
+        mqtt_service_ack_event(event, MQTT_ACK_PUBLISHED);
         break;
     }
+
+    case MQTT_EVENT_DELETED:
+        mqtt_service_ack_event(event, MQTT_ACK_DELETED);
+        /* 汇总诊断在服务任务输出，回调不递归发布日志。 */
+        atomic_fetch_add(&s_deleted_count, 1);
+        break;
 
     case MQTT_EVENT_DATA:
     {
@@ -687,36 +683,34 @@ static esp_err_t mqtt_app_start_locked(void)
         return s_client_started && !stopping ? ESP_OK : ESP_ERR_INVALID_STATE;
     }
 
+    esp_err_t init_err = mqtt_init_locked();
+    if (init_err != ESP_OK) return init_err;
     char *json = create_up_line_json(0, DEVICE_ID);
+    if (json == NULL) return ESP_ERR_NO_MEM;
 
     esp_mqtt_client_config_t mqtt_cfg = {
-        .broker = {
-            .address = {
-                .hostname = SERVER_IP,
-                .port = SERVER_UDP_Port,
-                .transport = MQTT_TRANSPORT_OVER_TCP,
-            }},
-        .credentials = {.username = "dev", .authentication = {
-                                               .password = "123456",
-                                           }},
-        .session = {.keepalive = IsRoot == 1 ? MQTT_ROOT_KEEPALIVE_SECONDS : MQTT_NODE_KEEPALIVE_SECONDS, .disable_clean_session = false, .protocol_ver = MQTT_PROTOCOL_V_3_1_1, .last_will = {
-                                                                                                                                                                                     .topic = "device/public/down_line",
-                                                                                                                                                                                     .msg = json,
-                                                                                                                                                                                     .qos = 1,
-                                                                                                                                                                                     .retain = 0,
-
-                                                                                                                                                                                 }},
-        .network = {
-            .timeout_ms = 10000, // 网络连接超时时间，单位为毫秒
-            .disable_auto_reconnect = false,
-            .reconnect_timeout_ms = IsRoot == 1 ? 0 : MQTT_NODE_RECONNECT_WAIT_MS, // 根节点保留SDK默认退避。
-
+        .broker.address = {
+            .hostname = SERVER_IP,
+            .port = SERVER_UDP_Port,
+            .transport = MQTT_TRANSPORT_OVER_TCP,
         },
-        .buffer = {
-            .size = 1024,
-            .out_size = 8192,
-        }
-
+        .credentials = {.username = "dev", .authentication.password = "123456"},
+        .session = {
+            .keepalive = IsRoot == 1 ? MQTT_ROOT_KEEPALIVE_SECONDS : MQTT_NODE_KEEPALIVE_SECONDS,
+            .message_retransmit_timeout = 5000,
+            .disable_clean_session = false,
+            .protocol_ver = MQTT_PROTOCOL_V_3_1_1,
+            .last_will = {
+                .topic = "device/public/down_line", .msg = json, .qos = 1, .retain = 0,
+            },
+        },
+        .network = {
+            .timeout_ms = 10000,
+            .disable_auto_reconnect = IsRoot == 0,
+            .reconnect_timeout_ms = 0, // 根节点使用SDK默认10秒；子节点由服务任务调度。
+        },
+        .outbox.limit = MQTT_OUTBOX_LIMIT_BYTES,
+        .buffer = {.size = 1024, .out_size = 8192},
     };
 
     ESP_LOGI(TAG, "Starting MQTT client...");
@@ -729,7 +723,11 @@ static esp_err_t mqtt_app_start_locked(void)
     }
     portENTER_CRITICAL(&s_mqtt_state_lock);
     s_client = client;
-    s_mqtt_control.phase = MQTT_APP_CONNECTING;
+    s_connection_epoch++;
+    s_node_retry_step = 0;
+    s_node_first_start = IsRoot == 0;
+    s_node_retry_scheduled = false;
+    s_mqtt_control.phase = IsRoot == 0 ? MQTT_APP_WAIT_RECONNECT : MQTT_APP_CONNECTING;
     s_mqtt_control.switch_pending = false;
     s_mqtt_control.expedite_pending = false;
     s_mqtt_control.disconnect_requested = false;
@@ -743,6 +741,11 @@ static esp_err_t mqtt_app_start_locked(void)
         return ret;
     }
 
+    if (IsRoot == 0) {
+        /* 首次 start 也由服务任务错峰；句柄在生命周期锁下已完整注册。 */
+        mqtt_service_wake();
+        return ESP_OK;
+    }
     ret = esp_mqtt_client_start(s_client);
     if (ret != ESP_OK)
     {
@@ -781,6 +784,9 @@ void mqtt_app_stop(void)
         return;
     }
     portENTER_CRITICAL(&s_mqtt_state_lock);
+    s_connection_epoch++;
+    s_service_ack.capture = false;
+    s_service_ack.pending_id = 0;
     s_mqtt_control.phase = MQTT_APP_STOPPING;
     s_mqtt_control.switch_pending = false;
     s_mqtt_control.expedite_pending = false;
@@ -836,47 +842,389 @@ void mqtt_app_restart(void)
         ESP_LOGE(TAG, "Restart MQTT client failed: %s", esp_err_to_name(err));
 }
 
-static int mqtt_app_publish(char *topic, char *publish_string)
+/* SDK QoS0 enqueue(store=false) 不发送，运行日志另走有界、一次性服务队列。 */
+static bool mqtt_runtime_topic(const char *topic)
 {
-    /* SDK回调中的 Config_Report 也会发布，不能获取可能被 stop 持有的生命周期锁。 */
-    portENTER_CRITICAL(&s_mqtt_state_lock);
-    esp_mqtt_client_handle_t client = atomic_load(&s_mqtt_connected) &&
-                                              s_mqtt_control.phase == MQTT_APP_CONNECTED
-                                          ? s_client
-                                          : NULL;
-    if (client != NULL)
-        s_mqtt_control.publish_refs++;
-    portEXIT_CRITICAL(&s_mqtt_state_lock);
-    if (client == NULL)
-        return -1;
-    int msg_id = esp_mqtt_client_publish(client, topic, publish_string, 0, 1, 0);
+    char expected[MQTT_TOPIC_ITEM_CAPACITY];
+    int len = snprintf(expected, sizeof(expected), "device/%s/log/runtime", DEVICE_ID);
+    return len > 0 && len < sizeof(expected) && strcmp(topic, expected) == 0;
+}
+
+static void mqtt_client_release(void)
+{
     portENTER_CRITICAL(&s_mqtt_state_lock);
     s_mqtt_control.publish_refs--;
     portEXIT_CRITICAL(&s_mqtt_state_lock);
-    ESP_LOGI(TAG, "sent publish returned msg_id=%d", msg_id);
-    return msg_id;
 }
 
-int app_mqtt_publish(char *topic_name, char *publish_string, char *DEVICE_ID)
+/* 准入锁下获取引用，stop 等待引用释放后才销毁；不获取生命周期锁。 */
+static esp_mqtt_client_handle_t mqtt_client_acquire(uint32_t epoch)
 {
-    if (s_mqtt_connected == false)
-    {
-        ESP_LOGW(TAG, "MQTT is not connected. Cannot publish message.");
-        return -1;
-    }
-    char topic[64]; // 增大一点，确保空间足够
+    portENTER_CRITICAL(&s_mqtt_state_lock);
+    esp_mqtt_client_handle_t client = atomic_load(&s_mqtt_connected) &&
+        s_mqtt_control.phase == MQTT_APP_CONNECTED && !s_mqtt_control.switch_pending &&
+        (epoch == 0 || epoch == s_connection_epoch) ? s_client : NULL;
+    if (client != NULL) s_mqtt_control.publish_refs++;
+    portEXIT_CRITICAL(&s_mqtt_state_lock);
+    return client;
+}
 
-    // DEVICE_ID 是整数，要用 %d 格式符
-    if (DEVICE_ID != NULL)
-    {
-        snprintf(topic, sizeof(topic), topic_name, DEVICE_ID);
+static int mqtt_enqueue_for_session(const char *topic, const char *payload, uint32_t epoch, bool startup)
+{
+    if (s_mqtt_admission_mutex == NULL ||
+        xSemaphoreTake(s_mqtt_admission_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return -1;
+    esp_mqtt_client_handle_t client = mqtt_client_acquire(epoch);
+    int result = -1;
+    if (client != NULL) {
+        size_t bytes = strlen(payload) + strlen(topic) + 16U; // 含 MQTT 可变长头与 packet ID 的保守上界。
+        unsigned used = esp_mqtt_client_get_outbox_size(client);
+        unsigned limit = startup ? MQTT_OUTBOX_LIMIT_BYTES : MQTT_OUTBOX_NORMAL_BYTES;
+        atomic_store(&s_last_outbox_bytes, used);
+        if (bytes > limit || used > limit - bytes) {
+            result = -2;
+            atomic_fetch_add(&s_rejected_count, 1);
+        } else {
+            result = esp_mqtt_client_enqueue(client, topic, payload, 0, 1, 0, true);
+        }
+        mqtt_client_release();
     }
-    else
-    {
-        snprintf(topic, sizeof(topic), "%s", topic_name);
-    }
+    if (xSemaphoreGive(s_mqtt_admission_mutex) != pdTRUE)
+        ESP_LOGE(TAG, "MQTT admission unlock failed");
+    return result;
+}
 
-    return mqtt_app_publish(topic, publish_string);
+int app_mqtt_publish(char *topic_name, char *publish_string, char *device_id)
+{
+    if (topic_name == NULL || publish_string == NULL) return -1;
+    char topic[MQTT_TOPIC_ITEM_CAPACITY];
+    int len = device_id != NULL ? snprintf(topic, sizeof(topic), topic_name, device_id)
+                                : snprintf(topic, sizeof(topic), "%s", topic_name);
+    if (len < 0 || len >= sizeof(topic)) return -1;
+    if (mqtt_runtime_topic(topic)) {
+        MqttRuntimeLog item = {0};
+        if (strlen(publish_string) >= sizeof(item.payload) || s_runtime_queue == NULL) return -1;
+        portENTER_CRITICAL(&s_mqtt_state_lock);
+        item.epoch = s_connection_epoch;
+        bool connected = atomic_load(&s_mqtt_connected);
+        portEXIT_CRITICAL(&s_mqtt_state_lock);
+        if (!connected) return -1;
+        memcpy(item.topic, topic, (size_t)len + 1U);
+        memcpy(item.payload, publish_string, strlen(publish_string) + 1U);
+        if (xQueueSend(s_runtime_queue, &item, 0) != pdTRUE) {
+            atomic_fetch_add(&s_rejected_count, 1);
+            return -2;
+        }
+        mqtt_service_wake();
+        return 0; // 已接受 best effort 日志；不是 broker 确认。
+    }
+    return mqtt_enqueue_for_session(topic, publish_string, 0, false);
+}
+
+typedef enum {
+    MQTT_SETUP_SUBSCRIBE, MQTT_SETUP_SUBACK, MQTT_SETUP_ONLINE,
+    MQTT_SETUP_ONLINE_ACK, MQTT_SETUP_CONFIG_WAIT, MQTT_SETUP_CONFIG, MQTT_SETUP_DONE
+} MqttSetupPhase;
+
+typedef struct {
+    uint32_t epoch;
+    MqttSetupPhase phase;
+    TickType_t due;
+    TickType_t suback_started;
+    uint8_t retry_step;
+    bool suback_warned;
+    char *online_json; // 仅服务任务访问、每代次生成一次；下一代次/断开时释放。
+} MqttServiceWork;
+static MqttServiceWork s_service_work;
+
+static void mqtt_setup_retry(MqttServiceWork *work, TickType_t now)
+{
+    uint32_t delay_ms = mqtt_retry_delay_ms(&work->retry_step);
+    work->due = now + pdMS_TO_TICKS(delay_ms);
+    ESP_LOGW(TAG, "MQTT setup retry: epoch=%lu phase=%d wait_ms=%lu",
+             (unsigned long)work->epoch, work->phase, (unsigned long)delay_ms);
+}
+
+static bool mqtt_ack_begin(uint32_t epoch, unsigned subscribe_count)
+{
+    portENTER_CRITICAL(&s_mqtt_state_lock);
+    s_service_ack.capture = false;
+    s_service_ack.pending_id = 0;
+    portEXIT_CRITICAL(&s_mqtt_state_lock);
+    memset(s_ack_map, 0, MQTT_ACK_MAP_BYTES);
+    portENTER_CRITICAL(&s_mqtt_state_lock);
+    bool current = epoch == s_connection_epoch && atomic_load(&s_mqtt_connected);
+    if (current) {
+        s_service_ack.epoch = epoch;
+        s_service_ack.flags = 0;
+        s_service_ack.subscribe_count = subscribe_count;
+        s_service_ack.capture = true;
+    }
+    portEXIT_CRITICAL(&s_mqtt_state_lock);
+    return current;
+}
+
+static void mqtt_ack_register(uint32_t epoch, int msg_id)
+{
+    portENTER_CRITICAL(&s_mqtt_state_lock);
+    if (epoch == s_connection_epoch && s_service_ack.epoch == epoch) {
+        s_service_ack.flags = mqtt_ack_flags_locked(msg_id);
+        s_service_ack.pending_id = msg_id > 0 ? msg_id : 0;
+        s_service_ack.capture = false;
+    }
+    portEXIT_CRITICAL(&s_mqtt_state_lock);
+}
+
+static uint8_t mqtt_ack_result(uint32_t epoch)
+{
+    portENTER_CRITICAL(&s_mqtt_state_lock);
+    uint8_t flags = epoch == s_connection_epoch ? s_service_ack.flags : 0;
+    portEXIT_CRITICAL(&s_mqtt_state_lock);
+    return flags;
+}
+
+/* 生命周期锁由调用者持有。SDK subscribe 写入可能阻塞，回调不获取本锁。 */
+static int mqtt_restore_subscriptions(uint32_t epoch)
+{
+    static const struct { const char *format; bool rack; } common[] = {
+        {"server/%s/cmd/ota", false}, {"server/rack/%s/CanRestart", true},
+        {"server/%s/cmd/set_config", false}, {"server/%s/cmd/get_config", false},
+    }, child[] = {
+        {"server/%s/cmd/start_aging", false}, {"server/%s/cmd/stop_aging", false},
+        {"server/%s/public/cmd/stop_aging", true}, {"server/%s/cmd/set_pn", false},
+        {"server/%s/cmd/get_state", false}, {"server/%s/cmd/get_lost_aging", false},
+        {"server/%s/cmd/remote_log", false}, {"server/%s/cmd/local_log", false},
+        {"server/rack/%s/CanNextstep", true},
+    };
+    char names[13][MQTT_TOPIC_ITEM_CAPACITY];
+    esp_mqtt_topic_t topics[13];
+    unsigned count = 0;
+    for (unsigned i = 0; i < sizeof(common) / sizeof(common[0]); ++i) {
+        int n = snprintf(names[count], sizeof(names[count]), common[i].format,
+                         common[i].rack ? AgingNumber : DEVICE_ID);
+        if (n < 0 || n >= sizeof(names[count])) return -1;
+        topics[count] = (esp_mqtt_topic_t){.filter = names[count], .qos = 0};
+        count++;
+    }
+    if (IsRoot == 1) {
+        int n = snprintf(names[count], sizeof(names[count]), "server/%s/cmd/CPower", DEVICE_ID);
+        if (n < 0 || n >= sizeof(names[count])) return -1;
+        topics[count] = (esp_mqtt_topic_t){.filter = names[count], .qos = 0};
+        count++;
+    } else {
+        for (unsigned i = 0; i < sizeof(child) / sizeof(child[0]); ++i) {
+            int n = snprintf(names[count], sizeof(names[count]), child[i].format,
+                             child[i].rack ? AgingNumber : DEVICE_ID);
+            if (n < 0 || n >= sizeof(names[count])) return -1;
+            topics[count] = (esp_mqtt_topic_t){.filter = names[count], .qos = 0};
+            count++;
+        }
+    }
+    if (xSemaphoreTake(s_mqtt_admission_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return -1;
+    int result = -1;
+    if (mqtt_session_current(epoch) && mqtt_ack_begin(epoch, count)) {
+        unsigned used = esp_mqtt_client_get_outbox_size(s_client);
+        /* SUBSCRIBE: fixed header + packet ID + 每个 topic 的长度字段与 QoS 字节。 */
+        size_t bytes = 16U;
+        for (unsigned i = 0; i < count; ++i) bytes += strlen(names[i]) + 3U;
+        if (bytes > MQTT_OUTBOX_LIMIT_BYTES || used > MQTT_OUTBOX_LIMIT_BYTES - bytes) {
+            result = -2;
+            atomic_fetch_add(&s_rejected_count, 1);
+        } else {
+            result = esp_mqtt_client_subscribe_multiple(s_client, topics, count);
+            /* SDK 写订阅失败时可能已将未知 msg_id 放入 outbox，不能直接再提交一批。
+             * 请求正常断开后由既有恢复路径处理，不停止/重建客户端。 */
+            if (result < 0 && esp_mqtt_client_disconnect(s_client) != ESP_OK)
+                ESP_LOGW(TAG, "MQTT subscribe failed; disconnect request rejected");
+        }
+        mqtt_ack_register(epoch, result);
+    }
+    if (xSemaphoreGive(s_mqtt_admission_mutex) != pdTRUE)
+        ESP_LOGE(TAG, "MQTT admission unlock failed");
+    return result;
+}
+
+/* 只在服务任务访问调度；回调更新的计数/状态在短临界区内快照。 */
+static void mqtt_node_reconnect_poll(TickType_t now)
+{
+    if (IsRoot != 0) return;
+    SemaphoreHandle_t mutex = mqtt_lifecycle_mutex();
+    if (mutex == NULL || xSemaphoreTake(mutex, 0) != pdTRUE) return;
+    portENTER_CRITICAL(&s_mqtt_state_lock);
+    bool waiting = s_client != NULL && s_mqtt_control.phase == MQTT_APP_WAIT_RECONNECT;
+    bool scheduled = s_node_retry_scheduled;
+    bool first = s_node_first_start;
+    uint8_t step = s_node_retry_step;
+    TickType_t due = s_node_retry_due;
+    uint32_t epoch = s_connection_epoch;
+    portEXIT_CRITICAL(&s_mqtt_state_lock);
+    bool parent_online = __atomic_load_n(&Network_Flag, __ATOMIC_ACQUIRE) != 0;
+    if (!waiting || !parent_online) {
+        portENTER_CRITICAL(&s_mqtt_state_lock);
+        s_node_retry_scheduled = false;
+        portEXIT_CRITICAL(&s_mqtt_state_lock);
+    } else if (!scheduled) {
+        unsigned logged_step = step;
+        uint32_t delay_ms = first ? esp_random() % (MQTT_INITIAL_JITTER_MS + 1U)
+                                  : mqtt_retry_delay_ms(&step);
+        portENTER_CRITICAL(&s_mqtt_state_lock);
+        if (epoch == s_connection_epoch) {
+            s_node_retry_due = now + pdMS_TO_TICKS(delay_ms);
+            s_node_retry_scheduled = true;
+        }
+        portEXIT_CRITICAL(&s_mqtt_state_lock);
+        ESP_LOGI(TAG, "Child MQTT connect scheduled: wait_ms=%lu step=%u first=%d",
+                 (unsigned long)delay_ms, logged_step, first);
+    } else if (mqtt_due(now, due)) {
+        portENTER_CRITICAL(&s_mqtt_state_lock);
+        bool current = epoch == s_connection_epoch && s_mqtt_control.phase == MQTT_APP_WAIT_RECONNECT;
+        if (current) {
+            s_mqtt_control.phase = MQTT_APP_CONNECTING;
+            s_node_retry_scheduled = false;
+            s_node_first_start = false;
+            if (!first && s_node_retry_step < 4) s_node_retry_step++;
+        }
+        portEXIT_CRITICAL(&s_mqtt_state_lock);
+        if (current) {
+            esp_err_t err = s_client_started ? esp_mqtt_client_reconnect(s_client)
+                                             : esp_mqtt_client_start(s_client);
+            if (err == ESP_OK) {
+                if (!s_client_started) {
+                    s_client_started = true;
+                    ESP_LOGI(TAG, "MQTT client started: client=%p, start_count=%u",
+                             (void *)s_client, ++s_client_start_count);
+                }
+            } else {
+                portENTER_CRITICAL(&s_mqtt_state_lock);
+                if (epoch == s_connection_epoch && s_mqtt_control.phase == MQTT_APP_CONNECTING)
+                    s_mqtt_control.phase = MQTT_APP_WAIT_RECONNECT;
+                portEXIT_CRITICAL(&s_mqtt_state_lock);
+                ESP_LOGW(TAG, "Child MQTT connect request failed: %s", esp_err_to_name(err));
+            }
+        }
+    }
+    mqtt_lifecycle_unlock(mutex);
+}
+
+static void mqtt_service_poll(void)
+{
+    TickType_t now = xTaskGetTickCount();
+    mqtt_node_reconnect_poll(now);
+    portENTER_CRITICAL(&s_mqtt_state_lock);
+    uint32_t epoch = s_connection_epoch;
+    bool connected = atomic_load(&s_mqtt_connected) && s_mqtt_control.phase == MQTT_APP_CONNECTED;
+    portEXIT_CRITICAL(&s_mqtt_state_lock);
+    MqttServiceWork *work = &s_service_work;
+    if (work->epoch != epoch) {
+        free(work->online_json);
+        *work = (MqttServiceWork){.epoch = epoch, .phase = MQTT_SETUP_SUBSCRIBE, .due = now};
+    }
+    if (!connected || !mqtt_due(now, work->due)) return;
+    uint8_t flags = mqtt_ack_result(epoch);
+    if (work->phase == MQTT_SETUP_SUBACK) {
+        if (flags & (MQTT_ACK_REJECTED | MQTT_ACK_DELETED)) {
+            work->phase = MQTT_SETUP_SUBSCRIBE;
+            mqtt_setup_retry(work, now);
+        } else if (flags & MQTT_ACK_SUBSCRIBED) {
+            work->phase = MQTT_SETUP_ONLINE;
+            work->retry_step = 0;
+            ESP_LOGI(TAG, "MQTT subscriptions confirmed: epoch=%lu", (unsigned long)epoch);
+        } else if (!work->suback_warned &&
+                   now - work->suback_started >= pdMS_TO_TICKS(MQTT_SUBACK_WARN_MS)) {
+            work->suback_warned = true;
+            ESP_LOGW(TAG, "MQTT SUBACK delayed; keep original batch pending, epoch=%lu", (unsigned long)epoch);
+        }
+        return;
+    }
+    if (work->phase == MQTT_SETUP_ONLINE_ACK) {
+        if (flags & MQTT_ACK_PUBLISHED) {
+            work->phase = MQTT_SETUP_CONFIG_WAIT;
+            work->due = now + pdMS_TO_TICKS(esp_random() % (MQTT_CONFIG_JITTER_MS + 1U));
+            work->retry_step = 0;
+            ESP_LOGI(TAG, "MQTT online confirmed: epoch=%lu", (unsigned long)epoch);
+        } else if (flags & MQTT_ACK_DELETED) {
+            work->phase = MQTT_SETUP_ONLINE;
+            mqtt_setup_retry(work, now);
+        }
+        return;
+    }
+    if (work->phase == MQTT_SETUP_CONFIG_WAIT) work->phase = MQTT_SETUP_CONFIG;
+    if (work->phase == MQTT_SETUP_DONE) return;
+    SemaphoreHandle_t mutex = mqtt_lifecycle_mutex();
+    if (xSemaphoreTake(mutex, 0) != pdTRUE) return;
+    if (!mqtt_session_current(epoch)) {
+        mqtt_lifecycle_unlock(mutex);
+        return;
+    }
+    if (work->phase == MQTT_SETUP_SUBSCRIBE) {
+        int id = mqtt_restore_subscriptions(epoch);
+        if (id > 0) {
+            work->phase = MQTT_SETUP_SUBACK;
+            work->suback_started = now;
+            work->suback_warned = false;
+        } else mqtt_setup_retry(work, now);
+    } else if (work->phase == MQTT_SETUP_ONLINE) {
+        if (work->online_json == NULL) work->online_json = create_up_line_json(time(NULL), DEVICE_ID);
+        int id = -1;
+        if (work->online_json != NULL && mqtt_ack_begin(epoch, 0)) {
+            id = mqtt_enqueue_for_session("device/public/up_line", work->online_json, epoch, true);
+            mqtt_ack_register(epoch, id);
+        }
+        if (id > 0) work->phase = MQTT_SETUP_ONLINE_ACK;
+        else mqtt_setup_retry(work, now);
+    } else if (work->phase == MQTT_SETUP_CONFIG) {
+        char *json = CreateReadConfigJsonFromFiles_MQTT(time(NULL), 100, 1, NULL);
+        char topic[MQTT_TOPIC_ITEM_CAPACITY];
+        int len = snprintf(topic, sizeof(topic), "device/%s/cmd/reply/config", DEVICE_ID);
+        if (json != NULL && len > 0 && len < sizeof(topic)) {
+            if (strlen(json) + strlen(topic) + 16U > MQTT_OUTBOX_NORMAL_BYTES) {
+                atomic_fetch_add(&s_rejected_count, 1);
+                ESP_LOGE(TAG, "MQTT config exceeds budget; full payload rejected, bytes=%u", (unsigned)strlen(json));
+                work->phase = MQTT_SETUP_DONE;
+            } else if (mqtt_enqueue_for_session(topic, json, epoch, false) > 0) {
+                work->phase = MQTT_SETUP_DONE;
+            } else mqtt_setup_retry(work, now);
+        } else mqtt_setup_retry(work, now);
+        free(json);
+    }
+    mqtt_lifecycle_unlock(mutex);
+}
+
+static void mqtt_runtime_poll(void)
+{
+    MqttRuntimeLog item;
+    if (xQueueReceive(s_runtime_queue, &item, 0) != pdTRUE) return;
+    if (s_service_work.phase < MQTT_SETUP_CONFIG_WAIT) return; // 上线优先，日志不补发。
+    if (xSemaphoreTake(s_mqtt_admission_mutex, 0) != pdTRUE) return;
+    esp_mqtt_client_handle_t client = mqtt_client_acquire(item.epoch);
+    if (client != NULL) {
+        // 仅此 best effort 路径同步写，位于 CPU1 服务任务，绝不在 SDK 回调/业务调用者中写。
+        if (esp_mqtt_client_publish(client, item.topic, item.payload, 0, 0, 0) < 0)
+            atomic_fetch_add(&s_rejected_count, 1);
+        mqtt_client_release();
+    }
+    if (xSemaphoreGive(s_mqtt_admission_mutex) != pdTRUE)
+        ESP_LOGE(TAG, "MQTT admission unlock failed");
+}
+
+void mqtt_app_service_task(void *arg)
+{
+    TickType_t last_diagnostic = xTaskGetTickCount();
+    unsigned last_rejected = 0, last_deleted = 0;
+    for (;;) {
+        mqtt_service_poll();
+        mqtt_runtime_poll();
+        TickType_t now = xTaskGetTickCount();
+        if (now - last_diagnostic >= pdMS_TO_TICKS(10000)) {
+            unsigned rejected = atomic_load(&s_rejected_count), deleted = atomic_load(&s_deleted_count);
+            if (rejected != last_rejected || deleted != last_deleted)
+                ESP_LOGW(TAG, "MQTT pressure: rejected=%u expired=%u last_outbox_bytes=%u",
+                         rejected, deleted, atomic_load(&s_last_outbox_bytes));
+            last_rejected = rejected;
+            last_deleted = deleted;
+            last_diagnostic = now;
+        }
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(MQTT_SERVICE_POLL_MS));
+    }
 }
 
 int app_read_MQTT_topic(char *topic_buffer, int buffer_len, uint32_t timeout)
@@ -968,6 +1316,17 @@ static esp_err_t mqtt_init_locked(void)
         }
     }
 
+    if (s_ack_map == NULL) {
+        s_ack_map = app_calloc_prefer_psram(1, MQTT_ACK_MAP_BYTES);
+        if (s_ack_map == NULL) return ESP_ERR_NO_MEM;
+    }
+    if (s_runtime_queue == NULL) {
+        s_runtime_queue = xQueueCreate(MQTT_RUNTIME_QUEUE_LEN, sizeof(MqttRuntimeLog));
+        if (s_runtime_queue == NULL) return ESP_ERR_NO_MEM;
+    }
+    if (s_mqtt_service_task == NULL &&
+        app_create_mqtt_service_task(mqtt_app_service_task, &s_mqtt_service_task) != pdPASS)
+        return ESP_ERR_NO_MEM;
     return ESP_OK;
 }
 

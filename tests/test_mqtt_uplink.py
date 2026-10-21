@@ -36,22 +36,40 @@ static int xSemaphoreTake(SemaphoreHandle_t mutex, TickType_t timeout) {
 }
 static int xSemaphoreGive(SemaphoreHandle_t mutex) { return pthread_mutex_unlock(&mutex->mutex) == 0 ? pdTRUE : 0; }
 
-typedef void *QueueHandle_t;
+typedef struct { unsigned cap, size, count, head; unsigned char *data; } *QueueHandle_t;
 static int queue_create_count, publish_count, subscribe_count, config_report_count;
-static QueueHandle_t xQueueCreate(int length, size_t size) { (void)length; (void)size; return (void *)(uintptr_t)++queue_create_count; }
-static int xQueueSend(QueueHandle_t queue, const void *item, TickType_t timeout) { (void)queue; (void)item; (void)timeout; return pdTRUE; }
-static int xQueueReceive(QueueHandle_t queue, void *item, TickType_t timeout) { (void)queue; (void)item; (void)timeout; return 0; }
+static QueueHandle_t xQueueCreate(int length, size_t size) {
+    QueueHandle_t q = calloc(1,sizeof(*q)); q->cap=length; q->size=size; q->data=calloc(length,size); queue_create_count++; return q;
+}
+static int xQueueSend(QueueHandle_t q, const void *item, TickType_t timeout) {
+    (void)timeout; if(q->count==q->cap) return 0; memcpy(q->data+((q->head+q->count)%q->cap)*q->size,item,q->size); q->count++; return pdTRUE;
+}
+static int xQueueReceive(QueueHandle_t q, void *item, TickType_t timeout) {
+    (void)timeout; if(!q->count) return 0; memcpy(item,q->data+q->head*q->size,q->size); q->head=(q->head+1)%q->cap; q->count--; return pdTRUE;
+}
 typedef struct { int unused; } cJSON;
-static cJSON *cJSON_CreateObject(void) { return NULL; }
+static cJSON *cJSON_CreateObject(void) { return calloc(1, sizeof(cJSON)); }
 static void cJSON_AddNumberToObject(cJSON *object, const char *key, double value) { (void)object; (void)key; (void)value; }
 static void cJSON_AddStringToObject(cJSON *object, const char *key, const char *value) { (void)object; (void)key; (void)value; }
-static void cJSON_AddItemToObject(cJSON *object, const char *key, cJSON *value) { (void)object; (void)key; (void)value; }
-static void cJSON_Delete(cJSON *object) { (void)object; }
-static char *cJSON_PrintUnformatted(cJSON *object) { (void)object; return NULL; }
+static void cJSON_AddItemToObject(cJSON *object, const char *key, cJSON *value) { (void)object; (void)key; free(value); }
+static void cJSON_Delete(cJSON *object) { free(object); }
+static char *cJSON_PrintUnformatted(cJSON *object) { (void)object; return strdup("{\"Data\":{\"id\":\"test-device\"}}"); }
 static const char *DEVICE_ID = "test-device", *AgingNumber = "rack";
 typedef struct { const char *version; } MockAppDesc;
 static const MockAppDesc *esp_app_get_description(void) { static MockAppDesc desc = {"test"}; return &desc; }
 static void Config_Report(int type) { (void)type; config_report_count++; }
+static char *CreateReadConfigJsonFromFiles_MQTT(int seq, int cmd_seq, int code, const char *msg) {
+    (void)seq; (void)cmd_seq; (void)code; (void)msg; config_report_count++; return strdup("{\"config\":true}");
+}
+static void *app_calloc_prefer_psram(size_t count, size_t bytes) { return calloc(count, bytes); }
+static uint32_t random_value;
+static uint32_t esp_random(void) { return random_value; }
+static int service_task_creates, service_task_error;
+static uint8_t mesh_get_current_level(void) { return IsRoot ? 1 : 2; }
+static int app_create_mqtt_service_task(void (*fn)(void *), TaskHandle_t *handle) {
+    (void)fn; if (service_task_error) return 0; if (*handle == NULL) { *handle = (void *)7; service_task_creates++; } return pdPASS;
+}
+
 #define MQTT_TRANSPORT_OVER_TCP 1
 #define MQTT_PROTOCOL_V_3_1_1 4
 #define MQTT_ERROR_TYPE_TCP_TRANSPORT 1
@@ -63,16 +81,18 @@ static void Config_Report(int type) { (void)type; config_report_count++; }
 #define MQTT_EVENT_PUBLISHED 5
 #define MQTT_EVENT_DATA 6
 #define MQTT_EVENT_ERROR 8
+#define MQTT_EVENT_DELETED 9
 
 typedef struct {
     struct { struct { const char *hostname; int port, transport; } address; } broker;
     struct { const char *username; struct { const char *password; } authentication; } credentials;
     struct {
-        int keepalive, protocol_ver; bool disable_clean_session;
+        int keepalive, protocol_ver, message_retransmit_timeout; bool disable_clean_session;
         struct { const char *topic, *msg; int qos, retain; } last_will;
     } session;
     struct { int timeout_ms, reconnect_timeout_ms; bool disable_auto_reconnect; } network;
     struct { int size, out_size; } buffer;
+    struct { uint64_t limit; } outbox;
 } esp_mqtt_client_config_t;
 typedef struct { bool alive, running; int sdk_phase; } MockMqttClient;
 typedef MockMqttClient *esp_mqtt_client_handle_t;
@@ -87,6 +107,9 @@ typedef MockMqttEvent *esp_mqtt_event_handle_t;
 static MockMqttClient sdk_clients[32];
 static esp_mqtt_client_config_t captured_config;
 static int init_count, start_count, stop_count, destroy_count, disconnect_count, reconnect_count;
+static int next_msg_id = 100, outbox_bytes, last_qos, enqueue_count;
+static bool early_suback, early_puback, track_outbox_bytes;
+
 static int sdk_disconnect_error, sdk_reconnect_error, sdk_stop_error, sdk_destroy_error, sdk_start_error;
 static void (*sdk_handler)(void *, esp_event_base_t, int32_t, void *);
 static void (*sdk_start_hook)(void);
@@ -147,17 +170,41 @@ static esp_err_t esp_mqtt_client_destroy(esp_mqtt_client_handle_t client) {
     client->alive = false; return ESP_OK;
 }
 static int esp_mqtt_client_subscribe(esp_mqtt_client_handle_t client, const char *topic, int qos) {
-    (void)topic; (void)qos; assert(client->alive && client->running); subscribe_count++; return 1;
+    (void)topic; (void)qos; assert(!in_sdk_callback && client->alive && client->running); subscribe_count++; return 1;
 }
+typedef struct { const char *filter; int qos; } esp_mqtt_topic_t;
+static void sdk_ack(esp_mqtt_client_handle_t client, int kind, int id, bool accepted, int count) {
+    char codes[13] = {0}; if (!accepted) codes[0] = (char)0x80;
+    MockMqttEvent event = {.client=client, .event_id=kind, .msg_id=id, .data=codes, .data_len=count};
+    bool previous = in_sdk_callback; in_sdk_callback = true; sdk_handler(NULL, 0, kind, &event); in_sdk_callback = previous;
+}
+static int esp_mqtt_client_subscribe_multiple(esp_mqtt_client_handle_t client, const esp_mqtt_topic_t *topics, int count) {
+    assert(!in_sdk_callback && client->alive && client->running); (void)topics; subscribe_count += count;
+    int id = ++next_msg_id;
+    if (early_suback) sdk_ack(client, MQTT_EVENT_SUBSCRIBED, id, true, count);
+    return id;
+}
+static int esp_mqtt_client_get_outbox_size(esp_mqtt_client_handle_t client) { assert(client->alive); return outbox_bytes; }
+
 static int esp_mqtt_client_publish(esp_mqtt_client_handle_t client, const char *topic,
     const char *data, int len, int qos, int retain) {
-    (void)topic; (void)data; (void)len; (void)qos; (void)retain; assert(client->alive); publish_count++;
+    (void)topic; (void)data; (void)len; (void)retain; assert(!in_sdk_callback && client->alive); last_qos = qos; publish_count++;
     pthread_mutex_lock(&test_gate);
     publish_entered = true; pthread_cond_broadcast(&test_cond);
     while (block_publish && !allow_publish) pthread_cond_wait(&test_cond, &test_gate);
     pthread_mutex_unlock(&test_gate);
     assert(client->alive); return 10;
 }
+static int esp_mqtt_client_enqueue(esp_mqtt_client_handle_t client, const char *topic,
+    const char *data, int len, int qos, int retain, bool store) {
+    assert(store && qos == 1 && !in_sdk_callback); enqueue_count++;
+    esp_mqtt_client_publish(client, topic, data, len, qos, retain);
+    if (track_outbox_bytes) outbox_bytes += strlen(data) + strlen(topic) + 16;
+    int id = ++next_msg_id;
+    if (early_puback) sdk_ack(client, MQTT_EVENT_PUBLISHED, id, true, 0);
+    return id;
+}
+
 '''
 
 TESTS = r'''
@@ -167,7 +214,13 @@ static void reset(void) {
     memset(&s_mqtt_control, 0, sizeof(s_mqtt_control));
     atomic_store(&s_mqtt_connected, false);
     s_client_started = false; s_client_start_count = s_mqtt_connect_count = 0;
-    Topic_queue = Data_queue = NULL;
+    if (s_service_work.online_json) free(s_service_work.online_json);
+    memset(&s_service_work, 0, sizeof(s_service_work));
+    memset(&s_service_ack, 0, sizeof(s_service_ack));
+    s_connection_epoch = 0; s_node_retry_step = 0; s_node_retry_scheduled = false;
+    if (s_runtime_queue) s_runtime_queue->count = 0;
+    Network_Flag = 1; random_value = 0; outbox_bytes = 0; next_msg_id = 100;
+    early_puback = early_suback = track_outbox_bytes = false; enqueue_count = 0; last_qos = -1;
     memset(&s_state, 0, sizeof(s_state)); s_state.initialized = true;
     eth_netif = &eth_mock; wifi_netif = &wifi_mock;
     s_monitor_task_handle = (void *)1;
@@ -180,7 +233,7 @@ static void reset(void) {
     default_netif = &wifi_mock;
     now_us = 0; IsRoot = 1;
     init_count = start_count = stop_count = destroy_count = disconnect_count = reconnect_count = 0;
-    queue_create_count = publish_count = subscribe_count = config_report_count = 0;
+    publish_count = subscribe_count = config_report_count = 0;
     sdk_start_hook = NULL;
     block_stop = stop_entered = allow_stop = block_publish = publish_entered = allow_publish = false;
 }
@@ -197,7 +250,12 @@ static void set_route(dual_net_uplink_t uplink) {
 }
 static void change_while_starting(void) { set_route(DUAL_NET_UPLINK_ETH); }
 static void *stop_thread(void *arg) { (void)arg; mqtt_app_stop(); return NULL; }
-static void *publish_thread(void *arg) { (void)arg; assert(app_mqtt_publish("test", "payload", NULL) == 10); return NULL; }
+static void *publish_thread(void *arg) { (void)arg; assert(app_mqtt_publish("test", "payload", NULL) > 0); return NULL; }
+static void *budget_publish_thread(void *arg) {
+    (void)arg; char payload[1025]; memset(payload, 'x',1024); payload[1024]=0;
+    for (int i=0; i<80; ++i) {int rc=app_mqtt_publish("budget",payload,NULL); assert(rc>0 || rc==-2);}
+    return NULL;
+}
 int main(void) {
     reset(); start_wifi();
     esp_mqtt_client_handle_t original = s_client;
@@ -210,8 +268,9 @@ int main(void) {
     assert(reconnect_count == 1);
     sdk_emit(s_client, MQTT_EVENT_BEFORE_CONNECT);
     sdk_emit(s_client, MQTT_EVENT_CONNECTED);
-    assert(s_client == original && start_count == 1 && init_count == 1 && destroy_count == 0 && queue_create_count == 2);
-    assert(atomic_load(&s_mqtt_connected) && subscribe_count == 8);
+    assert(s_client == original && start_count == 1 && init_count == 1 && destroy_count == 0);
+    assert(atomic_load(&s_mqtt_connected) && subscribe_count == 0);
+    mqtt_service_poll(); assert(subscribe_count == 5);
     set_route(DUAL_NET_UPLINK_WIFI);
     sdk_emit(s_client, MQTT_EVENT_DISCONNECTED);
     assert(disconnect_count == 2 && reconnect_count == 2);
@@ -235,7 +294,8 @@ int main(void) {
     sdk_emit(s_client, MQTT_EVENT_DISCONNECTED);
     sdk_emit(s_client, MQTT_EVENT_BEFORE_CONNECT);
     sdk_emit(s_client, MQTT_EVENT_CONNECTED);
-    assert(atomic_load(&s_mqtt_connected) && subscribe_count == 4 && start_count == 1);
+    assert(atomic_load(&s_mqtt_connected) && subscribe_count == 0 && start_count == 1);
+    mqtt_service_poll(); assert(subscribe_count == 5);
     puts("PASS route change during connect rejects stale success without reporting online");
 
     reset(); s_state.active_uplink = DUAL_NET_UPLINK_ETH;
@@ -282,18 +342,27 @@ int main(void) {
     puts("PASS no uplink waits; restored uplink immediately wakes reconnection");
 
     reset(); IsRoot = 0;
-    mqtt_app_on_uplink_changed(DUAL_NET_UPLINK_ETH);
     assert(mqtt_init() == ESP_OK && mqtt_app_start() == ESP_OK);
-    assert(captured_config.session.keepalive == 15 && captured_config.network.reconnect_timeout_ms == 2000);
-    sdk_emit(s_client, MQTT_EVENT_CONNECTED);
-    assert(subscribe_count > 4);
-    sdk_emit(s_client, MQTT_EVENT_DISCONNECTED);
-    sdk_emit(s_client, MQTT_EVENT_BEFORE_CONNECT);
-    int previous_subscriptions = subscribe_count;
-    sdk_emit(s_client, MQTT_EVENT_CONNECTED);
-    assert(subscribe_count == previous_subscriptions * 2);
-    assert(disconnect_count == 0 && reconnect_count == 0 && init_count == 1);
-    puts("PASS child timing and automatic resubscription; no root handover control");
+    assert(captured_config.session.keepalive == 60 && captured_config.network.disable_auto_reconnect);
+    assert(start_count == 0); // initial attempt belongs to the service scheduler
+    random_value = 1500; mqtt_service_poll();
+    now_us += 1499000; mqtt_service_poll(); assert(start_count == 0);
+    now_us += 2000; mqtt_service_poll(); assert(start_count == 1);
+    sdk_emit(s_client, MQTT_EVENT_CONNECTED); mqtt_service_poll(); assert(subscribe_count == 13);
+    sdk_emit(s_client, MQTT_EVENT_DISCONNECTED); random_value = 0;
+    mqtt_service_poll(); now_us += 1999000; mqtt_service_poll(); assert(reconnect_count == 0);
+    now_us += 2000; mqtt_service_poll(); assert(reconnect_count == 1);
+    sdk_emit(s_client, MQTT_EVENT_BEFORE_CONNECT); sdk_emit(s_client, MQTT_EVENT_DISCONNECTED);
+    mqtt_service_poll(); assert(s_node_retry_due - xTaskGetTickCount() == 4000);
+    Network_Flag = 0; mqtt_service_poll(); assert(!s_node_retry_scheduled);
+    unsigned step_before = s_node_retry_step; now_us += 100000000; mqtt_service_poll();
+    assert(s_node_retry_step == step_before && reconnect_count == 1);
+    Network_Flag = 1; mqtt_service_poll(); assert(s_node_retry_due - xTaskGetTickCount() == 4000);
+    now_us += 4000000; mqtt_service_poll(); sdk_emit(s_client, MQTT_EVENT_BEFORE_CONNECT);
+    sdk_emit(s_client, MQTT_EVENT_CONNECTED); now_us += 30000000;
+    sdk_emit(s_client, MQTT_EVENT_DISCONNECTED); assert(s_node_retry_step == 0);
+    for (unsigned step=0; step<12; ++step) { uint8_t current=step; uint32_t delay=mqtt_retry_delay_ms(&current); assert(delay>=2000 && delay<=60000); }
+    puts("PASS child jitter/backoff, parent pause/resume, stable reset and client reuse");
 
     reset(); start_wifi();
     SemaphoreHandle_t mutex = mqtt_lifecycle_mutex();
@@ -344,7 +413,87 @@ int main(void) {
     sdk_start_error = 0; assert(mqtt_app_start() == ESP_OK);
     puts("PASS failed stop retains handle safely; failed start rolls back for retry");
 
+    reset(); start_wifi(); early_suback = early_puback = true;
+    assert(subscribe_count == 0 && publish_count == 0 && config_report_count == 0);
+    mqtt_service_poll(); assert(s_service_work.phase == MQTT_SETUP_SUBACK && subscribe_count == 5);
+    mqtt_service_poll(); assert(s_service_work.phase == MQTT_SETUP_ONLINE && enqueue_count == 0);
+    mqtt_service_poll(); assert(s_service_work.phase == MQTT_SETUP_ONLINE_ACK && enqueue_count == 1);
+    mqtt_service_poll(); assert(s_service_work.phase == MQTT_SETUP_CONFIG_WAIT && config_report_count == 0);
+    mqtt_service_poll(); assert(s_service_work.phase == MQTT_SETUP_DONE && config_report_count == 1);
+    mqtt_service_poll(); assert(enqueue_count == 2);
+    puts("PASS callbacks do no setup IO; early SUBACK/PUBACK preserve subscribe-online-config ordering");
+
+    reset(); start_wifi(); mqtt_service_poll();
+    int sub_id = s_service_ack.pending_id;
+    now_us += 11000000; mqtt_service_poll(); assert(subscribe_count == 5 && enqueue_count == 0);
+    sdk_ack(s_client, MQTT_EVENT_SUBSCRIBED, sub_id, false, 5);
+    mqtt_service_poll(); assert(s_service_work.phase == MQTT_SETUP_SUBSCRIBE && enqueue_count == 0);
+    mqtt_service_poll(); assert(subscribe_count == 5); // retry is delayed
+    now_us += 2000000; mqtt_service_poll(); assert(subscribe_count == 10);
+    sdk_ack(s_client, MQTT_EVENT_SUBSCRIBED, sub_id, true, 5); // obsolete batch ID
+    mqtt_service_poll(); assert(s_service_work.phase == MQTT_SETUP_SUBACK);
+    sdk_ack(s_client, MQTT_EVENT_DELETED, s_service_ack.pending_id, true, 0);
+    mqtt_service_poll(); assert(s_service_work.phase == MQTT_SETUP_SUBSCRIBE);
+    puts("PASS denied/expired subscriptions retry with backoff; timeout and obsolete ACK cannot announce online");
+
+    reset(); start_wifi(); early_suback = true;
+    mqtt_service_poll(); mqtt_service_poll(); mqtt_service_poll();
+    assert(s_service_work.phase == MQTT_SETUP_ONLINE_ACK);
+    char *frozen_online = s_service_work.online_json;
+    sdk_ack(s_client, MQTT_EVENT_PUBLISHED, s_service_ack.pending_id + 1, true, 0);
+    mqtt_service_poll(); assert(config_report_count == 0);
+    sdk_ack(s_client, MQTT_EVENT_DELETED, s_service_ack.pending_id, true, 0);
+    mqtt_service_poll(); now_us += 2000000; mqtt_service_poll();
+    assert(s_service_work.online_json == frozen_online && enqueue_count == 2);
+    sdk_emit(s_client, MQTT_EVENT_DISCONNECTED); mqtt_service_poll();
+    assert(s_service_work.online_json == NULL && config_report_count == 0);
+    puts("PASS online waits for its own PUBACK, expiry reuses frozen JSON, disconnect cancels stale setup");
+
+    reset(); start_wifi();
+    outbox_bytes = MQTT_OUTBOX_NORMAL_BYTES;
+    assert(app_mqtt_publish("data", "sample", NULL) == -2);
+    assert(mqtt_enqueue_for_session("device/public/up_line", "{}", s_connection_epoch, true) > 0);
+    outbox_bytes = MQTT_OUTBOX_LIMIT_BYTES;
+    assert(mqtt_enqueue_for_session("device/public/up_line", "{}", s_connection_epoch, true) == -2);
+    assert(enqueue_count == 1);
+    assert(captured_config.outbox.limit == MQTT_OUTBOX_LIMIT_BYTES && captured_config.session.message_retransmit_timeout == 5000);
+    puts("PASS normal traffic cannot consume startup reserve; total budget returns -2 without enqueue");
+
+    outbox_bytes = 0; s_service_work.phase = MQTT_SETUP_DONE;
+    assert(app_mqtt_publish("device/%s/log/runtime", "log", (char *)DEVICE_ID) == 0);
+    assert(enqueue_count == 1); mqtt_runtime_poll(); assert(last_qos == 0);
+    assert(app_mqtt_publish("device/%s/log/error", "error", (char *)DEVICE_ID) > 0 && last_qos == 1);
+    for (int i = 0; i < MQTT_RUNTIME_QUEUE_LEN; ++i)
+        assert(app_mqtt_publish("device/%s/log/runtime", "log", (char *)DEVICE_ID) == 0);
+    assert(app_mqtt_publish("device/%s/log/runtime", "log", (char *)DEVICE_ID) == -2);
+    unsigned before = publish_count;
+    sdk_emit(s_client, MQTT_EVENT_DISCONNECTED);
+    for (int i = 0; i < MQTT_RUNTIME_QUEUE_LEN; ++i) mqtt_runtime_poll();
+    assert(publish_count == before);
+    puts("PASS only runtime uses bounded best-effort QoS0; old-session logs are discarded");
+
+    reset(); start_wifi(); track_outbox_bytes = true;
+    pthread_t budget_a,budget_b;
+    assert(pthread_create(&budget_a,NULL,budget_publish_thread,NULL)==0);
+    assert(pthread_create(&budget_b,NULL,budget_publish_thread,NULL)==0);
+    assert(pthread_join(budget_a,NULL)==0 && pthread_join(budget_b,NULL)==0);
+    assert(outbox_bytes<=MQTT_OUTBOX_NORMAL_BYTES && outbox_bytes>MQTT_OUTBOX_NORMAL_BYTES-1046);
+    assert(mqtt_enqueue_for_session("device/public/up_line","{}",s_connection_epoch,true)>0);
+    uint8_t capped=4;random_value=30000;assert(mqtt_retry_delay_ms(&capped)==60000);
+    puts("PASS concurrent publishers respect packet budget; capped random backoff reaches 60 seconds");
+
+    reset(); s_mqtt_service_task = NULL; service_task_error = 1;
+    assert(mqtt_app_start() == ESP_ERR_NO_MEM && init_count == 0 && start_count == 0);
+    service_task_error = 0;
+    assert(mqtt_app_start() == ESP_OK);
+    unsigned task_creates = service_task_creates;
+    assert(mqtt_init() == ESP_OK && mqtt_app_start() == ESP_OK && service_task_creates == task_creates && init_count == 1);
+    puts("PASS service creation failure prevents client startup; repeated init never duplicates worker");
+
     mqtt_app_stop();
+    free(s_service_work.online_json); free(s_ack_map);
+    QueueHandle_t queues[] = {Topic_queue, Data_queue, s_runtime_queue};
+    for (unsigned i=0; i<3; ++i) {free(queues[i]->data); free(queues[i]);}
     puts("All MQTT handover regression scenarios passed");
     return 0;
 }
@@ -365,7 +514,7 @@ static pthread_mutex_t critical_mutex = PTHREAD_MUTEX_INITIALIZER;''')
         (temp / 'mocks.h').write_text(mocks)
         for header in ['esp_log.h', 'esp_event.h', 'esp_netif.h', 'esp_wifi.h', 'esp_bridge.h',
                        'esp_eth.h', 'esp_timer.h', 'esp_err.h', 'esp_system.h', 'esp_tls.h',
-                       'mqtt_client.h', 'cJSON.h', 'esp_app_desc.h', 'appTask.h',
+                       'mqtt_client.h', 'cJSON.h', 'esp_app_desc.h', 'appTask.h', 'esp_random.h', 'app_mem.h', 'Json_data.h',
                        'mesh.h', 'task_config.h', 'ConfigData.h', 'log.h',
                        'freertos/FreeRTOS.h', 'freertos/task.h', 'freertos/semphr.h',
                        'lwip/sockets.h', 'lwip/inet.h']:
@@ -378,8 +527,10 @@ static pthread_mutex_t critical_mutex = PTHREAD_MUTEX_INITIALIZER;''')
                         + 'static bool s_sta_reconnect_paused_by_eth;\n' + control + '\n' + TESTS)
         binary = temp / 'test'
         args = [os.environ.get('CC', 'cc'), '-std=c11', '-D_DEFAULT_SOURCE', '-pthread',
-                '-Wall', '-Wextra', '-Werror', '-Wno-unused-function', '-Wno-unused-parameter',
+                '-Wall', '-Wextra', '-Werror', '-Wno-unused-function', '-Wno-unused-parameter', '-Wno-sign-compare',
                 '-I', str(temp), '-I', str(MQTT.parent), '-I', str(DUAL.parent), str(unit), '-o', str(binary)]
+        if os.environ.get('TEST_SANITIZE') == '1':
+            args[1:1] = ['-fsanitize=address,undefined', '-fno-omit-frame-pointer']
         subprocess.run(args, check=True)
         subprocess.run([str(binary)], check=True, timeout=20)
 
