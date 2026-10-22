@@ -44,10 +44,12 @@ IDF_SKIP_CHECK_SUBMODULES=1 idf.py -B build/mesh-lite -D SDKCONFIG=build/mesh-li
 
 ## OTA 升级（main/APP/OTA/）
 
-触发：MQTT 收到 topic 含 `ota`（含 `public/cmd/ota`）的命令 → `parse_jsonCommand_MQTT()`
-（appTask.c 约 2499 行）→ `simple_ota_check_and_update_default()`。
+触发：MQTT 收到 topic 含 `ota` 的命令 → `parse_jsonCommand_MQTT()` →
+`mesh_ota_handle_mqtt_command()` 非阻塞通知服务任务。根节点由下载任务调用
+`simple_ota_check_and_update_default()`；子节点采用 Mesh-Lite BINARY 分发。
+当前为“不自动重启”的分发验证版本，流程与实机验收见 `MESH_LITE_OTA_INTEGRATION.md`。
 
-流程（`simple_ota_check_and_update()`）：
+根节点 HTTP 流程（`simple_ota_check_and_update()`）：
 
 1. 读本地版本（来自 `esp_app_desc_t`，即 version.txt 的编译期值），要求严格 `MAJOR.MINOR.PATCH`。
 2. 下载 `LG_URL_OTA_BASE_URL_FMT`（`main/Task/service_urls.h` 的 `_FMT` 模板）经
@@ -61,7 +63,7 @@ IDF_SKIP_CHECK_SUBMODULES=1 idf.py -B build/mesh-lite -D SDKCONFIG=build/mesh-li
    且必须以 `_v<version>.bin` 结尾（防止 JSON 版本与文件名不一致）。
 4. 版本比较：服务器 **>** 本地才升级；相等跳过，更旧**阻止降级**，均返回 `ESP_OK`。
 5. 下载固件：`http://`/`https://` 统一走手动 `esp_ota_begin/write/end` +
-   `esp_ota_set_boot_partition()` + `esp_restart()`（2048 字节缓冲、进度日志、长度校验）。
+   `esp_ota_set_boot_partition()`（2048 字节缓冲、进度日志、长度和镜像版本校验），不自动重启。
    不使用 `esp_https_ota()` 组件——其强制证书校验与无证书 HTTPS 策略冲突。
 6. 分区表为 `ota_0`/`ota_1` 双槽（各 0x240000）+ `otadata`，见 `partition.csv`。
 
@@ -74,7 +76,7 @@ IDF_SKIP_CHECK_SUBMODULES=1 idf.py -B build/mesh-lite -D SDKCONFIG=build/mesh-li
   无证书 HTTPS 放行路径保留备用（换回 HTTPS 内网地址时自动生效，打 WRN 可识别）。
 - `version.txt` 现为 `0.0.1`（三段式对齐服务器；为 `0.0.0` 时任何服务器版本都会触发升级，
   发布正式固件前应设置真实版本号）。
-- OTA 下载完成后**不再自动重启**（2026-10-16 起）：`simple_ota_check_and_update*()` 下载并设置启动分区后正常返回，设备继续运行旧固件，状态进入 `PENDING_RESTART`（`simple_ota_get_state()` 可查询）。重启由外部触发：向 `server/rack/<AgingNumber>/CanRestart` 发 `{"Data":{"Restart":1}}`（子节点已订阅），节点随即重启运行新固件；pending 期间重复 OTA 命令会被忽略。
+- OTA 下载完成后**不自动重启**：下载并设置启动分区后继续运行旧固件。BINARY 在校验、文件名登记和恢复下级 OTA 后输出 `OTA_BINARY_READY`，并向 `device/<DEVICE_ID>/event/OTACP` 以 QoS1 上报 `{"Seq":完成时间戳,"Data":{"IsComplete":1,"AgingNumber":"本机配置"}}`；断线/入队失败每 5 秒重试。不实现 30 秒重启。`PENDING_RESTART` 不等于供数已就绪。现有 `server/rack/<AgingNumber>/CanRestart` 的 5 秒延时重启行为保留，验证期间不要发送；期间掉电/其他重启会启动已选定的新固件。
 - 升级只写另一个 ota 槽，SQLite 数据库（`data_storage` 分区）与配置（`storage` 分区）不受影响。
 
 ## 关键约定速查（详见 CLAUDE.md）

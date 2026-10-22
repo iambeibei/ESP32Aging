@@ -15,6 +15,7 @@
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
+#include "freertos/FreeRTOS.h"
 
 #ifdef CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
 #include "esp_crt_bundle.h"
@@ -22,21 +23,35 @@
 
 static const char *TAG = "simple_ota";
 
-/*
- * OTA 状态机（2026-10-16）：下载完成后不再自动重启，改由外部触发
- * （MQTT CanRestart 等）。当前仅 mqtt_rx 任务写读；置 volatile 是为
- * 未来其他任务查询（状态上报等）可见，语义见 ota.h 状态图。
- */
-static volatile simple_ota_state_t s_ota_state = SIMPLE_OTA_STATE_IDLE;
+/* cmd_task/dl_task/库回调共享；只在短临界区内读写状态和下载结果。 */
+static portMUX_TYPE s_ota_state_lock = portMUX_INITIALIZER_UNLOCKED;
+static simple_ota_state_t s_ota_state = SIMPLE_OTA_STATE_IDLE;
+static simple_ota_download_result_t s_download_result;
+static bool s_download_result_valid;
 
 simple_ota_state_t simple_ota_get_state(void)
 {
-    return s_ota_state;
+    portENTER_CRITICAL(&s_ota_state_lock);
+    simple_ota_state_t state = s_ota_state;
+    portEXIT_CRITICAL(&s_ota_state_lock);
+    return state;
 }
 
 bool simple_ota_is_pending_restart(void)
 {
-    return s_ota_state == SIMPLE_OTA_STATE_PENDING_RESTART;
+    return simple_ota_get_state() == SIMPLE_OTA_STATE_PENDING_RESTART;
+}
+
+esp_err_t simple_ota_get_download_result(simple_ota_download_result_t *out_result)
+{
+    if (out_result == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    portENTER_CRITICAL(&s_ota_state_lock);
+    bool valid = s_download_result_valid;
+    *out_result = valid ? s_download_result : (simple_ota_download_result_t){0};
+    portEXIT_CRITICAL(&s_ota_state_lock);
+    return valid ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
 /*
@@ -474,7 +489,8 @@ esp_err_t simple_ota_get_running_version(char *version, size_t version_size)
  * 与本报文的无证书 HTTPS 策略冲突（见 OTA_SERVER_MIGRATION_DESIGN.md 第 8 节）。
  */
 static esp_err_t perform_http_ota(const char *firmware_url,
-                                  const simple_ota_config_t *config)
+                                  const simple_ota_config_t *config,
+                                  const ota_metadata_t *metadata)
 {
     ESP_LOGI(TAG, "Starting OTA download: %s", firmware_url);
 
@@ -527,6 +543,12 @@ static esp_err_t perform_http_ota(const char *firmware_url,
         esp_http_client_cleanup(client);
         return ESP_ERR_NOT_FOUND;
     }
+    if (content_length > update_partition->size) {
+        ESP_LOGE(TAG, "Firmware exceeds OTA partition");
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return ESP_ERR_INVALID_SIZE;
+    }
 
     ESP_LOGI(TAG,
              "Writing OTA partition: type=%d subtype=%d offset=0x%lx",
@@ -560,6 +582,10 @@ static esp_err_t perform_http_ota(const char *firmware_url,
             break;
         }
 
+        if ((size_t)read_len > update_partition->size - (size_t)total_read) {
+            err = ESP_ERR_INVALID_SIZE;
+            goto ota_fail;
+        }
         err = esp_ota_write(ota_handle, buffer, (size_t)read_len);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "esp_ota_write failed: %s", esp_err_to_name(err));
@@ -604,6 +630,14 @@ static esp_err_t perform_http_ota(const char *firmware_url,
         return err;
     }
 
+    esp_app_desc_t downloaded_desc;
+    err = esp_ota_get_partition_description(update_partition, &downloaded_desc);
+    if (err != ESP_OK ||
+        strncmp(downloaded_desc.version, metadata->version, sizeof(downloaded_desc.version)) != 0) {
+        ESP_LOGE(TAG, "Downloaded image version does not match update.json target=%s", metadata->version);
+        return err != ESP_OK ? err : ESP_ERR_INVALID_VERSION;
+    }
+
     err = esp_ota_set_boot_partition(update_partition);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
@@ -617,12 +651,23 @@ static esp_err_t perform_http_ota(const char *firmware_url,
      * 重复 OTA 命令在此状态下会被 simple_ota_check_and_update() 忽略，
      * 防止二次下载覆盖正在运行的槽位。
      */
+    portENTER_CRITICAL(&s_ota_state_lock);
+    s_download_result = (simple_ota_download_result_t){
+        .metadata = *metadata,
+        .size_bytes = (size_t)total_read,
+        .partition = update_partition,
+    };
+    s_download_result_valid = true;
     s_ota_state = SIMPLE_OTA_STATE_PENDING_RESTART;
+    portEXIT_CRITICAL(&s_ota_state_lock);
     ESP_LOGI(TAG, "OTA download completed and set as boot partition; restart deferred to external trigger (CanRestart)");
     return ESP_OK;
 
 ota_fail:
-    esp_ota_abort(ota_handle);
+    {
+        esp_err_t abort_err = esp_ota_abort(ota_handle);
+        if (abort_err != ESP_OK) ESP_LOGW(TAG, "HTTP OTA abort failed: %s", esp_err_to_name(abort_err));
+    }
     if (client != NULL) {
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
@@ -631,7 +676,8 @@ ota_fail:
 }
 
 static esp_err_t perform_firmware_ota(const char *firmware_url,
-                                      const simple_ota_config_t *config)
+                                      const simple_ota_config_t *config,
+                                      const ota_metadata_t *metadata)
 {
     /*
      * http:// 与 https:// 统一走 esp_http_client 手动 OTA 通路。
@@ -642,7 +688,7 @@ static esp_err_t perform_firmware_ota(const char *firmware_url,
      */
     if (strncmp(firmware_url, "http://", 7) == 0 ||
         strncmp(firmware_url, "https://", 8) == 0) {
-        return perform_http_ota(firmware_url, config);
+        return perform_http_ota(firmware_url, config, metadata);
     }
 
     ESP_LOGE(TAG, "Unsupported firmware URL: %s", firmware_url);
@@ -693,6 +739,10 @@ static esp_err_t ota_check_and_update_impl(const simple_ota_config_t *config)
     if (!parse_semver(metadata.version, &server_semver)) {
         return ESP_ERR_INVALID_VERSION;
     }
+    if (strlen(metadata.file) >= SIMPLE_OTA_BINARY_FILENAME_CAPACITY) {
+        ESP_LOGE(TAG, "BINARY file name exceeds 31 bytes: %s", metadata.file);
+        return ESP_ERR_INVALID_SIZE;
+    }
 
     ESP_LOGI(TAG, "Server firmware version: %s", metadata.version);
     ESP_LOGI(TAG, "Server firmware file: %s", metadata.file);
@@ -726,7 +776,7 @@ static esp_err_t ota_check_and_update_impl(const simple_ota_config_t *config)
              metadata.version);
     ESP_LOGI(TAG, "Firmware URL: %s", firmware_url);
 
-    return perform_firmware_ota(firmware_url, config);
+    return perform_firmware_ota(firmware_url, config, &metadata);
 }
 
 /*
@@ -738,19 +788,22 @@ static esp_err_t ota_check_and_update_impl(const simple_ota_config_t *config)
  */
 esp_err_t simple_ota_check_and_update(const simple_ota_config_t *config)
 {
-    if (s_ota_state == SIMPLE_OTA_STATE_PENDING_RESTART) {
+    if (simple_ota_is_pending_restart()) {
         ESP_LOGW(TAG, "OTA already pending restart; ignoring duplicate OTA command");
         return ESP_OK;
     }
 
+    portENTER_CRITICAL(&s_ota_state_lock);
+    s_download_result_valid = false;
     s_ota_state = SIMPLE_OTA_STATE_RUNNING;
+    portEXIT_CRITICAL(&s_ota_state_lock);
     esp_err_t err = ota_check_and_update_impl(config);
 
     if (err != ESP_OK) {
-        s_ota_state = SIMPLE_OTA_STATE_FAILED;
-    } else if (s_ota_state == SIMPLE_OTA_STATE_RUNNING) {
+        simple_ota_set_state(SIMPLE_OTA_STATE_FAILED);
+    } else if (simple_ota_get_state() == SIMPLE_OTA_STATE_RUNNING) {
         /* 无需升级路径：回到 IDLE（下载成功路径已是 PENDING_RESTART） */
-        s_ota_state = SIMPLE_OTA_STATE_IDLE;
+        simple_ota_set_state(SIMPLE_OTA_STATE_IDLE);
     }
     return err;
 }
@@ -928,5 +981,7 @@ bool simple_ota_version_is_newer(const char *server_version)
 
 void simple_ota_set_state(simple_ota_state_t state)
 {
+    portENTER_CRITICAL(&s_ota_state_lock);
     s_ota_state = state;
+    portEXIT_CRITICAL(&s_ota_state_lock);
 }

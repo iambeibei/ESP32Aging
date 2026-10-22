@@ -3197,14 +3197,9 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                 if (CanRestart == 1)
                 {
                     /*
-                     * 外部触发重启（保留为运维重启入口）：
-                     * 2026-10-16 起 OTA 曾以此主题统一点火；2026-10-19
-                     * mesh_ota 改为"完成即重启"（LG_MESH_OTA_RESTART_DELAY_MS
-                     * 延迟自行 esp_restart），本主题不再是 OTA 必经路径，
-                     * 但保留订阅作为外部/运维手动重启通道——删除需确认无
-                     * 外部系统使用（独立分析评审意见）。
-                     * 重启前打印 OTA 状态并留 100ms 让日志与 publish ack 落盘。
-                     * 未下载新固件的节点重启后运行旧固件，无害。
+                     * 保留既有外部/运维重启行为（等待 5 秒）。BINARY 验证阶段
+                     * OTA 完成不自动重启，实机验证期间不要发送本命令；
+                     * 后续的统一延时 30 秒重启另行实现，本轮不调整此处行为。
                      */
                     ESP_LOGW(TAG, "CanRestart received; restarting now (ota_state=%d, pending_restart=%d)",
                              (int)simple_ota_get_state(), simple_ota_is_pending_restart() ? 1 : 0);

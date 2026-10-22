@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include "esp_err.h"
+#include "esp_partition.h"
 
 /* OTA 根目录地址统一取自 main/Task/service_urls.h */
 #include "service_urls.h"
@@ -26,6 +27,9 @@ extern "C" {
 
 /** 最长 BIN 文件名。 */
 #define SIMPLE_OTA_FILENAME_MAX_LEN      128
+
+/** Mesh-Lite BINARY 文件标识缓冲大小，含末尾 NUL。禁止截断文件名。 */
+#define SIMPLE_OTA_BINARY_FILENAME_CAPACITY 32
 
 /**
  * @brief OTA 状态机（2026-10-16 起：下载完成后不再自动重启）
@@ -129,6 +133,22 @@ typedef struct {
     char version[SIMPLE_OTA_VERSION_MAX_LEN];
     char file[SIMPLE_OTA_FILENAME_MAX_LEN];
 } simple_ota_metadata_t;
+
+/** 本次 HTTP 下载成功的不可变快照；partition 为 SDK 生命周期内有效的只读指针。 */
+typedef struct {
+    simple_ota_metadata_t metadata;
+    size_t size_bytes;
+    const esp_partition_t *partition;
+} simple_ota_download_result_t;
+
+/**
+ * @brief 复制最近一次实际下载成功的结果，不访问网络或重新读取 update.json。
+ *
+ * 任意任务上下文可调用，不可从 ISR 调用；短临界区内复制，不阻塞。
+ * out_result 由调用方拥有。返回 ESP_ERR_NOT_FOUND 表示本次未实际下载成功
+ * （包括版本无需更新）；失败时清零输出。重复 pending 命令保留原快照。
+ */
+esp_err_t simple_ota_get_download_result(simple_ota_download_result_t *out_result);
 
 /**
  * @brief 使用默认服务器地址检查更新

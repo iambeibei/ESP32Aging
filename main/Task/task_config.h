@@ -79,7 +79,7 @@
 #define LG_PRIO_MESH_HEALTH        2
 
 /* Mesh-Lite 原生 OTA 适配层（main/APP/OTA/mesh_ota.c）：
- * cmd_task：命令分流（层级错峰 + mesh 内发起 + 重试调度 + 完成即重启），
+ * cmd_task：命令分流（BINARY 请求 + 重试调度 + 文件 SHA/登记，不自动重启），
  *            所有节点创建；负载等同原 mqtt_rx 的 OTA 路径；
  * dl_task ：根节点外网下载（simple_ota 全链 + 2048B 读缓冲 + esp_ota_write），
  *            仅根节点创建（DL_EVT_START 唯一置位点在根路径）。 */

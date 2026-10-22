@@ -1,43 +1,20 @@
 /**
  * @file mesh_ota.c
- * @brief Mesh-Lite 原生 OTA 分发适配层实现
+ * @brief Mesh-Lite BINARY 分发验证：旧固件运行期间逐层提供已校验的新镜像。
  *
- * 对外接口与设计说明见 mesh_ota.h；总体架构：
+ * mqtt_rx 只通知 cmd_task；根由 dl_task 下载一次，子由 BINARY LAN 回调写入。
+ * done 回调完成镜像/版本校验及 set_boot，cmd_task 计算文件 SHA-256、登记文件名、
+ * 恢复下级 OTA 后输出 OTA_BINARY_READY，并经本机 event/OTACP 上报完成。不自动重启。
  *
- *   mqtt_rx ──通知──▶ cmd_task ──子节点: update.json + transmit_file_start
- *                        │         ──根节点: pause → 唤醒 dl_task（仅根创建）
- *                        ▼
- *                  Mesh-Lite 库（闭源）：逐级请求 / LAN OTA 传输 / OTA 事件
- *                        │
- *        ┌───────────────┼────────────────┐
- *        ▼               ▼                ▼
- *  provide_file_cb   get_file_cb    get_file_done_cb
- *  （按版本匹配分区   （惰性 begin +    （end + set_boot +
- *    读出供数, 缓存）   write_with_offset） 置 PENDING_RESTART
- *                                            + 通知 cmd_task 重启）
- *
- * 关键不变量：
- *   - extern_url_ota_cb 为禁用桩：子节点 mesh 内拿不到目标版本即失败，
- *     由 cmd_task 的有限重试吸收，绝不回落外网（产品决策，见 mesh_ota.h）；
- *   - dl_task 只服务根节点路径（仅根节点创建），与 transmit_file_start
- *     的调用者（cmd_task）分离，规避"库任务上下文回调再等 cmd_task"的死锁面；
- *   - s_ota_state（ota.c 状态机）是唯一状态事实源，本层只经
- *     simple_ota_set_state()/simple_ota_get_state() 读写；
- *   - 无运行期 malloc：EventGroup 全部静态分配，互斥用短临界区。
- *
- * 完成即重启（2026-10-19 用户决策）：根与子下载/分发完成后均延迟
- * LG_MESH_OTA_RESTART_DELAY_MS 自行 esp_restart()，不再等待 CanRestart
- * 统一点火，亦不再上报 OTACP；服务器以上线报文（up_line 的 Version 字段）
- * 获知节点已升级。重启前延迟等待串口日志与 MQTT 在途报文落盘。
- *
- * 回调上下文警告：provide/get/done 与 OTA 事件处理器均可能来自闭源库
- * 内部任务或 esp_event 任务，不得假设调用方身份、不得长时间持锁；
- * esp_ota_* 可重入（同 handle 串行由本层 s_ota_mutex 保证）；重启动作
- * （vTaskDelay + esp_restart）只经 cmd_task 执行，不在库回调上下文跑。
+ * 库回调/事件任务与 cmd_task 共享接收会话和供数记录，均经 s_ota_mutex 保护；
+ * 文件供数期间持锁读取，避免失败清理/重试擦除与读取同一分区并发。
  */
-
+#include <stdint.h>
+#include <stdio.h>
 #include <string.h>
+#include <time.h>
 
+#include "cJSON.h"
 #include "esp_app_format.h"
 #include "esp_err.h"
 #include "esp_event.h"
@@ -45,796 +22,705 @@
 #include "esp_mesh_lite.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
-#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "mbedtls/sha256.h"
 
 #include "mesh_ota.h"
-#include "ConfigData.h" /* IsRoot：dl_task 仅根节点创建 */
-#include "ota.h"
+#include "ConfigData.h"
+#include "mqtt_app.h"
 #include "task_config.h"
 
 static const char *TAG = "mesh_ota";
 
-/* -------------------------------------------------------------------------- */
-/* 可标定常量（现场按实测修正，见 MESH_LITE_OTA_INTEGRATION.md 标定方法）        */
-/* -------------------------------------------------------------------------- */
-
-/* 失败自动重试次数（首次 + 重试共 3 次尝试）。 */
-#define LG_MESH_OTA_RETRY_MAX 2
-
-/* 重试间隔；重试复用首次已获取的 metadata/size，不重复外网请求。 */
-#define LG_MESH_OTA_RETRY_INTERVAL_SEC 90
-
-/* 根节点外网下载等待上限：防 dl_task 异常时 cmd_task 永久挂起。 */
-#define LG_MESH_OTA_ROOT_DL_TIMEOUT_MS (10u * 60u * 1000u)
-
-/*
- * 完成即重启延迟（根与子共用）：下载/分发完成到 esp_restart 的等待。
- * 等待串口日志与 MQTT 在途报文落盘（对齐 CanRestart 分支重启前等待范式）。
- */
-#define LG_MESH_OTA_RESTART_DELAY_MS 3000
-
-/* PROGRESS 事件限频步长（百分比）。 */
-#define LG_MESH_OTA_PROGRESS_LOG_STEP_PCT 10
-
-/* -------------------------------------------------------------------------- */
-/* 内部状态                                                                     */
-/* -------------------------------------------------------------------------- */
-
-/*
- * xEventGroupSetBits/ClearBits 返回值（是否需上下文切换）在本模块所有调用点
- * 均处任务上下文（cmd_task / dl_task / esp_event 任务），无 ISR 路径，按
- * FreeRTOS 语义可忽略，故不逐个检查。
- */
-
 #ifdef CONFIG_ESP_MESH_LITE_OTA_ENABLE
-/* 以下为实现主体；Kconfig 关闭时仅保留文件末尾的对外降级 stub。 */
+#ifdef CONFIG_OTA_AUTO_RESTART
+#error "BINARY staging requires CONFIG_OTA_AUTO_RESTART to be disabled"
+#endif
 
-/* cmd_task 事件位 */
-#define CMD_EVT_REQUEST BIT0 /* MQTT ota 命令到达（mesh_ota_handle_mqtt_command） */
-#define CMD_EVT_RETRY   BIT1 /* OTA 失败/需重试（事件处理器或本任务置位） */
-#define CMD_EVT_RESTART BIT2 /* OTA 完成，待 cmd_task 延迟后重启（根+子，完成即重启） */
+#define LG_MESH_OTA_RETRY_MAX 2
+#define LG_MESH_OTA_RETRY_INTERVAL_MS (90u * 1000u)
+#define LG_MESH_OTA_ROOT_DL_TIMEOUT_MS (10u * 60u * 1000u)
+#define LG_MESH_OTA_DONE_WAIT_MS (10u * 1000u)
+#define LG_MESH_OTA_PROGRESS_LOG_STEP_PCT 10
+/* Mesh-Lite 文件长度按 64 KiB 对齐；真实长度单独保留。 */
+#define LG_MESH_OTA_FILE_ALIGNMENT_BYTES (64u * 1024u)
+#define LG_MESH_OTA_HASH_BUFFER_BYTES 2048
+#define LG_MESH_OTA_SERVICE_POLL_MS 1000
+#define LG_MESH_OTA_OTACP_RETRY_MS 5000
+#define LG_MESH_OTA_OTACP_TOPIC_BYTES 64
+#define LG_MESH_OTA_OTACP_PAYLOAD_BYTES 256
 
-/* dl_task 事件位 */
-#define DL_EVT_START BIT0 /* 唤醒 dl_task 开始外网下载（cmd_task 根路径置位） */
-#define DL_EVT_DONE  BIT1 /* 外网下载成功 */
-#define DL_EVT_FAIL  BIT2 /* 外网下载失败 */
+#define CMD_EVT_REQUEST BIT0
+#define CMD_EVT_FINISH BIT1
+#define CMD_EVT_DOWNLOAD_DONE BIT2
+#define DL_EVT_START BIT0
 
-static StaticEventGroup_t s_cmd_events_buf;
-static EventGroupHandle_t s_cmd_events;
-static StaticEventGroup_t s_dl_events_buf;
-static EventGroupHandle_t s_dl_events;
+typedef struct {
+    bool valid;
+    char file_name[SIMPLE_OTA_BINARY_FILENAME_CAPACITY];
+    char version[SIMPLE_OTA_VERSION_MAX_LEN];
+    size_t size_bytes;
+    const esp_partition_t *partition;
+    char sha256_hex[65];
+} mesh_ready_file_t;
 
-/*
- * OTA 接收会话互斥：保护 s_ota_handle/s_update_partition 的惰性 begin，
- * 并串行化 write/end。必须用 mutex 而非 portMUX 临界区——esp_ota_begin 的
- * 整槽擦除与 esp_ota_end 的镜像校验可达数百毫秒，关中断临界区不可接受
- * （本地规范"临界区必须短小"）。静态分配，禁运行期 malloc
- * （对齐 mqtt_app.c 的 StaticSemaphore 范式）。
- */
+static StaticEventGroup_t s_cmd_events_buf, s_dl_events_buf;
+static EventGroupHandle_t s_cmd_events, s_dl_events;
 static StaticSemaphore_t s_ota_mutex_buf;
 static SemaphoreHandle_t s_ota_mutex;
+static bool s_initialized;
+
+/* s_ota_mutex 保护以下接收会话、完成事实与供数记录。 */
 static esp_ota_handle_t s_ota_handle;
 static const esp_partition_t *s_update_partition;
+static bool s_session_open, s_rx_accepting, s_rx_done, s_rx_validated, s_rx_failed;
+static bool s_finish_received;
+static esp_mesh_lite_ota_finish_reason_t s_finish_reason;
+static TickType_t s_finish_tick;
+static mesh_ready_file_t s_ready_file;
+/* 库固定复制 32 字节，缓冲必须补零且在库调用结束后继续有效。 */
+static char s_registered_file_name[SIMPLE_OTA_BINARY_FILENAME_CAPACITY];
+static esp_err_t s_download_error;
 
-/*
- * 供数分区匹配缓存锁：仅保护 fw_version/partition/valid 三字段的读写
- * （微秒级），portMUX 短临界区可接受；flash 读取均在锁外进行。
- */
-static portMUX_TYPE s_cache_lock = portMUX_INITIALIZER_UNLOCKED;
-static struct {
-    bool valid;
-    char fw_version[SIMPLE_OTA_VERSION_MAX_LEN];
-    const esp_partition_t *partition;
-} s_provide_cache;
-
-/* 子节点路径的已获取参数（重试复用）；根节点不使用。 */
+/* 参数在会话开始前设置；回调只在 s_session_open 时读取，重试复用。 */
 static simple_ota_metadata_t s_metadata;
 static size_t s_firmware_size_bytes;
 static bool s_metadata_valid;
 
-/* 已执行的重试次数（首试为 0）。 */
+/* 以下仅由 cmd_task 访问。 */
 static uint8_t s_retry_count;
+static bool s_retry_waiting, s_finalization_pending, s_root_downloading;
+static bool s_root_timeout_logged, s_finish_wait_logged;
+static TickType_t s_retry_deadline, s_root_start_tick;
 
-static bool s_initialized;
+/* 完成通知仅由 cmd_task 访问；入队失败保留同一事件，成功后交给 SDK QoS1 重传。 */
+static bool s_otacp_pending, s_otacp_payload_ready;
+static time_t s_otacp_seq;
+static TickType_t s_otacp_retry_tick;
+static char s_otacp_topic[LG_MESH_OTA_OTACP_TOPIC_BYTES];
+static char s_otacp_payload[LG_MESH_OTA_OTACP_PAYLOAD_BYTES];
 
-/* -------------------------------------------------------------------------- */
-/* 供数：按 fw_version 匹配 app 分区（running 优先，次为另一 ota 槽）             */
-/* -------------------------------------------------------------------------- */
+static void schedule_retry(void);
 
-/*
- * 读分区镜像头部的 esp_app_desc_t 比对版本。擦除态/非镜像分区返回 false。
- * 调用上下文：库任务（provide_file_cb），只读 flash，可重入。
- */
-static bool partition_version_matches(const esp_partition_t *part, const char *fw_version)
+/* EventGroup SetBits 的返回值为当前事件位而非错误码；置位点均为任务上下文。
+ * mutex 的 Give 返回值则必须核验，便于发现错误所有权或初始化问题。 */
+static void ota_unlock(void)
 {
-    if (part == NULL || fw_version == NULL) {
-        return false;
+    if (xSemaphoreGive(s_ota_mutex) != pdTRUE) {
+        ESP_LOGE(TAG, "BINARY mutex release failed");
     }
-
-    esp_app_desc_t desc;
-    if (esp_ota_get_partition_description(part, &desc) != ESP_OK) {
-        return false;
-    }
-
-    return strncmp(desc.version, fw_version, sizeof(desc.version)) == 0;
 }
 
-static void provide_cache_store(const char *fw_version, const esp_partition_t *part)
+static bool binary_name_valid(const char *name)
 {
-    taskENTER_CRITICAL(&s_cache_lock);
-    strlcpy(s_provide_cache.fw_version, fw_version, sizeof(s_provide_cache.fw_version));
-    s_provide_cache.partition = part;
-    s_provide_cache.valid = true;
-    taskEXIT_CRITICAL(&s_cache_lock);
+    return name != NULL && name[0] != '\0' &&
+           strnlen(name, SIMPLE_OTA_BINARY_FILENAME_CAPACITY) < SIMPLE_OTA_BINARY_FILENAME_CAPACITY;
 }
 
-static void provide_cache_invalidate(void)
+static size_t aligned_file_size(size_t size_bytes)
 {
-    taskENTER_CRITICAL(&s_cache_lock);
-    s_provide_cache.valid = false;
-    taskEXIT_CRITICAL(&s_cache_lock);
+    if (size_bytes == 0 || size_bytes > SIZE_MAX - (LG_MESH_OTA_FILE_ALIGNMENT_BYTES - 1)) {
+        return 0;
+    }
+    return (size_bytes + LG_MESH_OTA_FILE_ALIGNMENT_BYTES - 1) &
+           ~(size_t)(LG_MESH_OTA_FILE_ALIGNMENT_BYTES - 1);
 }
 
-/*
- * 双路径覆盖闭源库"节点已有固件"判定条件的不可见性：
- *   1) running 分区（本节点已重启运行新固件的场景）；
- *   2) ota_0 / ota_1 另一槽（本项目 CanRestart 延迟重启的主场景：
- *      新固件已下载写入、otadata 已指向、但仍在运行旧固件）。
- * 调用上下文：库任务（provide_file_cb），只读，可重入。
- */
-static const esp_partition_t *find_firmware_partition(const char *fw_version)
+static bool transfer_range_valid(const esp_mesh_lite_lan_ota_file_transfer_param_t *param,
+                                 size_t size_bytes, const esp_partition_t *partition)
 {
-    if (fw_version == NULL) {
-        return NULL;
-    }
-
-    /* 缓存命中（短临界区）。 */
-    taskENTER_CRITICAL(&s_cache_lock);
-    if (s_provide_cache.valid &&
-        strncmp(s_provide_cache.fw_version, fw_version, sizeof(s_provide_cache.fw_version)) == 0) {
-        const esp_partition_t *cached = s_provide_cache.partition;
-        taskEXIT_CRITICAL(&s_cache_lock);
-        return cached;
-    }
-    taskEXIT_CRITICAL(&s_cache_lock);
-
-    const esp_partition_t *running = esp_ota_get_running_partition();
-    if (partition_version_matches(running, fw_version)) {
-        provide_cache_store(fw_version, running);
-        return running;
-    }
-
-    static const esp_partition_subtype_t ota_subtypes[] = {
-        ESP_PARTITION_SUBTYPE_APP_OTA_0,
-        ESP_PARTITION_SUBTYPE_APP_OTA_1,
-    };
-    for (size_t i = 0; i < sizeof(ota_subtypes) / sizeof(ota_subtypes[0]); i++) {
-        const esp_partition_t *part =
-            esp_partition_find_first(ESP_PARTITION_TYPE_APP, ota_subtypes[i], NULL);
-        if (partition_version_matches(part, fw_version)) {
-            provide_cache_store(fw_version, part);
-            return part;
-        }
-    }
-
-    return NULL;
+    size_t padded_bytes = aligned_file_size(size_bytes);
+    return param != NULL && partition != NULL && padded_bytes != 0 &&
+           padded_bytes <= partition->size && param->filesize > 0 &&
+           (size_t)param->filesize == padded_bytes && param->offset <= padded_bytes &&
+           param->data_size <= padded_bytes - param->offset;
 }
 
-/* -------------------------------------------------------------------------- */
-/* LAN OTA 文件传输三回调（组件契约，见 esp_mesh_lite_core.h）                    */
-/* -------------------------------------------------------------------------- */
+/* 调用者持有 s_ota_mutex；end 已消耗的 handle 必须先清零，禁止再次 abort。 */
+static void reset_receiver_locked(void)
+{
+    s_rx_accepting = false;
+    s_session_open = false;
+    if (s_ota_handle != 0) {
+        esp_err_t err = esp_ota_abort(s_ota_handle);
+        if (err != ESP_OK) ESP_LOGW(TAG, "OTA receive abort failed: %s", esp_err_to_name(err));
+        s_ota_handle = 0;
+    }
+    s_update_partition = NULL;
+    s_rx_done = false;
+    s_rx_validated = false;
+    s_rx_failed = false;
+    s_finish_received = false;
+}
 
-/*
- * 提供方：把 param 请求的数据块（offset/data_size）从匹配分区读出填入
- * param->data。读取范围按分区边界钳位；库按 64KB 对齐 filesize 请求，
- * 超出镜像实际大小的 padding 段填 0xFF（擦除态值，写入无害）。
- * 调用上下文：闭源库内部任务；不得持锁做 flash 读（仅短临界区查缓存）。
- */
+/* 库任务调用；仅提供本次完成校验且已登记的文件，不扫描 app 分区头猜测完整性。 */
 static esp_err_t provide_file_cb(esp_mesh_lite_lan_ota_file_transfer_param_t *param)
 {
-    if (param == NULL || param->data == NULL) {
+    if (param == NULL || param->data == NULL || !binary_name_valid(param->fw_version)) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (param->data_size == 0) {
-        return ESP_OK;
+    if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) return ESP_FAIL;
+    esp_err_t err = ESP_ERR_NOT_FOUND;
+    if (!s_ready_file.valid || strcmp(param->fw_version, s_ready_file.file_name) != 0) {
+        ESP_LOGW(TAG, "BINARY provide rejected: request=%.*s ready=%d",
+                 SIMPLE_OTA_BINARY_FILENAME_CAPACITY - 1, param->fw_version, s_ready_file.valid);
+        goto done;
     }
-
-    const esp_partition_t *part = find_firmware_partition(param->fw_version);
-    if (part == NULL) {
-        ESP_LOGE(TAG, "provide: no app partition with version=%s",
-                 param->fw_version ? param->fw_version : "(null)");
-        return ESP_ERR_NOT_FOUND;
+    if (!transfer_range_valid(param, s_ready_file.size_bytes, s_ready_file.partition)) {
+        err = ESP_ERR_INVALID_SIZE;
+        ESP_LOGE(TAG, "BINARY provide range rejected: offset=%u bytes=%u filesize=%d",
+                 (unsigned)param->offset, (unsigned)param->data_size, param->filesize);
+        goto done;
     }
-
-    size_t to_read_bytes = param->data_size;
-    bool overflow = false;
-    if (param->offset >= part->size) {
-        to_read_bytes = 0;
-        overflow = true;
-    } else if (param->offset + to_read_bytes > part->size) {
-        to_read_bytes = (size_t)(part->size - param->offset);
-        overflow = true;
+    /* 每个文件首块记录供数节点，实机据此区别 L2 供数与穿透到根。 */
+    if (param->offset == 0) {
+        ESP_LOGI(TAG, "OTA_BINARY_PROVIDE level=%u request=%.*s partition=%s bytes=%u",
+                 (unsigned)esp_mesh_lite_get_level(), SIMPLE_OTA_BINARY_FILENAME_CAPACITY - 1,
+                 param->fw_version, s_ready_file.partition->label, (unsigned)s_ready_file.size_bytes);
     }
-
-    if (to_read_bytes > 0) {
-        esp_err_t err = esp_partition_read(part, param->offset, param->data, to_read_bytes);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "provide: read failed at offset=%u: %s",
-                     (unsigned)param->offset, esp_err_to_name(err));
-            return err;
-        }
+    size_t read_bytes = 0;
+    if (param->offset < s_ready_file.size_bytes) {
+        read_bytes = s_ready_file.size_bytes - param->offset;
+        if (read_bytes > param->data_size) read_bytes = param->data_size;
     }
-    if (overflow) {
-        memset(param->data + to_read_bytes, 0xFF, param->data_size - to_read_bytes);
+    err = ESP_OK;
+    if (read_bytes != 0) {
+        err = esp_partition_read(s_ready_file.partition, param->offset, param->data, read_bytes);
     }
-
-    return ESP_OK;
+    if (err == ESP_OK && param->data_size > read_bytes) {
+        memset(param->data + read_bytes, 0xFF, param->data_size - read_bytes);
+    }
+done:
+    ota_unlock();
+    return err;
 }
 
-/*
- * 接收方：首次调用惰性 esp_ota_begin（OTA_SIZE_UNKNOWN 整槽擦除，
- * 与 perform_http_ota 一致），随后一律 esp_ota_write_with_offset——
- * 窗口传输（OTA_WND_DEFAULT=8256，6 包）可能乱序到达，offset 为权威位置。
- * 调用上下文：闭源库内部任务；s_ota_lock 短临界区保证多会话回调串行。
- */
+/* 库任务调用：惰性 begin，按 offset 接收乱序块；失败或已收尾的会话拒绝迟到写入。 */
 static esp_err_t get_file_cb(esp_mesh_lite_lan_ota_file_transfer_param_t *param)
 {
-    if (param == NULL || param->data == NULL) {
-        return ESP_ERR_INVALID_ARG;
+    if (param == NULL || param->data == NULL) return ESP_ERR_INVALID_ARG;
+    if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) return ESP_FAIL;
+    esp_err_t err = ESP_ERR_INVALID_STATE;
+    if (!s_session_open || !s_rx_accepting || s_rx_failed) goto done;
+    if (!binary_name_valid(param->fw_version) || strcmp(param->fw_version, s_metadata.file) != 0) {
+        ESP_LOGE(TAG, "BINARY receive identifier mismatch: request=%.*s expected=%s",
+                 SIMPLE_OTA_BINARY_FILENAME_CAPACITY - 1,
+                 param->fw_version != NULL ? param->fw_version : "(null)", s_metadata.file);
+        err = ESP_ERR_INVALID_ARG;
+        goto failed;
+    }
+    const esp_partition_t *update = s_update_partition;
+    if (update == NULL) update = esp_ota_get_next_update_partition(NULL);
+    if (!transfer_range_valid(param, s_firmware_size_bytes, update)) {
+        err = ESP_ERR_INVALID_SIZE;
+        goto failed;
     }
     if (param->data_size == 0) {
-        return ESP_OK;
+        err = ESP_OK;
+        goto done;
     }
-
-    /*
-     * 持锁覆盖惰性 begin + write：库对多会话回调的串行性不可见，此处以
-     * mutex 保证同一 handle 的 begin/write 不并发（flash 操作可跨毫秒，
-     * 用 mutex 而非关中断临界区）。只可能等同一节点的另一会话，无死锁面
-     * （回调内不再回调本模块）。
-     */
-    if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) {
-        ESP_LOGE(TAG, "get_file: take OTA mutex failed");
-        return ESP_FAIL;
-    }
-
     if (s_ota_handle == 0) {
-        const esp_partition_t *update = esp_ota_get_next_update_partition(NULL);
-        if (update == NULL) {
-            xSemaphoreGive(s_ota_mutex);
-            ESP_LOGE(TAG, "get_file: no next update partition");
-            return ESP_ERR_NOT_FOUND;
-        }
-
-        esp_ota_handle_t handle = 0;
-        esp_err_t err = esp_ota_begin(update, OTA_SIZE_UNKNOWN, &handle);
-        if (err != ESP_OK) {
-            xSemaphoreGive(s_ota_mutex);
-            ESP_LOGE(TAG, "get_file: esp_ota_begin failed: %s", esp_err_to_name(err));
-            return err;
-        }
-
-        s_ota_handle = handle;
+        err = esp_ota_begin(update, OTA_SIZE_UNKNOWN, &s_ota_handle);
+        if (err != ESP_OK) goto failed;
         s_update_partition = update;
-        ESP_LOGI(TAG, "get_file: OTA session started on %s", update->label);
+        ESP_LOGI(TAG, "BINARY receive begin: level=%u request=%.*s partition=%s bytes=%u",
+                 (unsigned)esp_mesh_lite_get_level(), SIMPLE_OTA_BINARY_FILENAME_CAPACITY - 1,
+                 param->fw_version, update->label, (unsigned)s_firmware_size_bytes);
     }
-
-    esp_err_t err = esp_ota_write_with_offset(s_ota_handle, param->data,
-                                              param->data_size, param->offset);
-    xSemaphoreGive(s_ota_mutex);
-
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "get_file: write at offset=%u failed: %s",
-                 (unsigned)param->offset, esp_err_to_name(err));
-        return err;
-    }
-
-    return ESP_OK;
+    /* 对齐尾部也会落入备用槽，且已验证其范围不超过分区。 */
+    err = esp_ota_write_with_offset(s_ota_handle, param->data, param->data_size, param->offset);
+    if (err != ESP_OK) goto failed;
+    goto done;
+failed:
+    s_rx_failed = true;
+    s_rx_accepting = false;
+    ESP_LOGE(TAG, "BINARY receive failed: offset=%u bytes=%u error=%s",
+             (unsigned)param->offset, (unsigned)param->data_size, esp_err_to_name(err));
+done:
+    ota_unlock();
+    return err;
 }
 
-/*
- * 完成：esp_ota_end（镜像校验）+ esp_ota_set_boot_partition → 置
- * PENDING_RESTART（不自动重启，等 CanRestart 统一点火，AGENTS.md）。
- * 失败路径 abort 并置 FAILED（OTA_FINISH 事件随后汇入重试调度）。
- * 调用上下文：闭源库内部任务。
- */
+/* 库需要此返回值决定传输结果，故镜像校验/版本核验/set_boot 在回调中串行完成。
+ * SHA-256、文件登记和恢复下级均延后至 cmd_task，绝不在这里重启。 */
 static esp_err_t get_file_done_cb(void)
 {
-    if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) {
-        ESP_LOGE(TAG, "get_file_done: take OTA mutex failed");
-        return ESP_FAIL;
-    }
-
+    if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) return ESP_FAIL;
+    esp_err_t err = ESP_ERR_INVALID_STATE;
+    if (!s_session_open || !s_rx_accepting || s_rx_failed || s_ota_handle == 0) goto done;
+    s_rx_accepting = false;
     esp_ota_handle_t handle = s_ota_handle;
-    const esp_partition_t *update = s_update_partition;
-    s_ota_handle = 0;
-    s_update_partition = NULL;
-    xSemaphoreGive(s_ota_mutex);
-
-    if (handle == 0 || update == NULL) {
-        ESP_LOGW(TAG, "get_file_done: no active OTA session");
-        return ESP_ERR_INVALID_STATE;
+    s_ota_handle = 0; /* esp_ota_end 无论成功失败都消耗 handle。 */
+    err = esp_ota_end(handle);
+    if (err != ESP_OK) goto done;
+    esp_app_desc_t desc;
+    err = esp_ota_get_partition_description(s_update_partition, &desc);
+    if (err != ESP_OK) goto done;
+    if (strncmp(desc.version, s_metadata.version, sizeof(desc.version)) != 0) {
+        err = ESP_ERR_INVALID_VERSION;
+        goto done;
     }
-
-    esp_err_t err = esp_ota_end(handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "get_file_done: esp_ota_end failed: %s", esp_err_to_name(err));
-        esp_ota_abort(handle);
-        simple_ota_set_state(SIMPLE_OTA_STATE_FAILED);
-        return err;
+    err = esp_ota_set_boot_partition(s_update_partition);
+    if (err == ESP_OK) s_rx_validated = true;
+done:
+    if (s_session_open) {
+        s_rx_done = true;
+        if (err != ESP_OK) s_rx_failed = true;
     }
-
-    err = esp_ota_set_boot_partition(update);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "get_file_done: set_boot_partition failed: %s", esp_err_to_name(err));
-        simple_ota_set_state(SIMPLE_OTA_STATE_FAILED);
-        return err;
-    }
-
-    /*
-     * 本节点现已持有新版本（update 槽）。失效供数缓存，使后续子节点
-     * 请求时 find_firmware_partition 重新匹配到该槽（中间父级联场景）。
-     */
-    provide_cache_invalidate();
-    simple_ota_set_state(SIMPLE_OTA_STATE_PENDING_RESTART);
-    /*
-     * 通知 cmd_task 延迟后重启（完成即重启，2026-10-19 决策；不再等待
-     * CanRestart，亦不上报 OTACP）。本回调可能位于闭源库任务上下文，
-     * vTaskDelay + esp_restart 只在 cmd_task 执行，故此处仅置位。
-     */
-    xEventGroupSetBits(s_cmd_events, CMD_EVT_RESTART);
-    ESP_LOGI(TAG, "Mesh OTA complete; restart scheduled (deferred %u ms)",
-             (unsigned)LG_MESH_OTA_RESTART_DELAY_MS);
-    return ESP_OK;
+    ota_unlock();
+    if (err != ESP_OK) ESP_LOGE(TAG, "BINARY local validation failed: %s", esp_err_to_name(err));
+    xEventGroupSetBits(s_cmd_events, CMD_EVT_FINISH);
+    return err;
 }
 
-/* -------------------------------------------------------------------------- */
-/* OTA 事件处理器（esp_event 任务上下文，非 ISR）                                 */
-/* -------------------------------------------------------------------------- */
-
-static void mesh_ota_event_handler(void *arg, esp_event_base_t base,
-                                   int32_t event_id, void *event_data)
+/* esp_event 任务只复制终态、唤醒服务任务，不能凭 SDK success 宣告本地固件就绪。 */
+static void mesh_ota_event_handler(void *arg, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     (void)arg;
-
-    if (base != ESP_MESH_LITE_EVENT) {
-        return;
-    }
-
-    switch (event_id) {
-    case ESP_MESH_LITE_EVENT_OTA_START:
-        ESP_LOGI(TAG, "Mesh OTA event: start");
-        break;
-
-    case ESP_MESH_LITE_EVENT_OTA_PROGRESS: {
-        const esp_mesh_lite_event_ota_progress_t *prog = event_data;
-        if (prog != NULL && (prog->percentage % LG_MESH_OTA_PROGRESS_LOG_STEP_PCT) == 0) {
-            ESP_LOGI(TAG, "Mesh OTA event: progress %u%%", prog->percentage);
+    if (base != ESP_MESH_LITE_EVENT) return;
+    if (event_id == ESP_MESH_LITE_EVENT_OTA_PROGRESS) {
+        const esp_mesh_lite_event_ota_progress_t *progress = event_data;
+        if (progress != NULL && progress->percentage % LG_MESH_OTA_PROGRESS_LOG_STEP_PCT == 0) {
+            ESP_LOGI(TAG, "BINARY progress=%u%%", progress->percentage);
         }
-        break;
-    }
-
-    case ESP_MESH_LITE_EVENT_OTA_FINISH: {
-        const esp_mesh_lite_event_ota_finish_t *fin = event_data;
-        esp_mesh_lite_ota_finish_reason_t reason =
-            (fin != NULL) ? fin->reason : (esp_mesh_lite_ota_finish_reason_t)ESP_MESH_LITE_EVENT_OTA_FAIL;
-
-        if (reason == ESP_MESH_LITE_EVENT_OTA_SUCCESS) {
-            ESP_LOGI(TAG, "Mesh OTA event: finish, success");
-            /*
-             * get_file_done 通常已置 PENDING_RESTART；此处仅对仍处于
-             * RUNNING 的非常规顺序做兜底（状态只升不降，不覆盖既有终态）。
-             */
-            if (simple_ota_get_state() == SIMPLE_OTA_STATE_RUNNING) {
-                simple_ota_set_state(SIMPLE_OTA_STATE_PENDING_RESTART);
-                /*
-                 * 非常规顺序（done 回调未到）：兜底通知重启。与 done 路径
-                 * 双置位无害——第一次 esp_restart 后系统即重置。
-                 */
-                xEventGroupSetBits(s_cmd_events, CMD_EVT_RESTART);
-            }
-        } else {
-            ESP_LOGE(TAG, "Mesh OTA event: finish, fail, reason=%d", (int)reason);
-            if (simple_ota_get_state() == SIMPLE_OTA_STATE_RUNNING) {
-                simple_ota_set_state(SIMPLE_OTA_STATE_FAILED);
-            }
-            /* 通知 cmd_task 按重试间隔再试（cmd_task 内做间隔延迟）。 */
-            xEventGroupSetBits(s_cmd_events, CMD_EVT_RETRY);
+    } else if (event_id == ESP_MESH_LITE_EVENT_OTA_FINISH) {
+        const esp_mesh_lite_event_ota_finish_t *finish = event_data;
+        if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) return;
+        if (s_session_open && !s_finish_received) {
+            s_finish_reason = finish != NULL ? finish->reason : ESP_MESH_LITE_EVENT_OTA_FAIL;
+            s_finish_tick = xTaskGetTickCount();
+            s_finish_received = true;
         }
-        break;
-    }
-
-    default:
-        break;
+        ota_unlock();
+        xEventGroupSetBits(s_cmd_events, CMD_EVT_FINISH);
     }
 }
 
-/* -------------------------------------------------------------------------- */
-/* 子节点禁用桩：mesh 内全链路无目标版本时命中                                    */
-/* -------------------------------------------------------------------------- */
-
-/*
- * extern_url_ota_cb 禁用桩（产品决策：子节点不走外网兜底）。
- * 命中即返回失败，由 cmd_task 有限重试吸收；重试耗尽置 FAILED 等服务器
- * 重发命令。不打 firmware URL，防日志泄露内网拓扑。
- * 调用上下文：闭源库内部任务。
- */
 static esp_err_t mesh_ota_extern_disabled(void)
 {
-    ESP_LOGW(TAG, "Mesh-internal firmware unavailable; external fallback disabled by design");
+    ESP_LOGW(TAG, "BINARY file unavailable in mesh; external body download disabled");
+    /* transmit_file_start 可能忽略 extern 回调的返回值，显式交给服务任务收尾。 */
+    if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) return ESP_FAIL;
+    if (s_session_open) {
+        s_finish_received = true;
+        s_finish_reason = ESP_MESH_LITE_EVENT_OTA_FAIL;
+        s_finish_tick = xTaskGetTickCount();
+    }
+    ota_unlock();
+    xEventGroupSetBits(s_cmd_events, CMD_EVT_FINISH);
     return ESP_FAIL;
 }
 
-/* -------------------------------------------------------------------------- */
-/* cmd_task：状态预检 + 层级分流 + 重试调度                                       */
-/* -------------------------------------------------------------------------- */
+/* cmd_task 调用；就绪前无供数读者，可以在锁外分块读 flash，避免长时间占锁。
+ * 每块让出 CPU1，SHA 对应原 BIN 的完整字节，排除 Mesh-Lite 的填充段。 */
+static esp_err_t hash_file(mesh_ready_file_t *file)
+{
+    unsigned char digest[32];
+    unsigned char buffer[LG_MESH_OTA_HASH_BUFFER_BYTES];
+    static const char hex[] = "0123456789abcdef";
+    mbedtls_sha256_context ctx;
+    mbedtls_sha256_init(&ctx);
+    esp_err_t err = ESP_FAIL;
+    if (mbedtls_sha256_starts(&ctx, 0) != 0) goto done;
+    for (size_t offset = 0; offset < file->size_bytes;) {
+        size_t count = file->size_bytes - offset;
+        if (count > sizeof(buffer)) count = sizeof(buffer);
+        err = esp_partition_read(file->partition, offset, buffer, count);
+        if (err != ESP_OK) goto done;
+        if (mbedtls_sha256_update(&ctx, buffer, count) != 0) {
+            err = ESP_FAIL;
+            goto done;
+        }
+        offset += count;
+        vTaskDelay(1);
+    }
+    err = ESP_FAIL;
+    if (mbedtls_sha256_finish(&ctx, digest) != 0) goto done;
+    for (size_t i = 0; i < sizeof(digest); ++i) {
+        file->sha256_hex[2 * i] = hex[digest[i] >> 4];
+        file->sha256_hex[2 * i + 1] = hex[digest[i] & 0x0F];
+    }
+    file->sha256_hex[64] = '\0';
+    err = ESP_OK;
+done:
+    mbedtls_sha256_free(&ctx);
+    return err;
+}
 
-/* 置重试位（未耗尽时）；调用方随后返回，WaitBits 立即唤醒走重试流程。 */
+/* cmd_task 调用，只接受来自本次本地校验成功路径的分区，不扫描分区头。 */
+static esp_err_t stage_candidate(const simple_ota_metadata_t *metadata, size_t size_bytes,
+                                  const esp_partition_t *partition)
+{
+    if (metadata == NULL || !binary_name_valid(metadata->file) || partition == NULL ||
+        aligned_file_size(size_bytes) == 0 || aligned_file_size(size_bytes) > partition->size) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) return ESP_FAIL;
+    s_ready_file = (mesh_ready_file_t){.size_bytes = size_bytes, .partition = partition};
+    strlcpy(s_ready_file.file_name, metadata->file, sizeof(s_ready_file.file_name));
+    strlcpy(s_ready_file.version, metadata->version, sizeof(s_ready_file.version));
+    ota_unlock();
+    s_finalization_pending = true;
+    simple_ota_set_state(SIMPLE_OTA_STATE_PENDING_RESTART);
+    return ESP_OK;
+}
+
+/* cJSON 临时节点全部在本函数释放；最终负载静态保存，不跨任务传递堆指针。
+ * 使用 JSON 转义保留 AgingNumber 的字符串类型，重试复用同一 Seq/负载。 */
+static bool prepare_otacp_payload(void)
+{
+    if (DEVICE_ID == NULL || DEVICE_ID[0] == '\0' || AgingNumber == NULL) {
+        ESP_LOGE(TAG, "OTACP requires configured DEVICE_ID and AgingNumber");
+        return false;
+    }
+    int len = snprintf(s_otacp_topic, sizeof(s_otacp_topic), "device/%s/event/OTACP", DEVICE_ID);
+    if (len < 0 || (size_t)len >= sizeof(s_otacp_topic)) {
+        ESP_LOGE(TAG, "OTACP topic exceeds buffer; refusing truncation");
+        return false;
+    }
+    cJSON *root = cJSON_CreateObject();
+    if (root == NULL) return false;
+    bool ok = cJSON_AddNumberToObject(root, "Seq", (double)s_otacp_seq) != NULL;
+    cJSON *data = ok ? cJSON_AddObjectToObject(root, "Data") : NULL;
+    ok = data != NULL && cJSON_AddNumberToObject(data, "IsComplete", 1) != NULL &&
+              cJSON_AddStringToObject(data, "AgingNumber", AgingNumber) != NULL &&
+              cJSON_PrintPreallocated(root, s_otacp_payload, sizeof(s_otacp_payload), false);
+    cJSON_Delete(root);
+    return ok;
+}
+
+/* 服务任务每秒轮询；仅实际下载并完成就绪登记才置 pending，失败/跳过无通知。 */
+static void poll_otacp_report(void)
+{
+    if (!s_otacp_pending || (int32_t)(xTaskGetTickCount() - s_otacp_retry_tick) < 0) return;
+    s_otacp_retry_tick = xTaskGetTickCount() + pdMS_TO_TICKS(LG_MESH_OTA_OTACP_RETRY_MS);
+    if (!s_otacp_payload_ready) {
+        s_otacp_payload_ready = prepare_otacp_payload();
+        if (!s_otacp_payload_ready) {
+            ESP_LOGW(TAG, "OTACP payload preparation failed; retry later");
+            return;
+        }
+    }
+    if (!app_mqtt_is_connected()) return;
+    int msg_id = app_mqtt_publish(s_otacp_topic, s_otacp_payload, NULL);
+    if (msg_id < 0) {
+        ESP_LOGW(TAG, "OTACP enqueue rejected: %d; retry later", msg_id);
+        return;
+    }
+    s_otacp_pending = false;
+    ESP_LOGI(TAG, "OTACP enqueued: topic=%s seq=%lld msg_id=%d", s_otacp_topic,
+             (long long)s_otacp_seq, msg_id);
+}
+
+/* cmd_task 调用；登记/恢复失败仅重试收尾，不重新下载或擦除已经有效的固件。 */
+static esp_err_t finalize_candidate(void)
+{
+    mesh_ready_file_t file;
+    if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) return ESP_FAIL;
+    file = s_ready_file;
+    ota_unlock();
+    if (!s_finalization_pending || file.partition == NULL) return ESP_ERR_INVALID_STATE;
+    esp_err_t err;
+    if (file.sha256_hex[0] == '\0') {
+        err = hash_file(&file);
+        if (err != ESP_OK) return err;
+        if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) return ESP_FAIL;
+        s_ready_file = file; /* 登记/恢复失败时复用 SHA，仍保持 valid=false。 */
+        ota_unlock();
+    }
+    memset(s_registered_file_name, 0, sizeof(s_registered_file_name));
+    memcpy(s_registered_file_name, file.file_name, strlen(file.file_name));
+    err = esp_mesh_lite_lan_ota_set_file_name(s_registered_file_name);
+    if (err != ESP_OK) return err;
+    /* 此 restart 仅恢复下级 OTA 请求，绝不是 esp_restart。根不重启也须解除 pause。 */
+    err = esp_mesh_lite_ota_notify_child_node_restart();
+    if (err != ESP_OK) return err;
+    file.valid = true;
+    if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) return ESP_FAIL;
+    s_ready_file = file;
+    ota_unlock();
+    s_finalization_pending = false;
+    s_retry_waiting = false;
+    char running_version[SIMPLE_OTA_VERSION_MAX_LEN];
+    err = simple_ota_get_running_version(running_version, sizeof(running_version));
+    if (err != ESP_OK) strlcpy(running_version, "unknown", sizeof(running_version));
+    ESP_LOGI(TAG, "OTA_BINARY_READY level=%u running=%s target=%s file=%s partition=%s bytes=%u sha256=%s",
+             (unsigned)esp_mesh_lite_get_level(), running_version, file.version, file.file_name,
+             file.partition->label, (unsigned)file.size_bytes, file.sha256_hex);
+    s_otacp_seq = time(NULL);
+    s_otacp_pending = true;
+    s_otacp_payload_ready = false;
+    s_otacp_retry_tick = xTaskGetTickCount();
+    return ESP_OK;
+}
+
 static void schedule_retry(void)
 {
-    if (s_retry_count < LG_MESH_OTA_RETRY_MAX) {
-        xEventGroupSetBits(s_cmd_events, CMD_EVT_RETRY);
-    } else {
-        ESP_LOGE(TAG, "OTA retry exhausted (%u/%u); waiting for server resend",
-                 (unsigned)s_retry_count, (unsigned)LG_MESH_OTA_RETRY_MAX);
-        simple_ota_set_state(SIMPLE_OTA_STATE_FAILED);
+    if (s_retry_waiting) return;
+    if (s_retry_count >= LG_MESH_OTA_RETRY_MAX) {
+        ESP_LOGE(TAG, "BINARY retry exhausted; stage=%s waiting for new command",
+                 s_finalization_pending ? "register/resume" : "download");
+        return;
+    }
+    ++s_retry_count;
+    s_retry_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(LG_MESH_OTA_RETRY_INTERVAL_MS);
+    s_retry_waiting = true;
+    ESP_LOGW(TAG, "BINARY retry %u/%u in %u ms, stage=%s", s_retry_count, LG_MESH_OTA_RETRY_MAX,
+             (unsigned)LG_MESH_OTA_RETRY_INTERVAL_MS, s_finalization_pending ? "register/resume" : "download");
+}
+
+static void finish_candidate(void)
+{
+    esp_err_t err = finalize_candidate();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "BINARY finalization failed: %s; no READY", esp_err_to_name(err));
+        schedule_retry();
     }
 }
 
-/*
- * 根节点路径：暂停子节点 OTA 请求（库内排队）→ 唤醒 dl_task 外网下载
- * 唯一 1 份 → 【方案 A】先行重启供数。
- *
- * 方案 A 依据（2026-10-19 1 根 1 子 gate 实测，见
- * MESH_LITE_OTA_INTEGRATION.md）：闭源库要求供数方 running 分区版本 ==
- * 子节点请求版本，根"已下载未重启"态（新固件在另一 ota 槽、running 仍是
- * 旧版）会被库拒绝供数。因此根下载完成后必须重启才能让子节点的 mesh 内
- * 请求命中 provide_file_cb——子的就绪在库约束下依赖根先重启。
- *
- * 根不发送 OTACP：先行重启本身即为完成信号（2026-10-19 起子节点同样
- * 完成即重启，OTACP 上报已整体移除）。
- * 重启前延迟等待串口日志与 MQTT 在途报文落盘（对齐 CanRestart 分支
- * 重启前等待范式，appTask.c）。
- *
- * 失败/超时路径：恢复子节点并汇入重试调度，根保持旧固件继续运行。
- * 调用上下文：cmd_task。
- */
-static void handle_root_path(void)
+/* done 和 FINISH 可能以不同顺序唤醒任务；二者都成功才进入登记流程。 */
+static void process_child_finish(void)
 {
-    ESP_LOGI(TAG, "Root OTA path: pause children, external download (single copy)");
-
-    esp_err_t err = esp_mesh_lite_ota_notify_child_node_pause();
-    if (err != ESP_OK) {
-        /* 继续下载：子节点请求可能直接穿透，由禁用桩/重试兜底。 */
-        ESP_LOGW(TAG, "notify_child_node_pause failed: %s", esp_err_to_name(err));
+    if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) return;
+    if (!s_session_open || !s_finish_received) {
+        ota_unlock();
+        return;
     }
-
-    xEventGroupClearBits(s_dl_events, DL_EVT_DONE | DL_EVT_FAIL);
-    xEventGroupSetBits(s_dl_events, DL_EVT_START);
-
-    EventBits_t bits = xEventGroupWaitBits(s_dl_events,
-                                           DL_EVT_DONE | DL_EVT_FAIL,
-                                           pdTRUE,
-                                           pdFALSE,
-                                           pdMS_TO_TICKS(LG_MESH_OTA_ROOT_DL_TIMEOUT_MS));
-
-    if (bits & DL_EVT_DONE) {
-        ESP_LOGW(TAG,
-                 "Root OTA completed; restarting root in %u ms to serve new firmware "
-                 "to children",
-                 (unsigned)LG_MESH_OTA_RESTART_DELAY_MS);
-        vTaskDelay(pdMS_TO_TICKS(LG_MESH_OTA_RESTART_DELAY_MS));
-        esp_restart();
-        /* 不返回：esp_restart 不会回到本函数。 */
+    if (s_finish_reason == ESP_MESH_LITE_EVENT_OTA_SUCCESS && !s_rx_done &&
+        xTaskGetTickCount() - s_finish_tick < pdMS_TO_TICKS(LG_MESH_OTA_DONE_WAIT_MS)) {
+        ota_unlock();
+        if (!s_finish_wait_logged) ESP_LOGW(TAG, "SDK success received; waiting for local validation");
+        s_finish_wait_logged = true;
+        return;
     }
-
-    /* 失败/超时路径：根保持旧固件，恢复子节点走重试。 */
-    ESP_LOGE(TAG, "Root OTA download failed or timed out; resume children for retry");
-    /* dl_task 失败时 simple_ota 状态已为 FAILED；超时路径防御性置位。 */
-    if (bits == 0) {
-        simple_ota_set_state(SIMPLE_OTA_STATE_FAILED);
+    bool valid = s_finish_reason == ESP_MESH_LITE_EVENT_OTA_SUCCESS && s_rx_validated && !s_rx_failed;
+    const esp_partition_t *partition = s_update_partition;
+    int reason = (int)s_finish_reason;
+    reset_receiver_locked();
+    ota_unlock();
+    if (valid) {
+        esp_err_t err = stage_candidate(&s_metadata, s_firmware_size_bytes, partition);
+        if (err == ESP_OK) {
+            finish_candidate();
+            return;
+        }
+        ESP_LOGE(TAG, "BINARY candidate rejected: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGE(TAG, "BINARY transfer not locally validated, SDK reason=%d; no READY", reason);
     }
-
-    err = esp_mesh_lite_ota_notify_child_node_restart();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "notify_child_node_restart failed: %s", esp_err_to_name(err));
-    }
-
+    simple_ota_set_state(SIMPLE_OTA_STATE_FAILED);
     schedule_retry();
 }
 
-/*
- * 子节点路径：收到命令即拉取 update.json → 版本门 → Content-Length 探测 →
- * transmit_file_start（extern 禁用桩）。之后由库驱动 get_file_cb/get_file_done
- * 与 OTA_FINISH 事件收尾。重试复用首次 metadata/size，不重复外网请求。
- *
- * 2026-10-20：去掉设备侧层级错峰延时——升级时序由上位机分级下发完全控制
- * （先根、根重启上线后再逐层下发子节点）。设备侧保留的时序兜底：根下载期间
- * pause/restart 让请求在库内排队、失败 90s×2 重试、库穿透机制；服务器若
- * 同时全层下发，子首次请求失败后由重试兜底命中（多一轮失败日志，功能正确）。
- *
- * 调用上下文：cmd_task；重试间隔延迟已由 cmd_task 主循环统一处理。
- */
+/* 根完成事件只在 dl_task 真正退出下载后处理，超时不并发启动第二次下载。 */
+static void process_root_finish(void)
+{
+    if (!s_root_downloading) return;
+    s_root_downloading = false;
+    if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) return;
+    esp_err_t err = s_download_error;
+    ota_unlock();
+    simple_ota_download_result_t result;
+    if (err == ESP_OK) {
+        err = simple_ota_get_download_result(&result);
+        if (err == ESP_ERR_NOT_FOUND && simple_ota_get_state() == SIMPLE_OTA_STATE_IDLE) {
+            esp_err_t resume_err = esp_mesh_lite_ota_notify_child_node_restart();
+            if (resume_err != ESP_OK) ESP_LOGW(TAG, "Root skip OTA: resume failed: %s", esp_err_to_name(resume_err));
+            ESP_LOGI(TAG, "Root has no newer firmware; no BINARY file registered, no READY");
+            return;
+        }
+    }
+    if (err == ESP_OK) err = stage_candidate(&result.metadata, result.size_bytes, result.partition);
+    if (err == ESP_OK) {
+        finish_candidate();
+        return;
+    }
+    ESP_LOGE(TAG, "Root BINARY download/stage failed: %s", esp_err_to_name(err));
+    esp_err_t resume_err = esp_mesh_lite_ota_notify_child_node_restart();
+    if (resume_err != ESP_OK) ESP_LOGW(TAG, "Root failure: resume failed: %s", esp_err_to_name(resume_err));
+    simple_ota_set_state(SIMPLE_OTA_STATE_FAILED);
+    schedule_retry();
+}
+
+static void handle_root_path(void)
+{
+    esp_err_t err = esp_mesh_lite_ota_notify_child_node_pause();
+    if (err != ESP_OK) ESP_LOGW(TAG, "Root pause failed: %s; unready callbacks still reject data", esp_err_to_name(err));
+    s_root_downloading = true;
+    s_root_timeout_logged = false;
+    s_root_start_tick = xTaskGetTickCount();
+    xEventGroupSetBits(s_dl_events, DL_EVT_START);
+}
+
 static void handle_child_path(void)
 {
-    ESP_LOGI(TAG, "Child OTA: level=%u, requesting firmware via mesh (server-controlled timing)",
-             (unsigned)esp_mesh_lite_get_level());
-
-    /* 首试获取参数；重试复用。 */
+    esp_err_t err;
     if (!s_metadata_valid) {
-        esp_err_t err = simple_ota_fetch_metadata(&s_metadata);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "fetch update.json failed: %s", esp_err_to_name(err));
-            simple_ota_set_state(SIMPLE_OTA_STATE_FAILED);
-            schedule_retry();
-            return;
+        err = simple_ota_fetch_metadata(&s_metadata);
+        if (err != ESP_OK) goto failed;
+        if (!binary_name_valid(s_metadata.file)) {
+            err = ESP_ERR_INVALID_SIZE;
+            ESP_LOGE(TAG, "BINARY file name must be 1..31 bytes; refusing truncation");
+            goto failed;
         }
-
         if (!simple_ota_version_is_newer(s_metadata.version)) {
-            ESP_LOGI(TAG, "Firmware already up to date (%s); skip OTA", s_metadata.version);
             simple_ota_set_state(SIMPLE_OTA_STATE_IDLE);
+            ESP_LOGI(TAG, "Child has no newer firmware; no READY");
             return;
         }
-
         err = simple_ota_probe_firmware_size(s_metadata.file, &s_firmware_size_bytes);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "probe firmware size failed: %s", esp_err_to_name(err));
-            simple_ota_set_state(SIMPLE_OTA_STATE_FAILED);
-            schedule_retry();
-            return;
+        if (err != ESP_OK) goto failed;
+        const esp_partition_t *partition = esp_ota_get_next_update_partition(NULL);
+        size_t padded_bytes = aligned_file_size(s_firmware_size_bytes);
+        if (partition == NULL || padded_bytes == 0 || padded_bytes > partition->size) {
+            err = ESP_ERR_INVALID_SIZE;
+            goto failed;
         }
-
         s_metadata_valid = true;
-        ESP_LOGI(TAG, "Child OTA target: version=%s size=%u bytes",
-                 s_metadata.version, (unsigned)s_firmware_size_bytes);
     }
-
-    /* 发起 mesh 内 OTA：extern 传禁用桩，强制 mesh 内路径。 */
+    if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) {
+        err = ESP_FAIL;
+        goto failed;
+    }
+    reset_receiver_locked();
+    s_session_open = true;
+    s_rx_accepting = true;
+    s_finish_wait_logged = false;
+    ota_unlock();
     esp_mesh_lite_file_transmit_config_t cfg = {
-        .type = ESP_MESH_LITE_OTA_TRANSMIT_FIRMWARE,
+        .type = ESP_MESH_LITE_OTA_TRANSMIT_BINARY,
         .size = s_firmware_size_bytes,
         .extern_url_ota_cb = mesh_ota_extern_disabled,
     };
-    strlcpy(cfg.fw_version, s_metadata.version, sizeof(cfg.fw_version));
-
-    esp_err_t err = esp_mesh_lite_transmit_file_start(&cfg);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "transmit_file_start failed: %s", esp_err_to_name(err));
-        simple_ota_set_state(SIMPLE_OTA_STATE_FAILED);
-        schedule_retry();
-        return;
+    strlcpy(cfg.file_name, s_metadata.file, sizeof(cfg.file_name));
+    ESP_LOGI(TAG, "OTA_BINARY_REQUEST level=%u file=%s target=%s bytes=%u",
+             (unsigned)esp_mesh_lite_get_level(), cfg.file_name, s_metadata.version, (unsigned)cfg.size);
+    err = esp_mesh_lite_transmit_file_start(&cfg);
+    if (err == ESP_OK) return;
+    if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) == pdTRUE) {
+        reset_receiver_locked();
+        ota_unlock();
     }
+failed:
+    ESP_LOGE(TAG, "Child BINARY request failed: %s", esp_err_to_name(err));
+    simple_ota_set_state(SIMPLE_OTA_STATE_FAILED);
+    schedule_retry();
+}
 
-    ESP_LOGI(TAG, "transmit_file_start: version=%s size=%u bytes; mesh-internal path only",
-             cfg.fw_version, (unsigned)s_firmware_size_bytes);
-    /* 后续由库回调 get_file_cb / get_file_done 与 OTA_FINISH 事件驱动。 */
+static void start_attempt(void)
+{
+    if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) return;
+    s_ready_file = (mesh_ready_file_t){0};
+    reset_receiver_locked();
+    ota_unlock();
+    simple_ota_set_state(SIMPLE_OTA_STATE_RUNNING);
+    /* 配置角色决定外网下载权限，失去父节点的子不能因 level=0 被当成根。 */
+    if (IsRoot == 1) handle_root_path();
+    else handle_child_path();
+}
+
+/* 单轮服务处理，所有重试调度均不阻塞，保证迟到完成事件能及时收尾。 */
+static void mesh_ota_service_poll(EventBits_t bits)
+{
+    if (bits & CMD_EVT_DOWNLOAD_DONE) process_root_finish();
+    process_child_finish();
+    if (s_root_downloading && !s_root_timeout_logged &&
+        xTaskGetTickCount() - s_root_start_tick >= pdMS_TO_TICKS(LG_MESH_OTA_ROOT_DL_TIMEOUT_MS)) {
+        s_root_timeout_logged = true;
+        ESP_LOGE(TAG, "Root download exceeded timeout; waiting for worker exit, concurrent retry prohibited");
+    }
+    if (bits & CMD_EVT_REQUEST) {
+        simple_ota_state_t state = simple_ota_get_state();
+        if (s_root_downloading || state == SIMPLE_OTA_STATE_RUNNING || s_retry_waiting) {
+            ESP_LOGW(TAG, "BINARY command ignored: current attempt/retry still active");
+        } else if (state == SIMPLE_OTA_STATE_PENDING_RESTART) {
+            if (s_finalization_pending) {
+                s_retry_count = 0;
+                finish_candidate();
+            } else ESP_LOGI(TAG, "BINARY already staged; duplicate command will not erase firmware");
+        } else {
+            s_retry_count = 0;
+            s_metadata_valid = false;
+            start_attempt();
+        }
+    }
+    if (s_retry_waiting && (int32_t)(xTaskGetTickCount() - s_retry_deadline) >= 0) {
+        s_retry_waiting = false;
+        if (s_finalization_pending) finish_candidate();
+        else if (!s_root_downloading) start_attempt();
+    }
+    poll_otacp_report();
 }
 
 static void mesh_ota_cmd_task(void *arg)
 {
     (void)arg;
-
     for (;;) {
         EventBits_t bits = xEventGroupWaitBits(s_cmd_events,
-                                               CMD_EVT_REQUEST | CMD_EVT_RETRY | CMD_EVT_RESTART,
-                                               pdTRUE,
-                                               pdFALSE,
-                                               portMAX_DELAY);
-
-        /*
-         * 完成即重启（2026-10-19 决策）：OTA 完成后由 cmd_task 延迟重启。
-         * 库回调上下文不做 vTaskDelay/esp_restart，故 get_file_done_cb 与
-         * FINISH 兜底只置位；状态闸门保证仅 PENDING_RESTART 才动作。
-         * 与 REQUEST/RETRY 同时置位时优先重启（PENDING_RESTART 下新命令
-         * 本就会被拒，重启后由新固件重新接收）。
-         */
-        if (bits & CMD_EVT_RESTART) {
-            if (simple_ota_get_state() == SIMPLE_OTA_STATE_PENDING_RESTART) {
-                ESP_LOGW(TAG,
-                         "OTA completed; restarting in %u ms to run new firmware",
-                         (unsigned)LG_MESH_OTA_RESTART_DELAY_MS);
-                vTaskDelay(pdMS_TO_TICKS(LG_MESH_OTA_RESTART_DELAY_MS));
-                esp_restart();
-                /* 不返回：esp_restart 不会回到本函数。 */
-            }
-            if ((bits & (CMD_EVT_REQUEST | CMD_EVT_RETRY)) == 0) {
-                continue;
-            }
-        }
-
-        bool is_retry = (bits & CMD_EVT_RETRY) != 0;
-
-        /*
-         * 状态预检（异步化后第二条 ota 命令可能在 RUNNING 期间到达；
-         * 原同步实现天然免疫，此处显式拒绝，防双下载/双传输会话）。
-         */
-        simple_ota_state_t st = simple_ota_get_state();
-        if (st == SIMPLE_OTA_STATE_PENDING_RESTART) {
-            ESP_LOGW(TAG, "OTA pending restart; ignoring %s",
-                     is_retry ? "retry" : "command");
-            continue;
-        }
-        if (st == SIMPLE_OTA_STATE_RUNNING) {
-            ESP_LOGW(TAG, "OTA already running; ignoring %s",
-                     is_retry ? "retry" : "command");
-            continue;
-        }
-
-        if (is_retry && s_retry_count >= LG_MESH_OTA_RETRY_MAX) {
-            ESP_LOGE(TAG, "OTA retry exhausted (%u/%u); waiting for server resend",
-                     (unsigned)s_retry_count, (unsigned)LG_MESH_OTA_RETRY_MAX);
-            simple_ota_set_state(SIMPLE_OTA_STATE_FAILED);
-            continue;
-        }
-
-        /*
-         * 重试间隔对所有路径统一在此延迟（根外网下载失败同样需要退避）。
-         * 延迟期间到达的新 REQUEST 会被本循环按 RETRY 合并处理——重试本身
-         * 即是对该命令的响应，语义等价。
-         */
-        if (is_retry) {
-            s_retry_count++;
-            ESP_LOGI(TAG, "OTA retry %u/%u in %us",
-                     (unsigned)s_retry_count, (unsigned)LG_MESH_OTA_RETRY_MAX,
-                     (unsigned)LG_MESH_OTA_RETRY_INTERVAL_SEC);
-            vTaskDelay(pdMS_TO_TICKS((uint32_t)LG_MESH_OTA_RETRY_INTERVAL_SEC * 1000u));
-
-            /* 等待期间可能已由其他路径完成（如服务器重发触发根侧完成）。 */
-            if (simple_ota_get_state() == SIMPLE_OTA_STATE_PENDING_RESTART) {
-                ESP_LOGI(TAG, "OTA retry aborted: pending restart");
-                continue;
-            }
-        } else {
-            s_retry_count = 0;
-        }
-        simple_ota_set_state(SIMPLE_OTA_STATE_RUNNING);
-
-        uint8_t level = esp_mesh_lite_get_level();
-        if (level <= 1) {
-            handle_root_path();
-        } else {
-            handle_child_path();
-        }
+            CMD_EVT_REQUEST | CMD_EVT_FINISH | CMD_EVT_DOWNLOAD_DONE,
+            pdTRUE, pdFALSE, pdMS_TO_TICKS(LG_MESH_OTA_SERVICE_POLL_MS));
+        mesh_ota_service_poll(bits);
     }
 }
-
-/* -------------------------------------------------------------------------- */
-/* dl_task：根节点外网下载（唯一执行 simple_ota 下载链的任务）                     */
-/* -------------------------------------------------------------------------- */
 
 static void mesh_ota_dl_task(void *arg)
 {
     (void)arg;
-
     for (;;) {
         xEventGroupWaitBits(s_dl_events, DL_EVT_START, pdTRUE, pdFALSE, portMAX_DELAY);
-
-        ESP_LOGI(TAG, "dl_task: starting external download");
         esp_err_t err = simple_ota_check_and_update_default();
-
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "dl_task: external download failed: %s", esp_err_to_name(err));
-            /* simple_ota_check_and_update 内部已置 FAILED；此处只发事件。 */
-            xEventGroupSetBits(s_dl_events, DL_EVT_FAIL);
-        } else {
-            ESP_LOGI(TAG, "dl_task: external download completed");
-            xEventGroupSetBits(s_dl_events, DL_EVT_DONE);
+        if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) == pdTRUE) {
+            s_download_error = err;
+            ota_unlock();
         }
+        xEventGroupSetBits(s_cmd_events, CMD_EVT_DOWNLOAD_DONE);
     }
 }
-
 #endif /* CONFIG_ESP_MESH_LITE_OTA_ENABLE */
-
-/* -------------------------------------------------------------------------- */
-/* 对外接口                                                                     */
-/* -------------------------------------------------------------------------- */
 
 esp_err_t mesh_ota_init(void)
 {
 #ifndef CONFIG_ESP_MESH_LITE_OTA_ENABLE
-    ESP_LOGE(TAG, "CONFIG_ESP_MESH_LITE_OTA_ENABLE not set; mesh OTA unavailable");
+    ESP_LOGE(TAG, "CONFIG_ESP_MESH_LITE_OTA_ENABLE not set; BINARY unavailable");
     return ESP_ERR_NOT_SUPPORTED;
 #else
-    if (s_initialized) {
-        return ESP_OK;
-    }
-
+    if (s_initialized) return ESP_OK;
     s_cmd_events = xEventGroupCreateStatic(&s_cmd_events_buf);
     s_dl_events = xEventGroupCreateStatic(&s_dl_events_buf);
-    if (s_cmd_events == NULL || s_dl_events == NULL) {
-        ESP_LOGE(TAG, "Failed to create static event groups");
-        return ESP_ERR_NO_MEM;
-    }
-
     s_ota_mutex = xSemaphoreCreateMutexStatic(&s_ota_mutex_buf);
-    if (s_ota_mutex == NULL) {
-        ESP_LOGE(TAG, "Failed to create static OTA mutex");
-        return ESP_ERR_NO_MEM;
-    }
-
-    /* LAN OTA 文件传输三回调。 */
-    static esp_mesh_lite_lan_ota_file_transfer_cb_t lan_ota_cb = {
-        .provide_file_cb = provide_file_cb,
-        .get_file_cb = get_file_cb,
-        .get_file_done = get_file_done_cb,
+    if (s_cmd_events == NULL || s_dl_events == NULL || s_ota_mutex == NULL) return ESP_ERR_NO_MEM;
+    static esp_mesh_lite_lan_ota_file_transfer_cb_t callbacks = {
+        .provide_file_cb = provide_file_cb, .get_file_cb = get_file_cb, .get_file_done = get_file_done_cb,
     };
-    esp_mesh_lite_ota_register_file_transfer_cb(&lan_ota_cb);
-
-    /* OTA 事件：一次注册整个 base（ESP_EVENT_ANY_ID），handler 内部分流。 */
+    esp_mesh_lite_ota_register_file_transfer_cb(&callbacks);
     esp_err_t err = esp_event_handler_register(ESP_MESH_LITE_EVENT, ESP_EVENT_ANY_ID,
                                                mesh_ota_event_handler, NULL);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Register OTA event handler failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    /*
-     * cmd_task：所有节点创建（命令分流 + mesh 内发起 + 重试 + 完成即重启调度）。
-     * 升级时序由上位机分级下发控制，设备侧无错峰延时（2026-10-20 移除）。
-     */
-    if (xTaskCreatePinnedToCore(mesh_ota_cmd_task, "mesh_ota_cmd",
-                                LG_STACK_MESH_OTA, NULL, LG_PRIO_MESH_OTA,
-                                NULL, LG_APP_CPU_CORE) != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create mesh_ota_cmd task");
-        return ESP_ERR_NO_MEM;
-    }
-
-    /*
-     * dl_task：仅根节点创建。DL_EVT_START 唯一置位点在根节点路径
-     * （handle_root_path）；子节点 extern_url_ota_cb 为禁用桩，永不触发
-     * 外网下载，故子节点无需该任务（每子省 LG_STACK_MESH_OTA_DL 栈 + TCB）。
-     * IsRoot 在 readconfig 阶段已加载，本调用点（mesh_init 成功后）可安全读取。
-     * 注意：根/子为同一固件，该函数在子节点固件中仍被编译保留，仅不执行创建。
-     */
-    if (IsRoot == 1) {
-        if (xTaskCreatePinnedToCore(mesh_ota_dl_task, "mesh_ota_dl",
-                                    LG_STACK_MESH_OTA_DL, NULL, LG_PRIO_MESH_OTA_DL,
-                                    NULL, LG_APP_CPU_CORE) != pdPASS) {
-            ESP_LOGE(TAG, "Failed to create mesh_ota_dl task");
-            return ESP_ERR_NO_MEM;
-        }
-    }
-
+    if (err != ESP_OK) return err;
+    /* 沿用既有任务，固定 CPU1 与 task_config.h 中的栈/优先级。 */
+    if (xTaskCreatePinnedToCore(mesh_ota_cmd_task, "mesh_ota_cmd", LG_STACK_MESH_OTA,
+            NULL, LG_PRIO_MESH_OTA, NULL, LG_APP_CPU_CORE) != pdPASS) return ESP_ERR_NO_MEM;
+    if (IsRoot == 1 && xTaskCreatePinnedToCore(mesh_ota_dl_task, "mesh_ota_dl", LG_STACK_MESH_OTA_DL,
+            NULL, LG_PRIO_MESH_OTA_DL, NULL, LG_APP_CPU_CORE) != pdPASS) return ESP_ERR_NO_MEM;
     s_initialized = true;
-    ESP_LOGI(TAG, "mesh_ota initialized: retry=%ux@%us, restart_delay=%ums (server-controlled timing)",
-             (unsigned)LG_MESH_OTA_RETRY_MAX,
-             (unsigned)LG_MESH_OTA_RETRY_INTERVAL_SEC,
-             (unsigned)LG_MESH_OTA_RESTART_DELAY_MS);
+    ESP_LOGI(TAG, "BINARY staging initialized; no automatic restart, OTACP enabled, retry=%u x 90s", LG_MESH_OTA_RETRY_MAX);
     return ESP_OK;
-#endif /* CONFIG_ESP_MESH_LITE_OTA_ENABLE */
+#endif
 }
 
 void mesh_ota_handle_mqtt_command(void)
 {
 #ifndef CONFIG_ESP_MESH_LITE_OTA_ENABLE
-    ESP_LOGE(TAG, "Mesh OTA not compiled in; ignoring ota command");
-    return;
+    ESP_LOGE(TAG, "Mesh OTA not compiled in; ignoring command");
 #else
-    if (s_cmd_events == NULL) {
-        ESP_LOGE(TAG, "mesh_ota not initialized; ignoring ota command");
+    if (!s_initialized) {
+        ESP_LOGE(TAG, "BINARY not initialized; ignoring command");
         return;
     }
-
-    /*
-     * 状态预检（与 cmd_task 内重复，但提前拦截可避免无谓唤醒）：
-     * PENDING_RESTART 忽略（防二次下载覆盖运行槽）、RUNNING 拒绝（防双下载）。
-     */
-    simple_ota_state_t st = simple_ota_get_state();
-    if (st == SIMPLE_OTA_STATE_PENDING_RESTART) {
-        ESP_LOGW(TAG, "OTA pending restart; ignoring ota command");
-        return;
-    }
-    if (st == SIMPLE_OTA_STATE_RUNNING) {
-        ESP_LOGW(TAG, "OTA already running; ignoring ota command");
-        return;
-    }
-
     xEventGroupSetBits(s_cmd_events, CMD_EVT_REQUEST);
-    ESP_LOGI(TAG, "OTA command received; dispatched to cmd_task");
-#endif /* CONFIG_ESP_MESH_LITE_OTA_ENABLE */
+#endif
 }
 
 simple_ota_state_t mesh_ota_get_state(void)
