@@ -1,5 +1,6 @@
 #include "modbus_cmd.h"
 #include "app_crc.h"
+#include "app_mem.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,7 +11,7 @@ static bool modbus_alloc_frame(ModbusFrame *out_frame, size_t len)
     if (!out_frame || len == 0)
         return false;
 
-    out_frame->data = (uint8_t *)malloc(len);
+    out_frame->data = (uint8_t *)app_malloc_prefer_psram(len);
     if (!out_frame->data)
     {
         out_frame->len = 0;

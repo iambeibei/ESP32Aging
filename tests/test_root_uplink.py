@@ -164,6 +164,12 @@ static unsigned tcp_attempts, mesh_pause_count, mesh_resume_count;
 static int mesh_disconnect_error;
 static esp_err_t esp_mesh_lite_disconnect(void) { assert(!lock_depth); mesh_pause_count++; return mesh_disconnect_error; }
 static void esp_mesh_lite_connect(void) { assert(!lock_depth); mesh_resume_count++; }
+/* 此脚本只验证有线仲裁；完整重启状态/互斥在 test_system_restart.py 验证。 */
+static bool mesh_control_take(void) { return true; }
+static void mesh_control_give(void) {}
+static bool restart_paused;
+static bool system_restart_mesh_paused(void) { return restart_paused; }
+static esp_err_t mesh_disconnect_locked(void) { return esp_mesh_lite_disconnect(); }
 static void mesh_root_manage_sta_reconnect(bool wired_preferred, bool sta_has_ip);
 /* Mock only socket I/O; use the real application's timeout/cleanup and probe counters. */
 static int mock_socket(int domain, int type, int protocol) { (void)domain; (void)type; (void)protocol; return 10; }
@@ -188,6 +194,7 @@ static int mock_connect(int fd, const struct sockaddr *addr, socklen_t len) {
 
 TESTS = r'''
 static void reset(void) {
+    restart_paused = false;
     memset(&s_state, 0, sizeof(s_state));
     s_state.initialized = true;
     eth_netif = &eth_mock; wifi_netif = &wifi_mock;

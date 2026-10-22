@@ -43,6 +43,7 @@
 #include "task_config.h"
 #include "ota.h"
 #include "mesh_ota.h"
+#include "system_restart.h"
 
 #pragma region 全局状态与任务辅助
 
@@ -113,8 +114,12 @@ static void show_free_heap(const char *tag)
              (unsigned)largest_internal_block, largest_internal_block / 1024.0);
     ESP_LOGI(tag, "PSRAM free: %u bytes (%.2f KB)",
              (unsigned)free_spiram, free_spiram / 1024.0);
+    ESP_LOGI(tag, "PSRAM minimum=%u bytes, largest=%u bytes",
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     ESP_LOGI(tag, "Free heap: %" PRId32 " bytes", esp_get_free_heap_size());
     ESP_LOGI(tag, "Minimum free heap: %" PRId32 " bytes", esp_get_minimum_free_heap_size());
+    app_memory_log("button");
 }
 
 static const char *TAG = "app_task";
@@ -135,7 +140,6 @@ typedef struct
 
 long Programld = 0;      // 老化任务ID
 uint8_t Cannextstep = 0; // 默认为0，群控模式下，收到下一步操作指令后，设置为1，表示可以执行下一步老化操作
-uint8_t CanRestart = 0;  // 默认为0，ota模式下，收到下一步操作指令后，设置为1，表示可以执行重启操作
 uint8_t AgingCMode = 0;
 uint8_t CycleIndex = 0;
 AgingConfig agingcfg = {0}; // 定义全局老化配置结构体
@@ -245,6 +249,12 @@ BaseType_t app_create_mqtt_service_task(TaskFunction_t task_fn, TaskHandle_t *ta
 {
     return create_cpu1_task(task_fn, "mqtt_service", LG_STACK_MQTT_SERVICE,
                             LG_PRIO_MQTT_SERVICE, task_handle);
+}
+
+BaseType_t app_create_restart_service_task(TaskFunction_t task_fn, TaskHandle_t *task_handle)
+{
+    return create_cpu1_task(task_fn, "restart_service", LG_STACK_RESTART_SERVICE,
+                            LG_PRIO_RESTART_SERVICE, task_handle);
 }
 
 static void print_task_stack_watermark(const char *name, TaskHandle_t task_handle)
@@ -623,6 +633,29 @@ static void device_response_publish_point(int cmd_seq, int code, const char *msg
     }
 }
 
+/* MQTT 接收任务仅校验/提交并复用现有应答契约；不延时、不碰 Wi-Fi SDK。 */
+static void app_handle_restart_command(const cJSON *root, int cmd_seq)
+{
+    const cJSON *data = cJSON_GetObjectItemCaseSensitive(root, "Data");
+    const cJSON *restart = cJSON_IsObject(data) ? cJSON_GetObjectItemCaseSensitive(data, "Restart") : NULL;
+    if (!cJSON_IsNumber(restart) || restart->valuedouble != 1.0) {
+        device_response_publish_point(cmd_seq, 0, "Restart requires Data.Restart=1");
+        return;
+    }
+    system_restart_plan_t plan;
+    esp_err_t err = system_restart_schedule(cmd_seq, &plan);
+    if (err != ESP_OK) {
+        device_response_publish_point(cmd_seq, 0, "Restart service unavailable or network recovery already committed");
+        ESP_LOGE(TAG, "Restart schedule rejected: %s", esp_err_to_name(err));
+        return;
+    }
+    char message[112];
+    snprintf(message, sizeof(message), "Restart scheduled: plan_seq=%" PRId32 " level=%u pause=%us restart=%us",
+             plan.command_seq, (unsigned)plan.level, (unsigned)LG_RESTART_BASE_DELAY_SEC,
+             (unsigned)plan.delay_seconds);
+    device_response_publish_point(cmd_seq, 1, message);
+}
+
 static void device_response_publish_state(int cmd_seq, int code, const char *msg)
 {
     char *response = create_device_response(time(NULL), cmd_seq, code, msg);
@@ -775,7 +808,7 @@ int *parse_ids_array(const char *json_str, int *out_count)
     }
 
     // 5. 分配 int 数组
-    int *array = (int *)malloc(count * sizeof(int));
+    int *array = (int *)app_calloc_prefer_psram(count, sizeof(int));
     if (array == NULL)
     {
         cJSON_Delete(root);
@@ -3137,7 +3170,7 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                         printf("ids[%d] = %d\n", i, ids[i]);
                         query_db1_to_global(ids[i]);
                         /* 坏记录隔离（v7）：无 RecordId 的历史记录不可补发。 */
-                        if (g_db1_result->record_id[0] != '\0' && g_db1_result->json_data[0] != '\0')
+                        if (g_db1_result != NULL && g_db1_result->record_id[0] != '\0' && g_db1_result->json_data[0] != '\0')
                         {
                             int publish_id = app_mqtt_publish("device/%s/data/aging", g_db1_result->json_data, DEVICE_ID);
                             if (publish_id > 0)
@@ -3188,24 +3221,7 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
             }
             else if (strstr(TopicBuf, "CanRestart"))
             {
-                cJSON *Data_obj = cJSON_GetObjectItem(pRoot, "Data");
-                cJSON *NextStep = cJSON_IsObject(Data_obj) ? cJSON_GetObjectItem(Data_obj, "Restart") : NULL;
-                if (cJSON_IsNumber(NextStep))
-                {
-                    CanRestart = (uint8_t)NextStep->valueint;
-                }
-                if (CanRestart == 1)
-                {
-                    /*
-                     * 保留既有外部/运维重启行为（等待 5 秒）。BINARY 验证阶段
-                     * OTA 完成不自动重启，实机验证期间不要发送本命令；
-                     * 后续的统一延时 30 秒重启另行实现，本轮不调整此处行为。
-                     */
-                    ESP_LOGW(TAG, "CanRestart received; restarting now (ota_state=%d, pending_restart=%d)",
-                             (int)simple_ota_get_state(), simple_ota_is_pending_restart() ? 1 : 0);
-                    vTaskDelay(pdMS_TO_TICKS(5000));
-                    esp_restart();
-                }
+                app_handle_restart_command(pRoot, Seq->valueint);
             }
             else if (strstr(TopicBuf, "CPower")) // 只有根节点才会触发,控制开关相关代码待完善
             {
@@ -3740,9 +3756,11 @@ static void Device_Init(Externaldevice **device1, int devicecount)
         }
         else if (strncmp(device->CommunicationMode, "Bluetooth", 9) == 0)
         {
+            app_memory_log("before_ble_init");
             // 初始化BLE控制模块
             // BluetoothDeviceCount = i;
             esp_err_t ret = ble_control_init();
+            app_memory_log("after_ble_init");
             if (ret == ESP_OK)
             {
                 ESP_LOGI(TAG, "BLE control module initialized successfully");
@@ -4255,13 +4273,13 @@ static bool aging_command_json_parse(const char *packet_copy)
     int64_t protoid = 0;
     get_json_int64(packet_copy, "ProtoID", &protoid);
 
-    agingcfg.devices[0].ProtoID = protoid;
-
     if (agingcfg.device_count <= 0 || agingcfg.devices == NULL)
     {
         aging_error_log("Aging configuration has no device");
         goto start_failed;
     }
+
+    agingcfg.devices[0].ProtoID = protoid;
 
     if (agingcfg.step_count <= 0 || agingcfg.steps == NULL)
     {
@@ -4371,6 +4389,7 @@ static bool aging_command_json_parse(const char *packet_copy)
     }
 
     aging_runtime_log("Aging task created; entering external-device check");
+    app_memory_log("aging_started");
     return true;
 
 start_failed:
@@ -4384,7 +4403,7 @@ start_failed:
         memset(&agingcfg, 0, sizeof(agingcfg));
     }
     spiffs_file_delete("Aging.json");
-
+    app_memory_log("aging_start_failed");
     return false;
 }
 // 老化步骤开始前/结束后执行动作列表，并记录每个失败动作。
@@ -5281,7 +5300,7 @@ void Aging_Test_Task(void *arg)
                         printf("ids[%d] = %d\n", i, ids[i]);
                         query_db1_to_global(ids[i]);
                         /* 坏记录隔离（v7）：无 RecordId 的历史记录不可补发。 */
-                        if (g_db1_result->record_id[0] != '\0' && g_db1_result->json_data[0] != '\0')
+                        if (g_db1_result != NULL && g_db1_result->record_id[0] != '\0' && g_db1_result->json_data[0] != '\0')
                         {
                             int publish_id = app_mqtt_publish("device/%s/data/aging", g_db1_result->json_data, DEVICE_ID);
                             if (publish_id > 0)
@@ -6031,11 +6050,17 @@ void app_task_init(void)
     }
 
     ESP_LOGI(TAG, "Configuration loaded successfully");
+    app_memory_log("config_loaded");
     Device_Init(&read_devices, read_device_count); // 初始化设备
 
     // UDP_Port 是历史配置键，目前仍作为联网功能开关。
     if (UDP_Port == 1)
     {
+        /* 早于 Mesh 自愈及 MQTT 命令；创建失败时命令明确拒绝，不同步重启。 */
+        esp_err_t restart_err = system_restart_init();
+        if (restart_err != ESP_OK) {
+            ESP_LOGE(TAG, "Restart service init failed: %s", esp_err_to_name(restart_err));
+        }
         esp_err_t mesh_err = mesh_init_Custom();
         if (mesh_err != ESP_OK)
         {

@@ -41,6 +41,11 @@ static int queue_create_count, publish_count, subscribe_count, config_report_cou
 static QueueHandle_t xQueueCreate(int length, size_t size) {
     QueueHandle_t q = calloc(1,sizeof(*q)); q->cap=length; q->size=size; q->data=calloc(length,size); queue_create_count++; return q;
 }
+/* Payload allocation/rollback is covered by test_psram_memory.py with the real helper. */
+typedef struct { QueueHandle_t handle; } AppPsramQueue;
+static QueueHandle_t app_psram_queue_create(AppPsramQueue *q, unsigned n, unsigned size, const char *name) {
+    (void)name; if (!q->handle) q->handle=xQueueCreate(n,size); return q->handle;
+}
 static int xQueueSend(QueueHandle_t q, const void *item, TickType_t timeout) {
     (void)timeout; if(q->count==q->cap) return 0; memcpy(q->data+((q->head+q->count)%q->cap)*q->size,item,q->size); q->count++; return pdTRUE;
 }
@@ -58,6 +63,9 @@ static const char *DEVICE_ID = "test-device", *AgingNumber = "rack";
 typedef struct { const char *version; } MockAppDesc;
 static const MockAppDesc *esp_app_get_description(void) { static MockAppDesc desc = {"test"}; return &desc; }
 static void Config_Report(int type) { (void)type; config_report_count++; }
+/* 应用层 SQLite 结算和补传入口由各自任务处理，此处只模拟模块边界。 */
+static void app_mqtt_publish_settled(int msg_id, bool acked) { (void)msg_id; (void)acked; }
+static void app_mqtt_backfill_wake(void) {}
 static char *CreateReadConfigJsonFromFiles_MQTT(int seq, int cmd_seq, int code, const char *msg) {
     (void)seq; (void)cmd_seq; (void)code; (void)msg; config_report_count++; return strdup("{\"config\":true}");
 }
@@ -174,7 +182,7 @@ static int esp_mqtt_client_subscribe(esp_mqtt_client_handle_t client, const char
 }
 typedef struct { const char *filter; int qos; } esp_mqtt_topic_t;
 static void sdk_ack(esp_mqtt_client_handle_t client, int kind, int id, bool accepted, int count) {
-    char codes[13] = {0}; if (!accepted) codes[0] = (char)0x80;
+    char codes[13]; memset(codes, 1, sizeof(codes)); if (!accepted) codes[0] = (char)0x80;
     MockMqttEvent event = {.client=client, .event_id=kind, .msg_id=id, .data=codes, .data_len=count};
     bool previous = in_sdk_callback; in_sdk_callback = true; sdk_handler(NULL, 0, kind, &event); in_sdk_callback = previous;
 }
@@ -492,8 +500,8 @@ int main(void) {
 
     mqtt_app_stop();
     free(s_service_work.online_json); free(s_ack_map);
-    QueueHandle_t queues[] = {Topic_queue, Data_queue, s_runtime_queue};
-    for (unsigned i=0; i<3; ++i) {free(queues[i]->data); free(queues[i]);}
+    QueueHandle_t queues[] = {Data_queue, s_runtime_queue};
+    for (unsigned i=0; i<sizeof(queues)/sizeof(queues[0]); ++i) {free(queues[i]->data); free(queues[i]);}
     puts("All MQTT handover regression scenarios passed");
     return 0;
 }
@@ -515,7 +523,7 @@ static pthread_mutex_t critical_mutex = PTHREAD_MUTEX_INITIALIZER;''')
         for header in ['esp_log.h', 'esp_event.h', 'esp_netif.h', 'esp_wifi.h', 'esp_bridge.h',
                        'esp_eth.h', 'esp_timer.h', 'esp_err.h', 'esp_system.h', 'esp_tls.h',
                        'mqtt_client.h', 'cJSON.h', 'esp_app_desc.h', 'appTask.h', 'esp_random.h', 'app_mem.h', 'Json_data.h',
-                       'mesh.h', 'task_config.h', 'ConfigData.h', 'log.h',
+                       'mesh.h', 'task_config.h', 'ConfigData.h', 'log.h', 'app_queue.h',
                        'freertos/FreeRTOS.h', 'freertos/task.h', 'freertos/semphr.h',
                        'lwip/sockets.h', 'lwip/inet.h']:
             path = temp / header

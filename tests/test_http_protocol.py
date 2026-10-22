@@ -47,6 +47,7 @@ typedef StaticSemaphore_t *SemaphoreHandle_t;
 #define ESP_LOGW(...) ((void)0)
 #define ESP_LOGE(...) ((void)0)
 #define ESP_LOGI(...) ((void)0)
+static void app_memory_log(const char *stage) { (void)stage; }
 #define LG_URL_HTTP_PROTOCOL_WHOLE_URL "https://protocol"
 static const char *esp_err_to_name(esp_err_t e) { (void)e; return "mock"; }
 static SemaphoreHandle_t xSemaphoreCreateMutexStatic(StaticSemaphore_t *s) { pthread_mutex_init(&s->lock,NULL); return s; }
@@ -212,7 +213,7 @@ def main():
         temp = Path(directory)
         (temp / 'mocks.h').write_text(MOCKS)
         for header in ['esp_err.h', 'esp_http_client.h', 'esp_log.h', 'esp_heap_caps.h', 'esp_crt_bundle.h',
-                       'service_urls.h', 'freertos/FreeRTOS.h', 'freertos/queue.h']:
+                       'service_urls.h', 'app_mem.h', 'freertos/FreeRTOS.h', 'freertos/queue.h']:
             path = temp / header
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text('#include "mocks.h"\n')

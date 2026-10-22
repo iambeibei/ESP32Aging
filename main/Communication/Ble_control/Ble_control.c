@@ -16,6 +16,8 @@
 #include "freertos/queue.h"
 #include "appTask.h"
 #include "app_enc.h"
+#include "app_mem.h"
+#include "esp_attr.h"
 
 static const char *TAG = "BLE_CTRL";
 
@@ -48,7 +50,8 @@ static QueueHandle_t data_queue;         // 接收到的数据队列
 static QueueHandle_t data_forword_queue; // 转发的数据队列
 
 // BLE设备列表
-static ble_device_info_t s_scanned_devices[MAX_SCAN_DEVICES];
+/* GAP/GATTC 回调为任务上下文；应用扫描列表不供控制器 DMA/ISR 使用。 */
+EXT_RAM_BSS_ATTR static ble_device_info_t s_scanned_devices[MAX_SCAN_DEVICES];
 static int s_scanned_count = 0;
 static bool s_is_scanning = false;
 static bool s_is_connected = false;
@@ -159,7 +162,7 @@ static ble_device_info_t *find_device_by_address(uint8_t *bda);
 //      }
 //  }
 
-static uint8_t a_data[BUFFER_MAX];
+EXT_RAM_BSS_ATTR static uint8_t a_data[BUFFER_MAX];
 
 void app_ble_recv_task(void *arg)
 {
@@ -186,7 +189,7 @@ void app_ble_recv_task(void *arg)
         {
             ESP_LOGI(TAG, "ble a recv len: %d", datalen);
             ble_data_t ble_data;
-            ble_data.data = malloc(datalen);
+            ble_data.data = app_malloc_prefer_psram(datalen);
             if (ble_data.data)
             {
                 ble_data.data_len = datalen;
@@ -1002,7 +1005,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
             break;
         }
 
-        char_result = malloc(sizeof(esp_gattc_char_elem_t) * count);
+        char_result = app_calloc_prefer_psram(count, sizeof(esp_gattc_char_elem_t));
         if (char_result == NULL)
         {
             ESP_LOGE(TAG, "Memory allocation failed");
@@ -1083,7 +1086,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
             break;
         }
 
-        descr_result = malloc(sizeof(esp_gattc_descr_elem_t) * descr_count);
+        descr_result = app_calloc_prefer_psram(descr_count, sizeof(esp_gattc_descr_elem_t));
         if (descr_result == NULL)
         {
             ESP_LOGE(TAG, "Memory allocation failed");
@@ -1121,7 +1124,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         // esp_log_buffer_hex(TAG, param->notify.value, param->notify.value_len);
 
         ble_mtu_data_t recv;
-        recv.data = malloc(param->notify.value_len);
+        recv.data = app_malloc_prefer_psram(param->notify.value_len);
         if (!recv.data)
         {
             ESP_LOGE(TAG, "recv.data = malloc(param->notify.value_len)");

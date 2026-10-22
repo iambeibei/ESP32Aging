@@ -35,7 +35,7 @@ extern "C" {
  * @brief OTA 状态机（2026-10-16 起：下载完成后不再自动重启）
  *
  * 状态转换：
- *   IDLE --OTA命令--> RUNNING --下载成功--> PENDING_RESTART（等待外部重启）
+ *   IDLE --OTA命令--> RUNNING --校验/持久化/设置启动成功--> PENDING_RESTART
  *                        |                （无需升级/版本不新）--> IDLE
  *                        +--任何失败--> FAILED（可再次收到命令重试）
  *
@@ -45,7 +45,7 @@ extern "C" {
  */
 typedef enum {
     SIMPLE_OTA_STATE_IDLE = 0,           /**< 空闲（初始态/无需升级后回到此态） */
-    SIMPLE_OTA_STATE_RUNNING,            /**< 检查/下载进行中 */
+    SIMPLE_OTA_STATE_RUNNING,            /**< 检查/下载/校验或持久化收尾进行中 */
     SIMPLE_OTA_STATE_PENDING_RESTART,    /**< 下载完成，等待外部触发重启 */
     SIMPLE_OTA_STATE_FAILED,             /**< 本次检查/下载失败 */
 } simple_ota_state_t;
@@ -110,16 +110,18 @@ bool simple_ota_is_pending_restart(void);
 /**
  * @brief 检查服务器版本并在需要时执行 OTA
  *
- * - 服务器版本 > 本地版本：下载并写入非运行槽、设为启动分区，完成后进入
- *   PENDING_RESTART 状态并正常返回 ESP_OK（**不再自动重启**，重启由外部
- *   通过 CanRestart 等机制触发）。
+ * - 服务器版本 > 本地版本：下载并校验非运行槽，生成下载结果并返回 ESP_OK。
+ *   仍保持 RUNNING，供 Mesh OTA 服务先持久化、再设置启动分区及完成通知。
  * - 服务器版本 <= 本地版本：不升级，返回 ESP_OK，状态回 IDLE。
- * - 状态为 PENDING_RESTART 时收到新的 OTA 命令：忽略（防止二次下载覆盖
- *   正在运行的槽位），返回 ESP_OK。
+ * - 状态为 PENDING_RESTART 时收到新的 OTA 命令：忽略，保留已暂存的新固件，
+ *   返回 ESP_OK。
  * - 网络、JSON、版本格式或 OTA 出错：返回对应错误码，状态置 FAILED。
  *
  * @param config OTA 配置
- * @return ESP_OK 无需升级/已下载完成（等待重启）或重复命令被忽略；失败返回错误码
+ * 仅供 OTA 服务串行调用；阻塞网络 I/O，不可从 ISR 或 MQTT 回调调用。
+ * 本函数不选择启动分区；调用方必须消费下载快照并执行持久化收尾。
+ *
+ * @return ESP_OK 无需升级/下载校验完成（等待服务收尾）或重复命令被忽略；失败返回错误码
  */
 esp_err_t simple_ota_check_and_update(const simple_ota_config_t *config);
 
@@ -149,6 +151,9 @@ typedef struct {
  * （包括版本无需更新）；失败时清零输出。重复 pending 命令保留原快照。
  */
 esp_err_t simple_ota_get_download_result(simple_ota_download_result_t *out_result);
+
+/** 严格三段版本比较，成功时 comparison 为 -1/0/1。任务上下文，无网络和阻塞。 */
+esp_err_t simple_ota_compare_versions(const char *left, const char *right, int *comparison);
 
 /**
  * @brief 使用默认服务器地址检查更新

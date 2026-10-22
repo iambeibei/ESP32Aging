@@ -1,4 +1,5 @@
 #include <ctype.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -20,19 +21,22 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "nvs.h"
 
 #include "ConfigData.h"
 #include "mesh.h"
 #include "dual_net.h"
 #include "task_config.h"
+#include "system_restart.h"
+#include "app_mem.h"
 
 
 #define MESH_MAX_LEVEL 6
 /*
  * 每节点 SoftAP 最大接入子节点数：2026-10-16 曾由 5 调到 8（缓解「中间父
  * 断开+根已满」时无替代父的重连循环），同日应现场要求回退为 5。
- * 回退后该场景依靠：重连节奏 5s×2/15s（加快重扫发现）+ 无父自愈 watchdog
+ * 回退后该场景依靠：重连/重扫（当前 10s×5/15s）+ 无父自愈 watchdog
  * （软复位→重启兜底，见 MESH_PARENT_LOST_SOFT_RESET_MS）兜底。
  * 约束备忘：ESP32-S3 SoftAP 单节点上限 15；CONFIG_LWIP_DHCPS_MAX_STATION_NUM=64；
  * iot_bridge Kconfig 要求 DHCPS ≥ SOFTAP_MAX_CONNECT_NUMBER；NAPT 表 512 条。
@@ -52,14 +56,12 @@
  * 射频争用与闭源重扫路径暴露；2026-10-16 折中为 5s×2/15s（重连窗口 30s→10s），
  * 加快中间父永久断开时的重扫发现，配合无父 watchdog 兜底。
  *
- * 2026-10-19 OTA 适配（本次）：父节点重启恢复期约 25~40s（外网下载完成 + 3s 延迟 +
- * 重启入网 + SoftAP 就绪，见 MESH_LITE_OTA_INTEGRATION.md 方案 A），10s 重连窗口
- * 覆盖不到，子节点会在父恢复前提前进入重扫、多绕一轮 OTA 重试（90s）。故加长到
+ * 2026-10-19 沿用的父恢复窗口取舍：为减少父重启恢复时的提前换父，重连窗口加长到
  * 10s×5=50s：父恢复 SoftAP 时子仍在重连原父窗口内，直接命中、OTA 传输中断面最小。
  * 代价：中间父永久故障时换父延迟从约 10s 增至约 50s（15s 重扫兜底节奏不变，
  * 仍有界；无父 watchdog 的 180s 软复位线不受影响）。根节点侧无负面：根 STA 30s 内
  * 恢复则 failover 的 30s 触发线不会误触发（FAILOVER_LOST_IP_MS），>30s 故障照旧切换。
- * 后续「逐层重启」方案落地时需重新评估本组参数。
+ * 2026-10-22 一键重启在等待阶段主动暂停重连；启动后仍用本组参数，实机核对恢复耗时。
  */
 #define MESH_PARENT_RETRY_INTERVAL_SEC 10
 #define MESH_PARENT_RETRY_COUNT        5
@@ -75,14 +77,13 @@
  * 为什么去掉 reason 过滤（2026-10-21，现场反馈"一直重连不重启"）：满员父的
  * deauth reason 由 iot_bridge SoftAP + WiFi 栈发出，实测值不可预先枚举
  * （初版集合 {2,4,5,6} 曾漏掉现场实际码导致计数不累加）；且正常换父成功会
- * 经 GOT_IP 稳定在线后清零，误伤可控，故任何断开都计数。
+ * 经 GOT_IP 持续在线 10s 后清零；只计非主动的 DISCONNECTED，不重复计 LOST_IP。
  */
 #define MESH_PARENT_FAIL_RESTART_THRESHOLD 5
 
 /*
- * "稳定在线"判定窗：距上次 GOT_IP 达到该时长才算真正恢复，连接失败计数
- * 重新从 1 计；窗口内的"连上秒级又被踢"不清零、继续累计——防止满员父
- * 短暂放行再挤掉的循环永远凑不满阈值（2026-10-21 现场反馈的嫌疑 2）。
+ * "稳定在线"判定窗：同一次连续在线满 10s 才清零；离线结束在线窗。
+ * 窗口内的"连上秒级又被踢"继续累计，续租不重置起点，旧 GOT_IP 时间不影响后续失败。
  */
 #define MESH_PARENT_STABLE_ONLINE_MS 10000
 
@@ -102,18 +103,15 @@
  * 分级 escalate（用户 2026-10-16 确认）：
  *   L1 连续无父 MESH_PARENT_LOST_SOFT_RESET_MS → 软复位一次：
  *      esp_mesh_lite_disconnect() + esp_mesh_lite_connect()，
- *      强制库走「扫描匹配节点并连接」的 fresh 路径，绕开可能卡住的
- *      内部重试状态与 RTC 原父偏好；不重启、不动老化任务、不丢数据；
- *   L2 软复位 MESH_SOFT_RESET_MAX 次仍无父 → esp_restart()；
+ *      请求重新扫描匹配节点，不承诺清除 RTC 原父偏好；不重启；
+ *   L2 软复位 MESH_SOFT_RESET_MAX 次仍无父 → 清 Mesh RTC 记录再 esp_restart()；
  *   L3 每上电周期重启达 MESH_RESTART_MAX_PER_CYCLE（RTC 计数，
  *      ESP_RST_SW 延续、上电/Brownout 清零，镜像 failover 范式）→
  *      永久放弃重启，只限频打日志并继续扫描，回到「无限期存活于
  *      无上行状态」（CHILD_NODE_ROOT_LOSS_DESIGN.md 7.2/7.7）。
  *
  * 背景：现场实测重启可恢复「中间父断开 + 根已满」的卡死；
- * 软复位用官方 API 达成同等 scan-first 效果且不杀老化会话，
- * 故作为第一级手段，重启仅作兜底。根掉线场景最坏时间线：
- * 约 12/24/36 分钟三次重启后稳定存活（每次软复位有 3 分钟观察窗）。
+ * 软恢复作为第一级手段；连续失败快通道可能早于 watchdog 触发，两者共享 3 次预算。
  */
 #define MESH_PARENT_LOST_SOFT_RESET_MS 180000 /* 连续无父 3 分钟后软复位 */
 #define MESH_SOFT_RESET_MAX             3      /* 本次无父期间软复位次数上限 */
@@ -121,6 +119,7 @@
 #define MESH_HEAL_RTC_MAGIC             0x4D484C57U /* "MHLW" */
 #define MESH_HEAL_GIVEUP_LOG_INTERVAL_MS 60000     /* 放弃重启后的限频日志周期 */
 #define MESH_HEAL_SOFT_RESET_GAP_MS     100        /* disconnect→connect 间隔与重启前日志落盘等待 */
+#define MESH_CONTROL_WAIT_MS           50
 
 static const char *TAG = "mesh_lite_app";
 static char s_softap_prefix[16];
@@ -147,19 +146,44 @@ static RTC_NOINIT_ATTR atomic_uint_least32_t s_heal_restart_count;
 static atomic_uint s_last_sta_disconnect_reason;
 
 /*
- * 连续父节点连接失败计数：事件任务写（STA_DISCONNECTED/LOST_IP 分支）、
- * 健康监视任务读（mesh_heal_connect_fail_fast_path），__atomic_* RELAXED
- * 同步。仅子节点累加（根连路由器无父概念，由 root_failover_task 管理）。
- * 清零规则见 note_parent_connect_failure() 的"稳定在线"判定。
+ * 连续父节点连接失败计数：事件任务在非主动 DISCONNECTED 时累加，
+ * 事件/健康任务在连续在线 10s 后清零。更新经 s_parent_state_lock 同步，诊断原子读。
+ * 仅子节点累加，LOST_IP 不重复计数。
  */
 static atomic_uint s_parent_fail_count;
 
 /*
- * 最近一次 GOT_IP 的 tick：仅事件任务访问（GOT_IP 写、断开分支读，默认
- * 事件循环单任务串行，无需原子），用于"稳定在线"判定——
- * 秒级连踢不清零计数，稳定后才算真正恢复。
+ * 连续在线起点、状态与最近父 BSSID：默认事件任务和健康任务共用短临界区。
  */
-static TickType_t s_last_got_ip_tick;
+static portMUX_TYPE s_parent_state_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_parent_ip_online;
+static TickType_t s_parent_online_since;
+static uint8_t s_last_parent_bssid[6];
+static atomic_uint s_last_valid_level;
+/* 主动 disconnect 的事件可能异步到达；只排除对应的本地 ASSOC_LEAVE 事件。 */
+static atomic_bool s_local_disconnect_pending;
+static StaticSemaphore_t s_mesh_control_mutex_buf;
+static SemaphoreHandle_t s_mesh_control_mutex;
+
+/* 应用连接/断开共用此锁；不在 Wi-Fi 事件中等待，SDK 调用不得置于 spinlock。 */
+static bool mesh_control_take(void)
+{
+    return s_mesh_control_mutex != NULL &&
+           xSemaphoreTake(s_mesh_control_mutex, pdMS_TO_TICKS(MESH_CONTROL_WAIT_MS)) == pdTRUE;
+}
+
+static void mesh_control_give(void)
+{
+    if (xSemaphoreGive(s_mesh_control_mutex) != pdTRUE) ESP_LOGE(TAG, "Mesh control mutex release failed");
+}
+
+static esp_err_t mesh_disconnect_locked(void)
+{
+    __atomic_store_n(&s_local_disconnect_pending, true, __ATOMIC_RELEASE);
+    esp_err_t err = esp_mesh_lite_disconnect();
+    if (err != ESP_OK) __atomic_store_n(&s_local_disconnect_pending, false, __ATOMIC_RELEASE);
+    return err;
+}
 
 /* 只有 net_monitor 访问此标志；SDK 调用可产生新的断开事件，先标记再调用。
  * disconnect 返回失败时内部可能已暂停重连，仍须在有线失效时执行一次 connect。
@@ -169,11 +193,19 @@ static bool s_sta_reconnect_paused_by_eth;
 void mesh_root_manage_sta_reconnect(bool wired_preferred, bool sta_has_ip)
 {
     if (IsRoot != 1) return;
+    if (!mesh_control_take()) return; /* 下一轮 net_monitor 会重试最新状态。 */
+    if (system_restart_mesh_paused()) {
+        mesh_control_give();
+        return;
+    }
     bool pause = wired_preferred && (s_sta_reconnect_paused_by_eth || !sta_has_ip);
-    if (pause == s_sta_reconnect_paused_by_eth) return;
+    if (pause == s_sta_reconnect_paused_by_eth) {
+        mesh_control_give();
+        return;
+    }
     s_sta_reconnect_paused_by_eth = pause;
     if (pause) {
-        esp_err_t err = esp_mesh_lite_disconnect();
+        esp_err_t err = mesh_disconnect_locked();
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "有线接管：暂停 STA 重连请求返回 %s（STA 可能已断开）", esp_err_to_name(err));
         } else {
@@ -183,11 +215,34 @@ void mesh_root_manage_sta_reconnect(bool wired_preferred, bool sta_has_ip)
         ESP_LOGI(TAG, "有线上行失效：恢复根节点 STA 重连");
         esp_mesh_lite_connect();
     }
+    mesh_control_give();
 }
 
 uint8_t mesh_get_current_level(void)
 {
-    return esp_mesh_lite_get_level();
+    uint8_t level = esp_mesh_lite_get_level();
+    if (level >= 1 && level <= MESH_MAX_LEVEL && (IsRoot == 1 || level >= 2)) {
+        __atomic_store_n(&s_last_valid_level, level, __ATOMIC_RELEASE);
+    }
+    return level;
+}
+
+uint8_t mesh_get_restart_level(void)
+{
+    if (IsRoot == 1) return 1;
+    uint8_t level = mesh_get_current_level();
+    if (level >= 2 && level <= MESH_MAX_LEVEL) return level;
+    level = __atomic_load_n(&s_last_valid_level, __ATOMIC_ACQUIRE);
+    return level >= 2 && level <= MESH_MAX_LEVEL ? level : MESH_MAX_LEVEL;
+}
+
+esp_err_t mesh_pause_for_restart(void)
+{
+    if (!system_restart_mesh_paused()) return ESP_ERR_INVALID_STATE;
+    if (!mesh_control_take()) return ESP_ERR_TIMEOUT;
+    esp_err_t err = mesh_disconnect_locked();
+    mesh_control_give();
+    return err;
 }
 
 /* dual_net 初始化成功后由它发布根节点标志；初始化前/失败时保留 STA 兜底。
@@ -198,6 +253,61 @@ static void mesh_update_network_flag(bool sta_has_ip)
     if (IsRoot == 1 && dual_net_is_initialized()) return;
 #endif
     __atomic_store_n(&Network_Flag, sta_has_ip ? 1U : 0U, __ATOMIC_RELEASE);
+}
+
+/* 事件与健康任务共用状态锁。续租 GOT_IP 不重置在线起点；离线即结束本次在线窗。 */
+static void mesh_parent_online_changed(bool online, TickType_t now)
+{
+    portENTER_CRITICAL(&s_parent_state_lock);
+    if (online && !s_parent_ip_online) s_parent_online_since = now;
+    if (!online && s_parent_ip_online &&
+        now - s_parent_online_since >= pdMS_TO_TICKS(MESH_PARENT_STABLE_ONLINE_MS)) {
+        __atomic_store_n(&s_parent_fail_count, 0, __ATOMIC_RELAXED);
+    }
+    s_parent_ip_online = online;
+    portEXIT_CRITICAL(&s_parent_state_lock);
+}
+
+static void mesh_parent_stability_poll(TickType_t now)
+{
+    portENTER_CRITICAL(&s_parent_state_lock);
+    if (s_parent_ip_online && now - s_parent_online_since >= pdMS_TO_TICKS(MESH_PARENT_STABLE_ONLINE_MS)) {
+        __atomic_store_n(&s_parent_fail_count, 0, __ATOMIC_RELAXED);
+    }
+    portEXIT_CRITICAL(&s_parent_state_lock);
+}
+
+/* 两条子节点自愈路径统一入口。仲裁与计划提交互斥，不清本项目 RTC 预算或任何 NVS。
+ * 成功取得重启权后不再返回；网络已恢复/排程已接受时放弃本次自愈。 */
+static void mesh_restart_without_parent(const char *reason, unsigned fails)
+{
+    if (!mesh_control_take()) return;
+    if (system_restart_is_planned() || __atomic_load_n(&Network_Flag, __ATOMIC_ACQUIRE)) {
+        mesh_control_give();
+        return;
+    }
+    unsigned long restarts = __atomic_load_n(&s_heal_restart_count, __ATOMIC_RELAXED);
+    if (restarts >= MESH_RESTART_MAX_PER_CYCLE) {
+        mesh_control_give();
+        return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(MESH_HEAL_SOFT_RESET_GAP_MS));
+    if (__atomic_load_n(&Network_Flag, __ATOMIC_ACQUIRE) || !system_restart_claim_recovery()) {
+        mesh_control_give();
+        return;
+    }
+    __atomic_store_n(&s_heal_restart_count, restarts + 1, __ATOMIC_RELAXED);
+    uint8_t bssid[6];
+    portENTER_CRITICAL(&s_parent_state_lock);
+    memcpy(bssid, s_last_parent_bssid, sizeof(bssid));
+    portEXIT_CRITICAL(&s_parent_state_lock);
+    ESP_LOGW(TAG, "MESH_RECOVERY_RESTART reason=%s failures=%u last_parent=" MACSTR
+             " reason_code=%u budget=%lu/%u erase_mesh_rtc=1",
+             reason, fails, MAC2STR(bssid),
+             (unsigned)__atomic_load_n(&s_last_sta_disconnect_reason, __ATOMIC_RELAXED),
+             restarts + 1, (unsigned)MESH_RESTART_MAX_PER_CYCLE);
+    esp_mesh_lite_erase_rtc_store();
+    esp_restart();
 }
 
 /*
@@ -211,6 +321,8 @@ static void mesh_heal_watchdog(bool online, TickType_t now)
     static TickType_t s_parent_lost_since = 0;
     static uint32_t s_soft_reset_count = 0;
     static TickType_t s_giveup_log_tick = 0;
+
+    if (system_restart_is_planned()) return;
 
     if (online) {
         /* 恢复挂接：丢弃本次无父周期的累计状态（含软复位计数）。 */
@@ -233,32 +345,33 @@ static void mesh_heal_watchdog(bool online, TickType_t now)
     }
 
     if (s_soft_reset_count < MESH_SOFT_RESET_MAX) {
+        if (!mesh_control_take()) return;
+        if (system_restart_is_planned() || __atomic_load_n(&Network_Flag, __ATOMIC_ACQUIRE)) {
+            mesh_control_give();
+            return;
+        }
         /* L1：软复位。重置计时给本次软复位一个完整观察窗。 */
         s_soft_reset_count++;
         s_parent_lost_since = now;
         ESP_LOGW(TAG, "Parent lost %u ms; mesh soft reset %u/%u (disconnect+connect)",
                  (unsigned)lost_ms, (unsigned)s_soft_reset_count, (unsigned)MESH_SOFT_RESET_MAX);
-        esp_err_t err = esp_mesh_lite_disconnect();
+        esp_err_t err = mesh_disconnect_locked();
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "esp_mesh_lite_disconnect: %s", esp_err_to_name(err));
         }
         vTaskDelay(pdMS_TO_TICKS(MESH_HEAL_SOFT_RESET_GAP_MS));
         /* esp_mesh_lite_connect() 为 void 返回（esp_mesh_lite_core.h）：扫描匹配
          * 节点并连接，结果由后续 mesh_health 心跳与 STA IP 日志体现。 */
-        esp_mesh_lite_connect();
+        if (!system_restart_mesh_paused()) esp_mesh_lite_connect();
+        mesh_control_give();
         return;
     }
 
     /* L2：软复位额度用尽 → 重启（受每上电周期预算约束）。 */
     unsigned long restarts = __atomic_load_n(&s_heal_restart_count, __ATOMIC_RELAXED);
     if (restarts < MESH_RESTART_MAX_PER_CYCLE) {
-        __atomic_store_n(&s_heal_restart_count, (atomic_uint_least32_t)(restarts + 1), __ATOMIC_RELAXED);
-        ESP_LOGW(TAG, "Parent lost %u ms; soft reset x%u ineffective; restarting node (%lu/%u this power cycle)",
-                 (unsigned)lost_ms, (unsigned)MESH_SOFT_RESET_MAX,
-                 (unsigned long)(restarts + 1), (unsigned)MESH_RESTART_MAX_PER_CYCLE);
-        vTaskDelay(pdMS_TO_TICKS(MESH_HEAL_SOFT_RESET_GAP_MS)); /* 给日志落盘留时间 */
-        esp_restart();
-        return; /* 不会到达 */
+        mesh_restart_without_parent("parent_lost_timeout", __atomic_load_n(&s_parent_fail_count, __ATOMIC_RELAXED));
+        return;
     }
 
     /* L3：重启预算耗尽 → 永久放弃重启，限频记录后继续扫描（无上行存活）。 */
@@ -278,8 +391,7 @@ static void mesh_heal_watchdog(bool online, TickType_t now)
  * "一直重连不重启"：初版 reason 过滤漏掉实际断开码，已改为任何断开都计数，
  * 并以稳定在线窗防"连上秒级被踢"的计数清零循环）。
  *
- * 重启语义是"重新选父"而非"重试"：重启后库走 fresh 扫描、绕开 RTC 原父
- * 偏好，有机会选到非满载的替代父。
+ * 自愈重启显式清除 Mesh RTC 后重新扫描；若没有其他合格候选仍可能选中原父。
  *
  * 复用 watchdog 的 RTC 重启预算（s_heal_restart_count /
  * MESH_RESTART_MAX_PER_CYCLE）：父持续满载时重启也无济于事，预算耗尽后
@@ -291,6 +403,7 @@ static void mesh_heal_watchdog(bool online, TickType_t now)
  */
 static void mesh_heal_connect_fail_fast_path(void)
 {
+    if (system_restart_is_planned() || __atomic_load_n(&Network_Flag, __ATOMIC_ACQUIRE)) return;
     unsigned fails = __atomic_load_n(&s_parent_fail_count, __ATOMIC_RELAXED);
     if (fails < MESH_PARENT_FAIL_RESTART_THRESHOLD) {
         return;
@@ -304,7 +417,9 @@ static void mesh_heal_connect_fail_fast_path(void)
          * 限频日志 + 继续扫描策略。清零后需再累计满阈值才会再来，
          * 不会刷屏。
          */
+        portENTER_CRITICAL(&s_parent_state_lock);
         __atomic_store_n(&s_parent_fail_count, 0, __ATOMIC_RELAXED);
+        portEXIT_CRITICAL(&s_parent_state_lock);
         ESP_LOGW(TAG,
                  "Parent connection failed %u times; restart budget exhausted (%lu/%u); "
                  "keep scanning, no more restarts this power cycle",
@@ -312,13 +427,7 @@ static void mesh_heal_connect_fail_fast_path(void)
         return;
     }
 
-    __atomic_store_n(&s_heal_restart_count, (atomic_uint_least32_t)(restarts + 1), __ATOMIC_RELAXED);
-    ESP_LOGW(TAG,
-             "Parent connection failed %u consecutive times; restarting node (%lu/%u this power cycle)",
-             fails, (unsigned long)(restarts + 1), (unsigned)MESH_RESTART_MAX_PER_CYCLE);
-    vTaskDelay(pdMS_TO_TICKS(MESH_HEAL_SOFT_RESET_GAP_MS)); /* 给日志落盘留时间 */
-    esp_restart();
-    /* 不会到达 */
+    mesh_restart_without_parent("parent_connection_failures", fails);
 }
 
 /*
@@ -339,6 +448,8 @@ static void mesh_health_task(void *arg)
     {
         bool online = __atomic_load_n(&Network_Flag, __ATOMIC_ACQUIRE) != 0;
         TickType_t now = xTaskGetTickCount();
+        mesh_parent_stability_poll(now);
+        uint8_t level = mesh_get_current_level();
         uint32_t interval_ms = online ? MESH_HEALTH_OK_INTERVAL_MS : MESH_HEALTH_LOST_INTERVAL_MS;
 
         if (online != was_online || last_report_tick == 0 ||
@@ -347,7 +458,7 @@ static void mesh_health_task(void *arg)
             ESP_LOGI(TAG,
                      "mesh_health: parent=%s, level=%u, network_flag=%u, last_sta_reason=%u, internal_free_bytes=%u",
                      online ? "online" : "LOST",
-                     (unsigned)esp_mesh_lite_get_level(),
+                     (unsigned)level,
                      online ? 1U : 0U,
                      (unsigned)__atomic_load_n(&s_last_sta_disconnect_reason, __ATOMIC_RELAXED),
                      (unsigned)esp_get_free_internal_heap_size());
@@ -360,13 +471,12 @@ static void mesh_health_task(void *arg)
 
         /*
          * 父连接失败快通道：连续连接失败达阈值即重启（复用 RTC 预算，
-         * 重启=重新选父），与 watchdog 并列——两者都只看父链路，触发条件
-         * 互不重叠（watchdog 管"无父超时"，快通道管"连续连接失败"）。
+         * 清记录后重新扫描），与 watchdog 共享预算及最终重启仲裁。
          */
         mesh_heal_connect_fail_fast_path();
 
-        /* 按当前态周期休眠：在线时 60s 一轮，无需每 5s 空转唤醒。 */
-        vTaskDelay(pdMS_TO_TICKS(interval_ms));
+        /* 始终 5s 检查恢复/稳定窗；健康态仅日志每 60s 输出，不再因长睡眠延误掉线处理。 */
+        vTaskDelay(pdMS_TO_TICKS(MESH_HEALTH_LOST_INTERVAL_MS));
     }
 }
 
@@ -433,29 +543,17 @@ static void sntp_sync_task(void *arg)
 
 /*
  * 记录一次父节点连接失败（2026-10-20 新增，2026-10-21 重构）：
- * 任何 STA 断开/LOST_IP 都计数（去掉初版 reason 过滤的原因见
- * MESH_PARENT_FAIL_RESTART_THRESHOLD 注释）；"稳定在线"判定——
- * 距上次 GOT_IP >= MESH_PARENT_STABLE_ONLINE_MS 算真正恢复、计数从 1 重新
- * 开始，否则（秒级"连上又被踢"）继续累计，由 mesh_health_task 的
- * mesh_heal_connect_fail_fast_path 消费（达阈值重启=重新选父）。
- *
- * 调用上下文：默认事件循环任务（network_event_handler），与 GOT_IP 写
- * s_last_got_ip_tick 串行；仅子节点计数（根无父概念）。
+ * 只由默认事件任务在非主动 DISCONNECTED 时调用；LOST_IP 不计数。
+ * 连续在线满 10s 的清零由 online_changed/stability_poll 负责，短连后继续累计。
  */
 static void note_parent_connect_failure(void)
 {
-    if (IsRoot == 1) {
-        return;
-    }
-
-    TickType_t now_tick = xTaskGetTickCount();
-    bool stable_before = (s_last_got_ip_tick != 0) &&
-                         ((now_tick - s_last_got_ip_tick) >= pdMS_TO_TICKS(MESH_PARENT_STABLE_ONLINE_MS));
-
+    if (IsRoot == 1 || system_restart_is_planned()) return;
+    portENTER_CRITICAL(&s_parent_state_lock);
     unsigned prev_fails = __atomic_load_n(&s_parent_fail_count, __ATOMIC_RELAXED);
-    unsigned fails = stable_before ? 1u : (prev_fails + 1u);
+    unsigned fails = prev_fails == UINT_MAX ? UINT_MAX : prev_fails + 1u;
     __atomic_store_n(&s_parent_fail_count, fails, __ATOMIC_RELAXED);
-
+    portEXIT_CRITICAL(&s_parent_state_lock);
     if (fails < MESH_PARENT_FAIL_RESTART_THRESHOLD) {
         ESP_LOGW(TAG,
                  "Parent connection failed (reason=%u), consecutive=%u/%u",
@@ -482,15 +580,16 @@ static void network_event_handler(void *arg, esp_event_base_t base,
          */
         mesh_update_network_flag(true);
         s_failover_attempts = 0;
-        /*
-         * 成功拿到 IP：清零连续连接失败计数，并记录"稳定在线"起点。
-         * 距本次 GOT_IP 不足 MESH_PARENT_STABLE_ONLINE_MS 的再次断开不清零
-         * （秒级连踢继续累计），见 note_parent_connect_failure()。
-         */
-        __atomic_store_n(&s_parent_fail_count, 0, __ATOMIC_RELAXED);
-        s_last_got_ip_tick = xTaskGetTickCount();
+        mesh_parent_online_changed(true, xTaskGetTickCount());
+        wifi_ap_record_t parent;
+        if (esp_wifi_sta_get_ap_info(&parent) == ESP_OK) {
+            portENTER_CRITICAL(&s_parent_state_lock);
+            memcpy(s_last_parent_bssid, parent.bssid, sizeof(s_last_parent_bssid));
+            portEXIT_CRITICAL(&s_parent_state_lock);
+            ESP_LOGI(TAG, "Parent connected: bssid=" MACSTR " rssi=%d", MAC2STR(parent.bssid), parent.rssi);
+        }
         ESP_LOGI(TAG, "STA IP " IPSTR ", level=%u, role=%s",
-                 IP2STR(&event->ip_info.ip), esp_mesh_lite_get_level(),
+                 IP2STR(&event->ip_info.ip), mesh_get_current_level(),
                  IsRoot ? "root" : "node");
         if (!s_sntp_started) {
             if (xTaskCreatePinnedToCore(sntp_sync_task, "sntp_sync", LG_STACK_SNTP,
@@ -502,6 +601,7 @@ static void network_event_handler(void *arg, esp_event_base_t base,
                (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)) {
         /* 与上面 STA_GOT_IP 对称：根节点交给 dual_net 裁决，子节点沿用原判据 */
         mesh_update_network_flag(false);
+        mesh_parent_online_changed(false, xTaskGetTickCount());
         if (s_trial_active) s_trial_success = false;
         /*
          * 断开原因落诊断变量，供子节点健康监视与「根掉线不重启」排查使用。
@@ -511,24 +611,31 @@ static void network_event_handler(void *arg, esp_event_base_t base,
         if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED && event_data != NULL) {
             const wifi_event_sta_disconnected_t *disc = (const wifi_event_sta_disconnected_t *)event_data;
             __atomic_store_n(&s_last_sta_disconnect_reason, disc->reason, __ATOMIC_RELAXED);
+            portENTER_CRITICAL(&s_parent_state_lock);
+            memcpy(s_last_parent_bssid, disc->bssid, sizeof(s_last_parent_bssid));
+            portEXIT_CRITICAL(&s_parent_state_lock);
             /* ssid 非保证 NUL 终止：用精度限定打印，并对 ssid_len 做防御性截断。 */
             unsigned print_len = disc->ssid_len;
-            if (print_len > sizeof(disc->ssid) - 1) {
-                print_len = sizeof(disc->ssid) - 1;
+            if (print_len > sizeof(disc->ssid)) {
+                print_len = sizeof(disc->ssid);
             }
-            ESP_LOGW(TAG, "STA disconnected, reason=%u, ssid=%.*s; local Mesh-Lite remains active",
-                     (unsigned)disc->reason, (int)print_len, (const char *)disc->ssid);
+            bool local = __atomic_exchange_n(&s_local_disconnect_pending, false, __ATOMIC_ACQ_REL) &&
+                         disc->reason == WIFI_REASON_ASSOC_LEAVE;
+            ESP_LOGW(TAG, "STA disconnected, reason=%u, ssid=%.*s, bssid=" MACSTR
+                     ", local=%d planned=%d; local Mesh-Lite remains active",
+                     (unsigned)disc->reason, (int)print_len, (const char *)disc->ssid,
+                     MAC2STR(disc->bssid), local, system_restart_is_planned());
 
             /*
              * 父节点连接失败计数（仅子节点；根连路由器无父概念）。任何断开
              * 都计数（去掉 reason 过滤的依据见 MESH_PARENT_FAIL_RESTART_THRESHOLD
              * 注释）；稳定在线判定与消费方见 note_parent_connect_failure()。
              */
-            note_parent_connect_failure();
+            if (!local) note_parent_connect_failure();
         } else {
             ESP_LOGW(TAG, "STA uplink lost; local Mesh-Lite remains active");
-            /* 曾有 IP 又丢失同样计一次连接失败（秒级连踢场景的主要来源）。 */
-            note_parent_connect_failure();
+            /* LOST_IP 结束在线窗但不重复计数；真正的连接失败由 DISCONNECTED 计一次。
+             * 单独丢 IP 的恢复由无父 watchdog 处理。缺失事件负载不能猜测失败次数。 */
         }
     }
 }
@@ -607,6 +714,10 @@ static void scan_done_handler(void *arg, esp_event_base_t base,
              (unsigned)__atomic_load_n(&Network_Flag, __ATOMIC_ACQUIRE),
              dual_net_has_eth_ip() ? 1 : 0,
              IsRoot ? 1 : 0);
+    if (system_restart_is_planned()) {
+        scan_end_cb();
+        return;
+    }
     if (!s_scan_active) return;
     if (__atomic_load_n(&Network_Flag, __ATOMIC_ACQUIRE) || !IsRoot || dual_net_has_eth_ip()) {
         scan_end_cb();
@@ -618,7 +729,7 @@ static void scan_done_handler(void *arg, esp_event_base_t base,
         scan_end_cb();
         return;
     }
-    wifi_ap_record_t *records = calloc(count, sizeof(*records));
+    wifi_ap_record_t *records = app_calloc_prefer_psram(count, sizeof(*records));
     if (!records) {
         scan_end_cb();
         return;
@@ -701,10 +812,15 @@ static void mesh_failover_log_state(bool online, TickType_t now)
  *
  * 注意：esp_mesh_lite_erase_rtc_store() 官方注释为 "Must be called before node
  * factory reset"，此处为有意的偏离使用——语义上正是「切换路由器前丢弃旧路由器
- * 存储」，且仅在根节点故障转移重启路径调用。RTC 内存为直接写访问，无需等待。
+ * 存储」。子节点自愈使用相同清理，正常一键重启保留该记录。RTC 写入无需 NVS 提交。
  */
 static void mesh_failover_restart(const char *reason)
 {
+    if (!mesh_control_take()) return;
+    if (!system_restart_claim_recovery()) {
+        mesh_control_give();
+        return;
+    }
     ESP_LOGW(TAG, "Failover restart (%s): erase stored router, then restart", reason);
     esp_mesh_lite_erase_rtc_store();
     esp_restart();
@@ -717,6 +833,15 @@ static void root_failover_task(void *arg)
     TickType_t last_log_cooldown_tick = 0;
     for (;;) {
         TickType_t now = xTaskGetTickCount();
+        if (system_restart_is_planned()) {
+            s_scan_requested = false;
+            s_scan_active = false;
+            s_restart_for_failover = false;
+            if (!s_trial_active) s_trial_uplink_index = UINT32_MAX;
+            lost_since = 0;
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
         /* 诊断：循环态限频日志（翻转即报），供 H1-H5 假设树判读。 */
         mesh_failover_log_state(__atomic_load_n(&Network_Flag, __ATOMIC_ACQUIRE) != 0, now);
         /*
@@ -941,6 +1066,9 @@ esp_err_t mesh_init_Custom(void)
         return ESP_ERR_INVALID_ARG;
     }
 
+    if (s_mesh_control_mutex == NULL) s_mesh_control_mutex = xSemaphoreCreateMutexStatic(&s_mesh_control_mutex_buf);
+    if (s_mesh_control_mutex == NULL) return ESP_ERR_NO_MEM;
+
     if (esp_reset_reason() != ESP_RST_SW || s_failover_magic != FAILOVER_RTC_MAGIC) {
         s_failover_magic = FAILOVER_RTC_MAGIC;
         s_failover_attempts = 0;
@@ -1027,8 +1155,7 @@ esp_err_t mesh_init_Custom(void)
     /*
      * 父节点重连/重扫节奏（库默认 5s×2 次后每 10s 重扫），取值见文件头部
      * MESH_PARENT_RETRY 与 MESH_RESCAN_INTERVAL_SEC 系列宏及注释：
-     * 当前为 5s×2/15s 折中值，加快中间父断开后的重扫发现，
-     * 同时不回到库默认的激进节奏；持续无父场景由无父
+     * 当前为 10s×5/15s，保留父重启恢复窗口；持续无父场景由无父
      * watchdog（MESH_PARENT_LOST_SOFT_RESET_MS）兜底。
      */
     esp_mesh_lite_set_wifi_reconnect_interval(MESH_PARENT_RETRY_INTERVAL_SEC,
@@ -1100,7 +1227,7 @@ esp_err_t mesh_init_Custom(void)
     }
     bool mesh_health_started = true; /* 根节点无此任务，视为不适用 */
     if (!IsRoot) {
-        /* 根掉线期间子节点必须存活：只观测不动作的健康监视，见设计文档 7.2 节。 */
+        /* 子节点健康监视与有界自愈；一键重启期间抑制自愈动作。 */
         mesh_health_started = xTaskCreatePinnedToCore(mesh_health_task, "mesh_health", LG_STACK_MESH_HEALTH,
                                                       NULL, LG_PRIO_MESH_HEALTH,
                                                       NULL, LG_APP_CPU_CORE) == pdPASS;

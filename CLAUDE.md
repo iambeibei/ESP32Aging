@@ -56,7 +56,10 @@ cd /home/wbb/espidfProject/ESP32Aging
 
 ### 启动 / 任务布局
 
-`main.c` 调用 `app_task_init()`（[appTask.c:5421](main/Task/appTask.c#L5421)），这是唯一的初始化和建任务入口。
+`main.c` 首先调用 `app_memory_init()` 安装全局 cJSON PSRAM 分配器及无分配的失败计数回调，
+再调用 `app_task_init()`（[appTask.c:5421](main/Task/appTask.c#L5421)）编排业务初始化和建任务。
+不得在运行中重设 cJSON hooks，避免跨分配器释放。RAM 优化实施与实机验收见
+[`RAM_PSRAM_优化实施记录.md`](RAM_PSRAM_优化实施记录.md)。
 顺序有讲究：
 
 `nvs_flash_init` → `spiffs_init`（配置 FS）→ `SqLite_Init`（老化数据库）→ `log_storage_mount`
@@ -204,6 +207,10 @@ AgingDeviceCheck → AgingAction → AgingComplete`，由 `Aging_Test_Task`
 - 在假定某段代码会运行、或动手"修复"它之前，先查 `SRCS`。
 - 大块内存分配优先使用 `heap_caps` / `app_malloc_prefer_psram`（见 `Tool/app_mem.c`）；
   此 ESP32-S3 带 PSRAM。
+- MQTT、UART / RS485 的大数据队列使用 `Tool/app_queue`：控制块在内部 RAM、数据区在 PSRAM，
+  仅供任务使用；初始化回滚须用 `app_psram_queue_delete()` 释放自有数据区。
+  任务栈、驱动事件队列和 DMA 缓冲继续使用内部 RAM。TLS 动态分配使用 PSRAM，
+  Bluedroid 启用 PSRAM 优先分配；应同步维护默认配置及实际构建配置。
 
 <!-- embedded-coding-standard:init -->
 ## Embedded Coding Standard

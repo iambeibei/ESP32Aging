@@ -3,7 +3,7 @@
  * @brief Mesh-Lite BINARY 分发验证：旧固件运行期间逐层提供已校验的新镜像。
  *
  * mqtt_rx 只通知 cmd_task；根由 dl_task 下载一次，子由 BINARY LAN 回调写入。
- * done 回调完成镜像/版本校验及 set_boot，cmd_task 计算文件 SHA-256、登记文件名、
+ * done 回调完成镜像/版本校验，cmd_task 计算 SHA、提交 NVS、设置启动分区、登记文件名、
  * 恢复下级 OTA 后输出 OTA_BINARY_READY，并经本机 event/OTACP 上报完成。不自动重启。
  *
  * 库回调/事件任务与 cmd_task 共享接收会话和供数记录，均经 s_ota_mutex 保护；
@@ -26,9 +26,9 @@
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "mbedtls/sha256.h"
 
 #include "mesh_ota.h"
+#include "ota_cache.h"
 #include "ConfigData.h"
 #include "mqtt_app.h"
 #include "task_config.h"
@@ -47,7 +47,6 @@ static const char *TAG = "mesh_ota";
 #define LG_MESH_OTA_PROGRESS_LOG_STEP_PCT 10
 /* Mesh-Lite 文件长度按 64 KiB 对齐；真实长度单独保留。 */
 #define LG_MESH_OTA_FILE_ALIGNMENT_BYTES (64u * 1024u)
-#define LG_MESH_OTA_HASH_BUFFER_BYTES 2048
 #define LG_MESH_OTA_SERVICE_POLL_MS 1000
 #define LG_MESH_OTA_OTACP_RETRY_MS 5000
 #define LG_MESH_OTA_OTACP_TOPIC_BYTES 64
@@ -95,6 +94,11 @@ static uint8_t s_retry_count;
 static bool s_retry_waiting, s_finalization_pending, s_root_downloading;
 static bool s_root_timeout_logged, s_finish_wait_logged;
 static TickType_t s_retry_deadline, s_root_start_tick;
+static ota_cache_record_t s_candidate_record;
+static bool s_candidate_persisted, s_candidate_recovered;
+static bool s_recovery_pending, s_bootstrap_pending, s_request_deferred;
+static uint8_t s_bootstrap_attempts;
+static TickType_t s_bootstrap_retry_tick;
 
 /* 完成通知仅由 cmd_task 访问；入队失败保留同一事件，成功后交给 SDK QoS1 重传。 */
 static bool s_otacp_pending, s_otacp_payload_ready;
@@ -102,6 +106,8 @@ static time_t s_otacp_seq;
 static TickType_t s_otacp_retry_tick;
 static char s_otacp_topic[LG_MESH_OTA_OTACP_TOPIC_BYTES];
 static char s_otacp_payload[LG_MESH_OTA_OTACP_PAYLOAD_BYTES];
+static char s_report_device_id[OTA_CACHE_ID_CAPACITY];
+static char s_report_aging_number[OTA_CACHE_ID_CAPACITY];
 
 static void schedule_retry(void);
 
@@ -156,7 +162,7 @@ static void reset_receiver_locked(void)
     s_finish_received = false;
 }
 
-/* 库任务调用；仅提供本次完成校验且已登记的文件，不扫描 app 分区头猜测完整性。 */
+/* 库任务调用；仅提供本次校验或启动恢复校验后已登记的文件，不扫描分区头猜测完整性。 */
 static esp_err_t provide_file_cb(esp_mesh_lite_lan_ota_file_transfer_param_t *param)
 {
     if (param == NULL || param->data == NULL || !binary_name_valid(param->fw_version)) {
@@ -244,8 +250,8 @@ done:
     return err;
 }
 
-/* 库需要此返回值决定传输结果，故镜像校验/版本核验/set_boot 在回调中串行完成。
- * SHA-256、文件登记和恢复下级均延后至 cmd_task，绝不在这里重启。 */
+/* 库需要此返回值决定传输结果；此处只完成镜像/版本核验。
+ * SHA、NVS、set_boot 与登记均在 cmd_task，保证掉电前记录先于启动选择落盘。 */
 static esp_err_t get_file_done_cb(void)
 {
     if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) return ESP_FAIL;
@@ -263,8 +269,7 @@ static esp_err_t get_file_done_cb(void)
         err = ESP_ERR_INVALID_VERSION;
         goto done;
     }
-    err = esp_ota_set_boot_partition(s_update_partition);
-    if (err == ESP_OK) s_rx_validated = true;
+    s_rx_validated = true;
 done:
     if (s_session_open) {
         s_rx_done = true;
@@ -314,69 +319,56 @@ static esp_err_t mesh_ota_extern_disabled(void)
     return ESP_FAIL;
 }
 
-/* cmd_task 调用；就绪前无供数读者，可以在锁外分块读 flash，避免长时间占锁。
- * 每块让出 CPU1，SHA 对应原 BIN 的完整字节，排除 Mesh-Lite 的填充段。 */
-static esp_err_t hash_file(mesh_ready_file_t *file)
+/* 服务任务调用；源分区在整个候选收尾期间禁止再次擦写。 */
+static esp_err_t stage_record(const ota_cache_record_t *record, const esp_partition_t *partition,
+                              bool persisted, bool recovered)
 {
-    unsigned char digest[32];
-    unsigned char buffer[LG_MESH_OTA_HASH_BUFFER_BYTES];
-    static const char hex[] = "0123456789abcdef";
-    mbedtls_sha256_context ctx;
-    mbedtls_sha256_init(&ctx);
-    esp_err_t err = ESP_FAIL;
-    if (mbedtls_sha256_starts(&ctx, 0) != 0) goto done;
-    for (size_t offset = 0; offset < file->size_bytes;) {
-        size_t count = file->size_bytes - offset;
-        if (count > sizeof(buffer)) count = sizeof(buffer);
-        err = esp_partition_read(file->partition, offset, buffer, count);
-        if (err != ESP_OK) goto done;
-        if (mbedtls_sha256_update(&ctx, buffer, count) != 0) {
-            err = ESP_FAIL;
-            goto done;
-        }
-        offset += count;
-        vTaskDelay(1);
-    }
-    err = ESP_FAIL;
-    if (mbedtls_sha256_finish(&ctx, digest) != 0) goto done;
-    for (size_t i = 0; i < sizeof(digest); ++i) {
-        file->sha256_hex[2 * i] = hex[digest[i] >> 4];
-        file->sha256_hex[2 * i + 1] = hex[digest[i] & 0x0F];
-    }
-    file->sha256_hex[64] = '\0';
-    err = ESP_OK;
-done:
-    mbedtls_sha256_free(&ctx);
-    return err;
+    if (record == NULL || partition == NULL || !binary_name_valid(record->file_name) ||
+        aligned_file_size(record->image_size_bytes) == 0 ||
+        aligned_file_size(record->image_size_bytes) > partition->size) return ESP_ERR_INVALID_SIZE;
+    if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) return ESP_FAIL;
+    s_ready_file = (mesh_ready_file_t){.size_bytes = record->image_size_bytes, .partition = partition};
+    strlcpy(s_ready_file.file_name, record->file_name, sizeof(s_ready_file.file_name));
+    strlcpy(s_ready_file.version, record->version, sizeof(s_ready_file.version));
+    strlcpy(s_ready_file.sha256_hex, record->sha256_hex, sizeof(s_ready_file.sha256_hex));
+    ota_unlock();
+    s_candidate_record = *record;
+    s_candidate_persisted = persisted;
+    s_candidate_recovered = recovered;
+    s_finalization_pending = true;
+    /* 收尾尚未完成，启动恢复时也先进入 RUNNING，再依据当前运行版本确定状态。 */
+    simple_ota_set_state(SIMPLE_OTA_STATE_RUNNING);
+    return ESP_OK;
 }
 
-/* cmd_task 调用，只接受来自本次本地校验成功路径的分区，不扫描分区头。 */
 static esp_err_t stage_candidate(const simple_ota_metadata_t *metadata, size_t size_bytes,
                                   const esp_partition_t *partition)
 {
-    if (metadata == NULL || !binary_name_valid(metadata->file) || partition == NULL ||
-        aligned_file_size(size_bytes) == 0 || aligned_file_size(size_bytes) > partition->size) {
-        return ESP_ERR_INVALID_SIZE;
+    ota_cache_record_t record;
+    esp_err_t err = ota_cache_record_init(&record, partition, metadata, size_bytes);
+    if (err != ESP_OK) return err;
+    if (DEVICE_ID == NULL || DEVICE_ID[0] == '\0' || AgingNumber == NULL || AgingNumber[0] == '\0' ||
+        strlen(DEVICE_ID) >= sizeof(record.device_id) || strlen(AgingNumber) >= sizeof(record.aging_number)) {
+        ESP_LOGE(TAG, "Cannot snapshot OTA completion identity");
+        return ESP_ERR_INVALID_ARG;
     }
-    if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) return ESP_FAIL;
-    s_ready_file = (mesh_ready_file_t){.size_bytes = size_bytes, .partition = partition};
-    strlcpy(s_ready_file.file_name, metadata->file, sizeof(s_ready_file.file_name));
-    strlcpy(s_ready_file.version, metadata->version, sizeof(s_ready_file.version));
-    ota_unlock();
-    s_finalization_pending = true;
-    simple_ota_set_state(SIMPLE_OTA_STATE_PENDING_RESTART);
-    return ESP_OK;
+    record.origin = OTA_CACHE_ORIGIN_DOWNLOAD;
+    record.completed_seq = (int64_t)time(NULL);
+    strlcpy(record.device_id, DEVICE_ID, sizeof(record.device_id));
+    strlcpy(record.aging_number, AgingNumber, sizeof(record.aging_number));
+    s_bootstrap_pending = false;
+    return stage_record(&record, partition, false, false);
 }
 
 /* cJSON 临时节点全部在本函数释放；最终负载静态保存，不跨任务传递堆指针。
  * 使用 JSON 转义保留 AgingNumber 的字符串类型，重试复用同一 Seq/负载。 */
 static bool prepare_otacp_payload(void)
 {
-    if (DEVICE_ID == NULL || DEVICE_ID[0] == '\0' || AgingNumber == NULL) {
+    if (s_report_device_id[0] == '\0' || s_report_aging_number[0] == '\0') {
         ESP_LOGE(TAG, "OTACP requires configured DEVICE_ID and AgingNumber");
         return false;
     }
-    int len = snprintf(s_otacp_topic, sizeof(s_otacp_topic), "device/%s/event/OTACP", DEVICE_ID);
+    int len = snprintf(s_otacp_topic, sizeof(s_otacp_topic), "device/%s/event/OTACP", s_report_device_id);
     if (len < 0 || (size_t)len >= sizeof(s_otacp_topic)) {
         ESP_LOGE(TAG, "OTACP topic exceeds buffer; refusing truncation");
         return false;
@@ -386,13 +378,13 @@ static bool prepare_otacp_payload(void)
     bool ok = cJSON_AddNumberToObject(root, "Seq", (double)s_otacp_seq) != NULL;
     cJSON *data = ok ? cJSON_AddObjectToObject(root, "Data") : NULL;
     ok = data != NULL && cJSON_AddNumberToObject(data, "IsComplete", 1) != NULL &&
-              cJSON_AddStringToObject(data, "AgingNumber", AgingNumber) != NULL &&
+              cJSON_AddStringToObject(data, "AgingNumber", s_report_aging_number) != NULL &&
               cJSON_PrintPreallocated(root, s_otacp_payload, sizeof(s_otacp_payload), false);
     cJSON_Delete(root);
     return ok;
 }
 
-/* 服务任务每秒轮询；仅实际下载并完成就绪登记才置 pending，失败/跳过无通知。 */
+/* 服务任务每秒轮询；实际下载就绪或恢复原下载记录后才置 pending，首次绑定无通知。 */
 static void poll_otacp_report(void)
 {
     if (!s_otacp_pending || (int32_t)(xTaskGetTickCount() - s_otacp_retry_tick) < 0) return;
@@ -425,12 +417,36 @@ static esp_err_t finalize_candidate(void)
     if (!s_finalization_pending || file.partition == NULL) return ESP_ERR_INVALID_STATE;
     esp_err_t err;
     if (file.sha256_hex[0] == '\0') {
-        err = hash_file(&file);
+        err = ota_cache_hash_file(file.partition, file.size_bytes, file.sha256_hex);
         if (err != ESP_OK) return err;
         if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) return ESP_FAIL;
         s_ready_file = file; /* 登记/恢复失败时复用 SHA，仍保持 valid=false。 */
         ota_unlock();
     }
+    char running_version[SIMPLE_OTA_VERSION_MAX_LEN];
+    err = simple_ota_get_running_version(running_version, sizeof(running_version));
+    if (err != ESP_OK) return err;
+    int comparison;
+    err = simple_ota_compare_versions(file.version, running_version, &comparison);
+    if (err != ESP_OK || comparison < 0) return ESP_ERR_INVALID_VERSION;
+    if (!s_candidate_persisted) {
+        strlcpy(s_candidate_record.sha256_hex, file.sha256_hex, sizeof(s_candidate_record.sha256_hex));
+        err = ota_cache_store(&s_candidate_record);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "OTA cache commit failed; boot selection withheld: %s", esp_err_to_name(err));
+            return err;
+        }
+        s_candidate_persisted = true;
+    }
+    bool pending_restart = s_candidate_record.origin == OTA_CACHE_ORIGIN_DOWNLOAD && comparison > 0;
+    if (pending_restart) {
+        const esp_partition_t *boot = esp_ota_get_boot_partition();
+        if (boot == NULL || boot->address != file.partition->address) {
+            err = esp_ota_set_boot_partition(file.partition);
+            if (err != ESP_OK) return err;
+        }
+    }
+    simple_ota_set_state(pending_restart ? SIMPLE_OTA_STATE_PENDING_RESTART : SIMPLE_OTA_STATE_IDLE);
     memset(s_registered_file_name, 0, sizeof(s_registered_file_name));
     memcpy(s_registered_file_name, file.file_name, strlen(file.file_name));
     err = esp_mesh_lite_lan_ota_set_file_name(s_registered_file_name);
@@ -444,16 +460,22 @@ static esp_err_t finalize_candidate(void)
     ota_unlock();
     s_finalization_pending = false;
     s_retry_waiting = false;
-    char running_version[SIMPLE_OTA_VERSION_MAX_LEN];
-    err = simple_ota_get_running_version(running_version, sizeof(running_version));
-    if (err != ESP_OK) strlcpy(running_version, "unknown", sizeof(running_version));
     ESP_LOGI(TAG, "OTA_BINARY_READY level=%u running=%s target=%s file=%s partition=%s bytes=%u sha256=%s",
              (unsigned)esp_mesh_lite_get_level(), running_version, file.version, file.file_name,
              file.partition->label, (unsigned)file.size_bytes, file.sha256_hex);
-    s_otacp_seq = time(NULL);
-    s_otacp_pending = true;
-    s_otacp_payload_ready = false;
-    s_otacp_retry_tick = xTaskGetTickCount();
+    if (s_candidate_recovered) {
+        ESP_LOGI(TAG, "OTA_CACHE_RESTORED source=%s file=%s",
+                 file.partition->address == esp_ota_get_running_partition()->address ? "running" : "staged",
+                 file.file_name);
+    }
+    if (s_candidate_record.origin == OTA_CACHE_ORIGIN_DOWNLOAD) {
+        s_otacp_seq = (time_t)s_candidate_record.completed_seq;
+        strlcpy(s_report_device_id, s_candidate_record.device_id, sizeof(s_report_device_id));
+        strlcpy(s_report_aging_number, s_candidate_record.aging_number, sizeof(s_report_aging_number));
+        s_otacp_pending = true;
+        s_otacp_payload_ready = false;
+        s_otacp_retry_tick = xTaskGetTickCount();
+    }
     return ESP_OK;
 }
 
@@ -478,6 +500,85 @@ static void finish_candidate(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "BINARY finalization failed: %s; no READY", esp_err_to_name(err));
         schedule_retry();
+    }
+}
+
+/* 启动/版本跳过时优先使用本地记录，无网络依赖。校验前不登记、不供数、不补报。 */
+static esp_err_t restore_cached_supply(void)
+{
+    ota_cache_record_t record;
+    esp_err_t err = ota_cache_load(&record);
+    if (err == ESP_ERR_NOT_FOUND) return err;
+    if (err != ESP_OK && err != ESP_ERR_INVALID_RESPONSE) return err;
+    const esp_partition_t *partition = NULL;
+    if (err == ESP_OK) {
+        err = ota_cache_verify(&record, &partition);
+        if (err == ESP_OK) {
+            char running[SIMPLE_OTA_VERSION_MAX_LEN];
+            int comparison;
+            err = simple_ota_get_running_version(running, sizeof(running));
+            if (err == ESP_OK) err = simple_ota_compare_versions(record.version, running, &comparison);
+            const esp_partition_t *current = esp_ota_get_running_partition();
+            if (err == ESP_OK && (comparison < 0 || current == NULL ||
+                (record.origin == OTA_CACHE_ORIGIN_BOOTSTRAP && partition->address != current->address))) {
+                err = ESP_ERR_INVALID_VERSION;
+            }
+        }
+    }
+    if (err == ESP_OK) {
+        err = stage_record(&record, partition, true, true);
+        if (err == ESP_OK) finish_candidate();
+        return err;
+    }
+    ESP_LOGW(TAG, "OTA cache cannot be restored: %s; supply withheld", esp_err_to_name(err));
+    /* 读 flash 等暂态错误保留原记录，下一条命令可重试；不擅自覆盖未知有效缓存。 */
+    if (err == ESP_FAIL || err == ESP_ERR_NO_MEM) return err;
+    err = ota_cache_invalidate();
+    return err == ESP_OK ? ESP_ERR_NOT_FOUND : err;
+}
+
+/* 首次直烧无记录时：只获取元数据/响应头，核实当前镜像真实长度，不下载 BIN 正文。 */
+static esp_err_t bootstrap_running_supply(void)
+{
+    simple_ota_metadata_t metadata;
+    esp_err_t err = simple_ota_fetch_metadata(&metadata);
+    if (err != ESP_OK) return err;
+    char running[SIMPLE_OTA_VERSION_MAX_LEN];
+    err = simple_ota_get_running_version(running, sizeof(running));
+    if (err != ESP_OK) return err;
+    if (!binary_name_valid(metadata.file) || strcmp(metadata.version, running) != 0) {
+        ESP_LOGI(TAG, "OTA cache bootstrap skipped: server version/file does not identify running image");
+        return ESP_ERR_INVALID_VERSION;
+    }
+    size_t server_bytes;
+    err = simple_ota_probe_firmware_size(metadata.file, &server_bytes);
+    if (err != ESP_OK) return err;
+    const esp_partition_t *partition = esp_ota_get_running_partition();
+    uint32_t image_bytes;
+    err = ota_cache_image_size(partition, metadata.version, &image_bytes);
+    if (err != ESP_OK) return err;
+    if (server_bytes != image_bytes) {
+        ESP_LOGE(TAG, "OTA cache bootstrap size mismatch: server=%u image=%u", (unsigned)server_bytes, (unsigned)image_bytes);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    ota_cache_record_t record;
+    err = ota_cache_record_init(&record, partition, &metadata, server_bytes);
+    if (err == ESP_OK) err = ota_cache_hash_file(partition, server_bytes, record.sha256_hex);
+    if (err == ESP_OK) err = stage_record(&record, partition, false, true);
+    if (err == ESP_OK) finish_candidate();
+    return err;
+}
+
+static void request_supply_recovery(void)
+{
+    s_bootstrap_pending = false;
+    esp_err_t err = restore_cached_supply();
+    if (err == ESP_ERR_NOT_FOUND) {
+        s_bootstrap_pending = true;
+        s_bootstrap_attempts = 0;
+        s_bootstrap_retry_tick = xTaskGetTickCount();
+    } else if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA supply recovery unavailable: %s", esp_err_to_name(err));
     }
 }
 
@@ -529,7 +630,8 @@ static void process_root_finish(void)
         if (err == ESP_ERR_NOT_FOUND && simple_ota_get_state() == SIMPLE_OTA_STATE_IDLE) {
             esp_err_t resume_err = esp_mesh_lite_ota_notify_child_node_restart();
             if (resume_err != ESP_OK) ESP_LOGW(TAG, "Root skip OTA: resume failed: %s", esp_err_to_name(resume_err));
-            ESP_LOGI(TAG, "Root has no newer firmware; no BINARY file registered, no READY");
+            ESP_LOGI(TAG, "Root has no newer firmware; checking existing supply cache");
+            request_supply_recovery();
             return;
         }
     }
@@ -568,7 +670,8 @@ static void handle_child_path(void)
         }
         if (!simple_ota_version_is_newer(s_metadata.version)) {
             simple_ota_set_state(SIMPLE_OTA_STATE_IDLE);
-            ESP_LOGI(TAG, "Child has no newer firmware; no READY");
+            ESP_LOGI(TAG, "Child has no newer firmware; checking existing supply cache");
+            request_supply_recovery();
             return;
         }
         err = simple_ota_probe_firmware_size(s_metadata.file, &s_firmware_size_bytes);
@@ -586,6 +689,13 @@ static void handle_child_path(void)
         goto failed;
     }
     reset_receiver_locked();
+    /* 同一互斥保护在途供数与擦写准入；持久记录失效失败时不启动库传输。 */
+    s_ready_file.valid = false;
+    err = ota_cache_before_write(esp_ota_get_next_update_partition(NULL));
+    if (err != ESP_OK) {
+        ota_unlock();
+        goto failed;
+    }
     s_session_open = true;
     s_rx_accepting = true;
     s_finish_wait_logged = false;
@@ -625,6 +735,10 @@ static void start_attempt(void)
 /* 单轮服务处理，所有重试调度均不阻塞，保证迟到完成事件能及时收尾。 */
 static void mesh_ota_service_poll(EventBits_t bits)
 {
+    if (s_recovery_pending) {
+        s_recovery_pending = false;
+        request_supply_recovery();
+    }
     if (bits & CMD_EVT_DOWNLOAD_DONE) process_root_finish();
     process_child_finish();
     if (s_root_downloading && !s_root_timeout_logged &&
@@ -634,13 +748,18 @@ static void mesh_ota_service_poll(EventBits_t bits)
     }
     if (bits & CMD_EVT_REQUEST) {
         simple_ota_state_t state = simple_ota_get_state();
-        if (s_root_downloading || state == SIMPLE_OTA_STATE_RUNNING || s_retry_waiting) {
-            ESP_LOGW(TAG, "BINARY command ignored: current attempt/retry still active");
-        } else if (state == SIMPLE_OTA_STATE_PENDING_RESTART) {
-            if (s_finalization_pending) {
+        if (s_otacp_pending) {
+            /* 单条通知持久记录不能被下一次下载覆盖；保留一个合并请求到入队成功。 */
+            s_request_deferred = true;
+        } else if (s_finalization_pending) {
+            if (!s_retry_waiting) {
                 s_retry_count = 0;
                 finish_candidate();
-            } else ESP_LOGI(TAG, "BINARY already staged; duplicate command will not erase firmware");
+            } else s_request_deferred = true;
+        } else if (s_root_downloading || state == SIMPLE_OTA_STATE_RUNNING || s_retry_waiting) {
+            ESP_LOGW(TAG, "BINARY command ignored: current attempt/retry still active");
+        } else if (state == SIMPLE_OTA_STATE_PENDING_RESTART) {
+            ESP_LOGI(TAG, "BINARY already staged; duplicate command will not erase firmware");
         } else {
             s_retry_count = 0;
             s_metadata_valid = false;
@@ -652,12 +771,29 @@ static void mesh_ota_service_poll(EventBits_t bits)
         if (s_finalization_pending) finish_candidate();
         else if (!s_root_downloading) start_attempt();
     }
+    if (s_bootstrap_pending && !s_otacp_pending && !s_root_downloading && !s_finalization_pending && !s_retry_waiting &&
+        simple_ota_get_state() == SIMPLE_OTA_STATE_IDLE && app_mqtt_is_connected() &&
+        (int32_t)(xTaskGetTickCount() - s_bootstrap_retry_tick) >= 0) {
+        esp_err_t err = bootstrap_running_supply();
+        ++s_bootstrap_attempts;
+        if (err == ESP_OK || err == ESP_ERR_INVALID_VERSION || s_bootstrap_attempts > LG_MESH_OTA_RETRY_MAX) {
+            s_bootstrap_pending = false;
+        } else {
+            s_bootstrap_retry_tick = xTaskGetTickCount() + pdMS_TO_TICKS(LG_MESH_OTA_RETRY_INTERVAL_MS);
+        }
+        if (err != ESP_OK) ESP_LOGW(TAG, "OTA cache bootstrap unavailable: %s", esp_err_to_name(err));
+    }
     poll_otacp_report();
+    if (s_request_deferred && !s_otacp_pending && !s_finalization_pending && !s_root_downloading && !s_retry_waiting) {
+        s_request_deferred = false;
+        xEventGroupSetBits(s_cmd_events, CMD_EVT_REQUEST);
+    }
 }
 
 static void mesh_ota_cmd_task(void *arg)
 {
     (void)arg;
+    mesh_ota_service_poll(0); /* 先本地恢复，再消费后续 OTA 命令。 */
     for (;;) {
         EventBits_t bits = xEventGroupWaitBits(s_cmd_events,
             CMD_EVT_REQUEST | CMD_EVT_FINISH | CMD_EVT_DOWNLOAD_DONE,
@@ -699,6 +835,7 @@ esp_err_t mesh_ota_init(void)
     esp_err_t err = esp_event_handler_register(ESP_MESH_LITE_EVENT, ESP_EVENT_ANY_ID,
                                                mesh_ota_event_handler, NULL);
     if (err != ESP_OK) return err;
+    s_recovery_pending = true;
     /* 沿用既有任务，固定 CPU1 与 task_config.h 中的栈/优先级。 */
     if (xTaskCreatePinnedToCore(mesh_ota_cmd_task, "mesh_ota_cmd", LG_STACK_MESH_OTA,
             NULL, LG_PRIO_MESH_OTA, NULL, LG_APP_CPU_CORE) != pdPASS) return ESP_ERR_NO_MEM;

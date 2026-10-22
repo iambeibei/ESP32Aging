@@ -1,6 +1,10 @@
 # 根节点掉线时子节点异常重启：排查与处理设计
 
 本文对应当前代码（ESP-IDF v5.4.4 / esp-mesh-lite 1.0.2 / iot_bridge 1.0.1）。
+2026-10-22 更新：本文件包含早期排查记录；重启/失败计数的现行行为以
+[NETWORK_RESTART_DESIGN.md](NETWORK_RESTART_DESIGN.md) 为准。当前重连参数为 10s×5/15s，
+子节点自愈重启前显式清除 Mesh RTC，不再假定普通 esp_restart 就能绕开旧父缓存；
+CanRestart 采用 30s 传播窗口后暂停连接、根先深层后重启，并抑制自愈竞争。
 目标：明确根/子节点依赖关系与保活、故障转移、重启恢复流程，定位并消除
 「根节点挂掉 → 子节点异常重启」的根因，使子节点在根掉线期间保持存活并继续老化。
 
@@ -257,8 +261,8 @@ true 仅代表 `enh_open` 被受理，状态机却立即认定已连接并空等
 
 | 级别 | 触发 | 动作 | 说明 |
 |---|---|---|---|
-| L1 软复位 | 连续无父 3min（`MESH_PARENT_LOST_SOFT_RESET_MS`） | `esp_mesh_lite_disconnect()` + 100ms + `esp_mesh_lite_connect()` | 强制库走「扫描匹配节点并连接」的 fresh 路径，绕开可能卡住的内部重试状态与 RTC 原父偏好；不重启、不动老化任务、不丢数据；每次软复位后重置计时，给 3 分钟观察窗；上限 `MESH_SOFT_RESET_MAX=3` 次 |
-| L2 重启 | 软复位 3 次仍无父 | `esp_restart()` | 重启前 100ms 等日志落盘；受每上电周期预算约束 |
+| L1 软复位 | 连续无父 3min（`MESH_PARENT_LOST_SOFT_RESET_MS`） | `esp_mesh_lite_disconnect()` + 100ms + `esp_mesh_lite_connect()` | 请求重新扫描连接，不承诺清除 RTC 原父偏好；不重启；每次给 3 分钟观察窗，上限 3 次 |
+| L2 重启 | 软复位 3 次仍无父 | 清 Mesh RTC 后 `esp_restart()` | 重启前核对网络恢复/计划重启及预算；连续失败快通道使用相同入口与预算 |
 | L3 放弃 | 重启预算耗尽 | 只限频（60s）打 WRN，继续扫描 | 回到「无限期存活于无上行状态」 |
 
 重启预算：`RTC_NOINIT_ATTR` 计数（`s_heal_restart_count`，镜像 7.3 failover

@@ -2025,12 +2025,14 @@ int QueryJsonRecordBySeq(int seq_no, QueryResult *out_result)
 
 void query_db1_latest_by_pn_to_global(const char *pn)
 {
+    if (g_db1_result == NULL) return; /* 初始化内存不足时不解引用未建立的结果缓存。 */
     memset(g_db1_result, 0, sizeof(QueryResult));
     (void)QueryStructuredRecordLatestByPN(pn, g_db1_result);
 }
 
 void query_db1_to_global(int target_id)
 {
+    if (g_db1_result == NULL) return;
     memset(g_db1_result, 0, sizeof(QueryResult));
     (void)QueryStructuredRecordBySeq(target_id, g_db1_result);
 }
@@ -2429,7 +2431,11 @@ void SqLite_Init(void)
         return;
     }
 
-    g_db1_result=(QueryResult *)app_malloc_prefer_psram(sizeof(QueryResult));
+    if (g_db1_result == NULL) g_db1_result = app_calloc_prefer_psram(1, sizeof(QueryResult));
+    if (g_db1_result == NULL) {
+        ESP_LOGE(TAG, "No memory for database result cache; SQLite init stopped without resetting storage");
+        return;
+    }
     snprintf(db1_name, sizeof(db1_name), "%s", DB_FILE_PATH);
     memset(g_db1_result, 0, sizeof(QueryResult));
 

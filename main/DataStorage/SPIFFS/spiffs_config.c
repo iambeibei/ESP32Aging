@@ -1,4 +1,5 @@
 #include "spiffs_config.h"
+#include "app_mem.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -258,7 +259,7 @@ char *read_json_from_spiffs(const char *filename)
 
     rewind(f);
 
-    char *buffer = malloc((size_t)file_len + 1);
+    char *buffer = app_malloc_prefer_psram((size_t)file_len + 1);
     if (buffer == NULL) {
         fclose(f);
         ESP_LOGE(TAG, "Failed to allocate JSON buffer, len=%ld", file_len);

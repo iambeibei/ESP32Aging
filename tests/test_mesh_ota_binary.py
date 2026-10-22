@@ -108,43 +108,119 @@ static int xTaskCreatePinnedToCore(void (*fn)(void *),const char *name,int stack
 #define LG_STACK_MESH_OTA_DL 8192
 #define LG_PRIO_MESH_OTA_DL 4
 
+
+#define ESP_ERR_NVS_NOT_FOUND 100
+#define ESP_ERR_NVS_NOT_ENOUGH_SPACE 101
+#define NVS_READONLY 0
+#define NVS_READWRITE 1
+typedef unsigned nvs_handle_t;
+static unsigned char nvs_blob[1024], nvs_staged[1024];
+static size_t nvs_blob_size,nvs_staged_size;
+static bool nvs_exists,nvs_deleting,fail_nvs_open,fail_nvs_set,fail_nvs_commit,fail_nvs_erase;
+static unsigned nvs_writes,nvs_commits,nvs_erases;
+static esp_err_t nvs_open(const char *name,int mode,nvs_handle_t *h) {
+    assert(!strcmp(name,"ota_cache"));
+    if(fail_nvs_open)return ESP_FAIL;
+    if(mode==NVS_READONLY && !nvs_exists)return ESP_ERR_NVS_NOT_FOUND;
+    *h=1;nvs_staged_size=0;nvs_deleting=false;return ESP_OK;
+}
+static esp_err_t nvs_get_blob(nvs_handle_t h,const char *key,void *data,size_t *bytes) {
+    assert(h==1 && !strcmp(key,"image_v1"));
+    if(!nvs_exists)return ESP_ERR_NVS_NOT_FOUND;
+    if(data){assert(*bytes>=nvs_blob_size);memcpy(data,nvs_blob,nvs_blob_size);}*bytes=nvs_blob_size;return ESP_OK;
+}
+static esp_err_t nvs_set_blob(nvs_handle_t h,const char *key,const void *data,size_t bytes) {
+    assert(h==1 && !strcmp(key,"image_v1") && bytes<=sizeof(nvs_staged));nvs_writes++;
+    if(fail_nvs_set)return ESP_ERR_NVS_NOT_ENOUGH_SPACE;
+    memcpy(nvs_staged,data,bytes);nvs_staged_size=bytes;return ESP_OK;
+}
+static esp_err_t nvs_erase_key(nvs_handle_t h,const char *key) {
+    assert(h==1 && !strcmp(key,"image_v1"));nvs_erases++;
+    if(fail_nvs_erase)return ESP_FAIL;
+    if(!nvs_exists)return ESP_ERR_NVS_NOT_FOUND;
+    nvs_deleting=true;return ESP_OK;
+}
+static esp_err_t nvs_commit(nvs_handle_t h) {
+    assert(h==1);nvs_commits++;if(fail_nvs_commit)return ESP_FAIL;
+    if(nvs_deleting){nvs_exists=false;nvs_blob_size=0;}
+    else if(nvs_staged_size){memcpy(nvs_blob,nvs_staged,nvs_staged_size);nvs_blob_size=nvs_staged_size;nvs_exists=true;}
+    return ESP_OK;
+}
+static void nvs_close(nvs_handle_t h) {(void)h;nvs_staged_size=0;nvs_deleting=false;}
+static uint32_t esp_rom_crc32_le(uint32_t crc,const uint8_t *data,uint32_t bytes) {
+    crc=~crc;for(uint32_t i=0;i<bytes;i++){crc^=data[i];for(unsigned bit=0;bit<8;bit++)crc=(crc>>1)^(0xEDB88320u&-(crc&1u));}return ~crc;
+}
+
+#define ESP_PARTITION_TYPE_APP 0
+#define ESP_PARTITION_SUBTYPE_APP_OTA_0 16
+#define ESP_PARTITION_SUBTYPE_APP_OTA_1 17
 typedef struct {unsigned size,address;int type,subtype;char label[16];} esp_partition_t;
 typedef struct {char version[32];} esp_app_desc_t;
-static esp_partition_t running_part={.size=131072,.label="ota_0"};
-static esp_partition_t update_part={.size=131072,.label="ota_1"};
-static unsigned char flash_bytes[131072],fixture[4103];
+static esp_partition_t running_part={.size=131072,.address=0x10000,.subtype=16,.label="ota_0"};
+static esp_partition_t update_part={.size=131072,.address=0x30000,.subtype=17,.label="ota_1"};
+static const esp_partition_t *current_part=&running_part,*boot_part=&running_part,*writing_part;
+static unsigned char flash_bytes[131072],running_flash_bytes[131072],fixture[4103];
 static size_t fixture_size=sizeof(fixture), write_cursor;
-static char image_version[32]="1.1.0";
+static char image_version[32]="1.1.0",running_image_version[32]="1.0.0";
 static unsigned begin_count,end_count,abort_count,boot_count;
-static bool handle_live,fail_end,fail_read,fail_boot;
+static bool handle_live,fail_end,fail_read,fail_boot,fail_image_verify;
+static uint32_t override_image_size;
+static pthread_mutex_t read_gate=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t read_condition=PTHREAD_COND_INITIALIZER;
+static bool block_read,read_entered,release_read,start_entered,start_finished;
 typedef unsigned esp_ota_handle_t;
 #define OTA_SIZE_UNKNOWN ((size_t)-1)
-static const esp_partition_t *esp_ota_get_running_partition(void) {return &running_part;}
-static const esp_partition_t *esp_ota_get_next_update_partition(const esp_partition_t *p) {(void)p;return &update_part;}
-static esp_err_t esp_ota_get_partition_description(const esp_partition_t *p,esp_app_desc_t *d) {
-    memset(d,0,sizeof(*d));strlcpy(d->version,p==&running_part?"1.0.0":image_version,sizeof(d->version));return ESP_OK;
+static const esp_partition_t *esp_ota_get_running_partition(void) {return current_part;}
+static const esp_partition_t *esp_ota_get_boot_partition(void) {return boot_part;}
+static const esp_partition_t *esp_ota_get_next_update_partition(const esp_partition_t *p) {
+    (void)p;return current_part==&running_part?&update_part:&running_part;
 }
+static const esp_partition_t *esp_partition_find_first(int type,int subtype,const char *label) {
+    const esp_partition_t *parts[]={&running_part,&update_part};
+    for(unsigned i=0;i<2;i++)if(type==0 && parts[i]->subtype==subtype && !strcmp(parts[i]->label,label))return parts[i];
+    return NULL;
+}
+static esp_err_t esp_ota_get_partition_description(const esp_partition_t *p,esp_app_desc_t *d) {
+    memset(d,0,sizeof(*d));strlcpy(d->version,p==&running_part?running_image_version:image_version,sizeof(d->version));return ESP_OK;
+}
+static unsigned char *part_bytes(const esp_partition_t *p) {assert(p==&running_part || p==&update_part);return p==&update_part?flash_bytes:running_flash_bytes;}
 static esp_err_t esp_ota_begin(const esp_partition_t *p,size_t size,esp_ota_handle_t *h) {
-    (void)size;assert(p==&update_part && !handle_live);memset(flash_bytes,0xFF,sizeof(flash_bytes));
-    begin_count++;handle_live=true;write_cursor=0;*h=1;return ESP_OK;
+    (void)size;assert(p!=current_part && !handle_live);memset(part_bytes(p),0xFF,131072);
+    begin_count++;handle_live=true;write_cursor=0;writing_part=p;*h=1;return ESP_OK;
 }
 static esp_err_t esp_ota_write(esp_ota_handle_t h,const void *data,size_t bytes) {
-    assert(h==1 && handle_live && bytes<=sizeof(flash_bytes)-write_cursor);
-    memcpy(flash_bytes+write_cursor,data,bytes);write_cursor+=bytes;return ESP_OK;
+    assert(h==1 && handle_live && bytes<=131072-write_cursor);
+    memcpy(part_bytes(writing_part)+write_cursor,data,bytes);write_cursor+=bytes;return ESP_OK;
 }
 static esp_err_t esp_ota_write_with_offset(esp_ota_handle_t h,const void *data,size_t bytes,uint32_t offset) {
-    assert(h==1 && handle_live && offset<=sizeof(flash_bytes) && bytes<=sizeof(flash_bytes)-offset);
-    memcpy(flash_bytes+offset,data,bytes);return ESP_OK;
+    assert(h==1 && handle_live && offset<=131072 && bytes<=131072-offset);
+    memcpy(part_bytes(writing_part)+offset,data,bytes);return ESP_OK;
 }
 static esp_err_t esp_ota_end(esp_ota_handle_t h) {
     assert(h==1 && handle_live);handle_live=false;end_count++;return fail_end?ESP_ERR_OTA_VALIDATE_FAILED:ESP_OK;
 }
 static esp_err_t esp_ota_abort(esp_ota_handle_t h) {assert(h==1 && handle_live);handle_live=false;abort_count++;return ESP_OK;}
-static esp_err_t esp_ota_set_boot_partition(const esp_partition_t *p) {assert(p==&update_part);boot_count++;return fail_boot?ESP_FAIL:ESP_OK;}
+static esp_err_t esp_ota_set_boot_partition(const esp_partition_t *p) {
+    assert(nvs_exists && nvs_blob_size>0);boot_count++;
+    if(fail_boot)return ESP_FAIL;
+    boot_part=p;return ESP_OK;
+}
 static esp_err_t esp_partition_read(const esp_partition_t *p,size_t offset,void *data,size_t bytes) {
-    assert(p==&update_part && offset<=sizeof(flash_bytes) && bytes<=sizeof(flash_bytes)-offset);
-    if(fail_read)return ESP_FAIL;
-    memcpy(data,flash_bytes+offset,bytes);return ESP_OK;
+    assert(offset<=131072 && bytes<=131072-offset);if(fail_read)return ESP_FAIL;
+    if(block_read){
+        pthread_mutex_lock(&read_gate);read_entered=true;pthread_cond_broadcast(&read_condition);
+        while(!release_read)pthread_cond_wait(&read_condition,&read_gate);
+        pthread_mutex_unlock(&read_gate);
+    }
+    memcpy(data,part_bytes(p)+offset,bytes);return ESP_OK;
+}
+typedef struct {uint32_t offset,size;} esp_partition_pos_t;
+typedef struct {uint32_t image_len;} esp_image_metadata_t;
+#define ESP_IMAGE_VERIFY 0
+static esp_err_t esp_image_verify(int mode,const esp_partition_pos_t *pos,esp_image_metadata_t *image) {
+    assert(mode==ESP_IMAGE_VERIFY && pos->size==131072);
+    if(fail_image_verify)return ESP_ERR_OTA_VALIDATE_FAILED;
+    image->image_len=override_image_size?override_image_size:fixture_size;return ESP_OK;
 }
 static unsigned restart_count;
 static void esp_restart(void) {restart_count++;abort();}
@@ -238,6 +314,14 @@ static void reset_case(bool root) {
     reset_receiver_locked();s_ready_file=(mesh_ready_file_t){0};s_finalization_pending=false;
     s_root_downloading=false;s_root_timeout_logged=false;s_finish_wait_logged=false;
     s_retry_count=0;s_retry_waiting=false;s_metadata_valid=false;s_firmware_size_bytes=0;
+    s_candidate_record=(ota_cache_record_t){0};s_candidate_persisted=s_candidate_recovered=false;
+    s_recovery_pending=s_bootstrap_pending=s_request_deferred=false;s_bootstrap_attempts=0;s_bootstrap_retry_tick=0;
+    s_report_device_id[0]=s_report_aging_number[0]=0;
+    nvs_exists=nvs_deleting=false;nvs_blob_size=nvs_staged_size=0;nvs_writes=nvs_commits=nvs_erases=0;
+    fail_nvs_open=fail_nvs_set=fail_nvs_commit=fail_nvs_erase=false;
+    current_part=boot_part=&running_part;writing_part=NULL;override_image_size=0;fail_image_verify=false;
+    block_read=read_entered=release_read=start_entered=start_finished=false;
+    strlcpy(running_image_version,"1.0.0",sizeof(running_image_version));
     s_otacp_pending=false;s_otacp_payload_ready=false;s_otacp_retry_tick=0;s_otacp_seq=0;
     mqtt_connected=true;mqtt_publish_result=42;mqtt_publish_attempts=mqtt_accepted=0;
     reported_topic[0]=reported_payload[0]=0;wall_time=1782373476;DEVICE_ID="100000010";AgingNumber="2";
@@ -252,6 +336,28 @@ static void reset_case(bool root) {
     strlcpy(server_metadata,"{\"version\":\"1.1.0\",\"file\":\"fw_v1.1.0.bin\"}",sizeof(server_metadata));
     memset(flash_bytes,0xA5,sizeof(flash_bytes));
     for(size_t i=0;i<sizeof(fixture);i++)fixture[i]=(unsigned char)(i*31u+17u);
+    memcpy(running_flash_bytes,fixture,sizeof(fixture));
+}
+
+/* 模拟硬复位：Flash/NVS/启动分区保留，所有 OTA RAM 和 SDK 会话丢失。 */
+static void simulate_boot(const esp_partition_t *running) {
+    handle_live=false;s_ota_handle=0;s_update_partition=NULL;
+    s_session_open=s_rx_accepting=s_rx_done=s_rx_validated=s_rx_failed=s_finish_received=false;
+    s_ready_file=(mesh_ready_file_t){0};memset(s_registered_file_name,0,sizeof(s_registered_file_name));
+    s_candidate_record=(ota_cache_record_t){0};s_candidate_persisted=s_candidate_recovered=false;
+    s_retry_count=0;s_retry_waiting=s_finalization_pending=s_root_downloading=false;
+    s_root_timeout_logged=s_finish_wait_logged=false;s_metadata_valid=false;s_firmware_size_bytes=0;
+    s_metadata=(simple_ota_metadata_t){0};s_download_result_valid=false;
+    s_otacp_pending=s_otacp_payload_ready=false;s_otacp_seq=0;s_otacp_retry_tick=0;
+    s_report_device_id[0]=s_report_aging_number[0]=0;s_otacp_topic[0]=s_otacp_payload[0]=0;
+    s_recovery_pending=true;s_bootstrap_pending=s_request_deferred=false;s_bootstrap_attempts=0;
+    s_bootstrap_retry_tick=0;current_part=running;now=0;wall_time+=300;
+    simple_ota_set_state(SIMPLE_OTA_STATE_IDLE);s_cmd_events->bits=s_dl_events->bits=0;
+    ready_logs=registration_count=resume_count=mqtt_publish_attempts=mqtt_accepted=0;
+    begin_count=end_count=abort_count=boot_count=metadata_reads=body_downloads=0;
+    nvs_writes=nvs_commits=nvs_erases=0;nvs_staged_size=0;nvs_deleting=false;
+    fail_nvs_open=fail_nvs_set=fail_nvs_commit=fail_nvs_erase=false;
+    fail_boot=fail_register=fail_resume=fail_read=fail_image_verify=false;
 }
 static void run_root_download(void) {
     mesh_ota_service_poll(CMD_EVT_REQUEST);assert(s_root_downloading);
@@ -290,6 +396,16 @@ static void check_report(const char *device_id,const char *aging_number) {
     cJSON *aging=cJSON_GetObjectItem(data,"AgingNumber");assert(cJSON_IsString(aging) && !strcmp(aging->valuestring,aging_number));
     cJSON_Delete(root);
 }
+
+static void *concurrent_provider(void *arg) {
+    esp_mesh_lite_lan_ota_file_transfer_param_t p={.fw_version="fw_v1.0.0.bin",.filesize=65536,
+        .offset=0,.data=arg,.data_size=16};assert(provide_file_cb(&p)==ESP_OK);return NULL;
+}
+static void *concurrent_withdrawal(void *arg) {
+    (void)arg;pthread_mutex_lock(&read_gate);start_entered=true;pthread_cond_broadcast(&read_condition);
+    pthread_mutex_unlock(&read_gate);mesh_ota_service_poll(CMD_EVT_REQUEST);
+    pthread_mutex_lock(&read_gate);start_finished=true;pthread_cond_broadcast(&read_condition);pthread_mutex_unlock(&read_gate);return NULL;
+}
 int main(void) {
     assert(mesh_ota_init()==ESP_OK);assert(task_count==2);assert(mesh_ota_init()==ESP_OK && task_count==2);
 
@@ -317,10 +433,11 @@ int main(void) {
     puts("PASS provide exact filename, padded range bounds and FF tail instead of stale flash");
 
     reset_case(true);strlcpy(server_metadata,"{\"version\":\"1.0.0\",\"file\":\"fw_v1.0.0.bin\"}",sizeof(server_metadata));
-    run_root_download();assert(simple_ota_get_state()==SIMPLE_OTA_STATE_IDLE && !ready_logs && !registration_count);
+    run_root_download();assert(simple_ota_get_state()==SIMPLE_OTA_STATE_IDLE && ready_logs==1 && registration_count==1);
+    assert(s_ready_file.partition==current_part && !begin_count && !body_downloads && !boot_count);
     assert(!mqtt_publish_attempts && !s_otacp_pending);
     memset(&r,0xA5,sizeof(r));assert(simple_ota_get_download_result(&r)==ESP_ERR_NOT_FOUND && r.partition==NULL);
-    puts("PASS no-new-version ESP_OK does not register an old or nonexistent image");
+    puts("PASS no-new-version bootstraps only verified running image without download or fake OTACP");
 
     reset_case(true);incomplete_body=true;run_root_download();
     assert(!ready_logs && !registration_count && abort_count==1 && !handle_live && s_retry_waiting);
@@ -394,8 +511,9 @@ int main(void) {
     fail_read=false;now=s_retry_deadline;mesh_ota_service_poll(0);assert(ready_logs==1 && begin_count==1);
     puts("PASS SHA read failure cannot advertise READY; finalization retry preserves downloaded file");
 
-    reset_case(false);receive_body();fail_boot=true;assert(get_file_done_cb()==ESP_FAIL);
-    terminal(ESP_MESH_LITE_EVENT_OTA_SUCCESS);assert(!ready_logs && !registration_count && abort_count==0);
+    reset_case(false);receive_body();fail_boot=true;assert(get_file_done_cb()==ESP_OK && !boot_count);
+    terminal(ESP_MESH_LITE_EVENT_OTA_SUCCESS);assert(!ready_logs && !registration_count && abort_count==0 && nvs_exists);
+    assert(s_finalization_pending && simple_ota_get_state()==SIMPLE_OTA_STATE_RUNNING);
     reset_case(true);fail_end=true;run_root_download();
     assert(!ready_logs && !registration_count && !boot_count && abort_count==0);
     assert(simple_ota_get_download_result(&r)==ESP_ERR_NOT_FOUND);
@@ -439,7 +557,135 @@ int main(void) {
 
     reset_case(false);AgingNumber="rack\"2\n";receive_body();assert(get_file_done_cb()==ESP_OK);
     terminal(ESP_MESH_LITE_EVENT_OTA_SUCCESS);check_report("100000010","rack\"2\n");
+
     puts("PASS OTACP AgingNumber is a JSON-escaped string");
+
+    reset_case(true);fail_nvs_set=true;run_root_download();
+    assert(!nvs_exists && !boot_count && !ready_logs && !mqtt_publish_attempts && s_finalization_pending);
+    assert(simple_ota_get_state()==SIMPLE_OTA_STATE_RUNNING);
+    fail_nvs_set=false;now=s_retry_deadline;mesh_ota_service_poll(0);
+    assert(nvs_exists && boot_count==1 && ready_logs==1 && begin_count==1 && body_downloads==1);
+    puts("PASS NVS capacity failure holds boot selection and OTACP; retry persists without redownload");
+
+    reset_case(false);receive_body();assert(get_file_done_cb()==ESP_OK && !boot_count && !nvs_exists);
+    fail_nvs_commit=true;terminal(ESP_MESH_LITE_EVENT_OTA_SUCCESS);
+    assert(!nvs_exists && !boot_count && !ready_logs && !mqtt_publish_attempts);
+    simulate_boot(&running_part);mesh_ota_service_poll(0);
+    assert(!ready_logs && !boot_count && !s_ready_file.valid && !mqtt_publish_attempts);
+    puts("PASS power loss before NVS commit leaves old boot and cannot advertise an unrecorded staged image");
+
+    reset_case(true);fail_boot=true;run_root_download();
+    ota_cache_record_t saved;assert(ota_cache_load(&saved)==ESP_OK && !strcmp(saved.version,"1.1.0"));
+    assert(saved.completed_seq==1782373476 && boot_part==&running_part && !ready_logs);
+    simulate_boot(&running_part);mesh_ota_service_poll(0);
+    assert(ready_logs==1 && s_ready_file.partition==&update_part && boot_part==&update_part && boot_count==1);
+    assert(simple_ota_get_state()==SIMPLE_OTA_STATE_PENDING_RESTART && !body_downloads && !metadata_reads && !nvs_writes);
+    check_report("100000010","2");
+    puts("PASS committed cache survives cut before boot selection, resumes staged supply and original OTACP");
+
+    reset_case(true);fail_register=true;run_root_download();assert(nvs_exists && boot_part==&update_part && !ready_logs);
+    simulate_boot(boot_part);mqtt_connected=false;DEVICE_ID="changed";AgingNumber="7";mesh_ota_service_poll(0);
+    assert(ready_logs==1 && s_ready_file.partition==current_part && simple_ota_get_state()==SIMPLE_OTA_STATE_IDLE);
+    assert(!boot_count && !nvs_writes && !metadata_reads && !body_downloads && s_otacp_pending);
+    p=(esp_mesh_lite_lan_ota_file_transfer_param_t){.fw_version="fw_v1.1.0.bin",.filesize=65536,.offset=0,.data=out,.data_size=sizeof(out)};
+    assert(provide_file_cb(&p)==ESP_OK && !memcmp(out,fixture,sizeof(out)));
+    mqtt_connected=true;now=s_otacp_retry_tick;mesh_ota_service_poll(0);check_report("100000010","2");
+    puts("PASS rebooted new firmware serves running partition offline and replays original device/Seq notification");
+
+    /* 已运行 B 的缓存恢复不得把状态误留为 pending，后续 C 写回 ota_0。 */
+    strcpy(server_metadata,"{\"version\":\"1.2.0\",\"file\":\"fw_v1.2.0.bin\"}");
+    strcpy(running_image_version,"1.2.0");DEVICE_ID="100000010";AgingNumber="2";
+    run_root_download();assert(begin_count==1 && boot_part==&running_part && s_ready_file.partition==&running_part);
+    assert(simple_ota_get_state()==SIMPLE_OTA_STATE_PENDING_RESTART && !strcmp(s_ready_file.version,"1.2.0"));
+    puts("PASS recovery of running firmware permits next upgrade into the opposite slot");
+
+    reset_case(true);run_root_download();simulate_boot(boot_part);
+    nvs_blob[offsetof(ota_cache_record_t,version)]^=1;
+    strcpy(server_metadata,"{\"version\":\"1.2.0\",\"file\":\"fw_v1.2.0.bin\"}");mesh_ota_service_poll(0);
+    assert(!ready_logs && !s_ready_file.valid && !mqtt_publish_attempts && nvs_erases==1 && !nvs_exists);
+    puts("PASS CRC-corrupt record is rejected and only OTA key is invalidated, with no false completion");
+
+    reset_case(true);run_root_download();simulate_boot(boot_part);flash_bytes[100]^=1;fail_image_verify=true;
+    mesh_ota_service_poll(0);assert(!ready_logs && !s_ready_file.valid && !mqtt_publish_attempts && !nvs_exists);
+    puts("PASS damaged image cannot restore supply even with valid NVS metadata");
+
+    reset_case(true);run_root_download();simulate_boot(boot_part);flash_bytes[100]^=1;
+    strcpy(server_metadata,"{\"version\":\"1.2.0\",\"file\":\"fw_v1.2.0.bin\"}");mesh_ota_service_poll(0);
+    assert(!ready_logs && !nvs_exists && !mqtt_publish_attempts);
+    puts("PASS full BIN SHA mismatch rejects a record even when image parser reports success");
+
+    reset_case(true);run_root_download();strcpy(running_image_version,"1.2.0");simulate_boot(&running_part);
+    strcpy(server_metadata,"{\"version\":\"1.2.0\",\"file\":\"fw_v1.2.0.bin\"}");mesh_ota_service_poll(0);
+    assert(ready_logs==1 && s_ready_file.partition==&running_part && !strcmp(s_ready_file.version,"1.2.0"));
+    assert(!boot_count && !mqtt_publish_attempts && !body_downloads && simple_ota_get_state()==SIMPLE_OTA_STATE_IDLE);
+    assert(ota_cache_load(&saved)==ESP_OK && saved.origin==OTA_CACHE_ORIGIN_BOOTSTRAP);
+    puts("PASS newer running version discards stale cache and bootstraps current image without downgrade or OTACP");
+
+    reset_case(true);strcpy(server_metadata,"{\"version\":\"1.0.0\",\"file\":\"fw_v1.0.0.bin\"}");
+    s_recovery_pending=true;override_image_size=sizeof(fixture)-1;mesh_ota_service_poll(0);
+    assert(!ready_logs && !nvs_exists && !boot_count && !body_downloads);
+    override_image_size=0;now=s_bootstrap_retry_tick;mesh_ota_service_poll(0);
+    assert(ready_logs==1 && s_ready_file.partition==current_part && !mqtt_publish_attempts && nvs_exists);
+    assert(!strcmp(s_ready_file.file_name,"fw_v1.0.0.bin"));
+    simulate_boot(current_part);http_status=503;mesh_ota_service_poll(0);
+    assert(ready_logs==1 && !metadata_reads && !body_downloads && !mqtt_publish_attempts);
+    puts("PASS direct-flash bootstrap requires exact image size and then recovers without server or fake OTACP");
+
+    reset_case(true);fail_nvs_open=true;run_root_download();
+    assert(!begin_count && !boot_count && !ready_logs && !mqtt_publish_attempts && !nvs_erases);
+    puts("PASS unreadable NVS prevents erasing a potentially cached partition");
+
+    reset_case(true);run_root_download();s_ready_file.valid=false;
+    fail_nvs_commit=true;unsigned erases_before=nvs_erases;
+    assert(ota_cache_before_write(&update_part)!=ESP_OK && nvs_exists && nvs_erases==erases_before+1);
+    fail_nvs_commit=false;assert(ota_cache_before_write(&update_part)==ESP_OK && !nvs_exists);
+    puts("PASS overlapping cache must be invalidated and committed before overwrite admission");
+
+    reset_case(true);run_root_download();simulate_boot(&running_part);mqtt_connected=false;mesh_ota_service_poll(CMD_EVT_REQUEST);
+    assert(ready_logs==1 && s_request_deferred && !s_root_downloading && !body_downloads && s_otacp_pending);
+    mqtt_connected=true;now=s_otacp_retry_tick;mesh_ota_service_poll(0);assert(!s_otacp_pending && !s_request_deferred);
+    check_report("100000010","2");
+
+    puts("PASS startup recovery and original completion report precede a deferred upgrade command");
+
+    reset_case(false);receive_body();assert(get_file_done_cb()==ESP_OK);terminal(ESP_MESH_LITE_EVENT_OTA_SUCCESS);
+    simulate_boot(boot_part);mqtt_connected=false;mesh_ota_service_poll(0);
+    assert(IsRoot==0 && ready_logs==1 && s_ready_file.partition==current_part && !s_root_downloading);
+    p=(esp_mesh_lite_lan_ota_file_transfer_param_t){.fw_version="fw_v1.1.0.bin",.filesize=65536,.offset=0,.data=out,.data_size=sizeof(out)};
+    assert(provide_file_cb(&p)==ESP_OK && !memcmp(out,fixture,sizeof(out)) && !metadata_reads && !body_downloads);
+    puts("PASS intermediate child recovers current-slot supply without taking the root download path");
+
+    reset_case(false);fail_nvs_open=true;mesh_ota_service_poll(CMD_EVT_REQUEST);
+    assert(!transmit_count && !begin_count && !boot_count && !ready_logs);
+    puts("PASS child cannot start LAN transfer when persistent invalidation cannot be checked");
+
+    reset_case(true);run_root_download();simulate_boot(boot_part);nvs_blob_size=12;
+    strcpy(server_metadata,"{\"version\":\"1.2.0\",\"file\":\"fw_v1.2.0.bin\"}");mesh_ota_service_poll(0);
+    assert(!ready_logs && !nvs_exists && !mqtt_publish_attempts);
+    puts("PASS truncated persistent record is rejected before dereferencing partition or strings");
+
+    reset_case(true);run_root_download();simulate_boot(boot_part);mesh_ota_service_poll(0);
+    strcpy(server_metadata,"{\"version\":\"1.2.0\",\"file\":\"fw_v1.2.0.bin\"}");
+    strcpy(running_image_version,"1.2.0");incomplete_body=true;run_root_download();
+    assert(ota_cache_load(&saved)==ESP_OK && !strcmp(saved.version,"1.1.0") && saved.partition_address==update_part.address);
+    incomplete_body=false;simulate_boot(&update_part);mesh_ota_service_poll(0);
+    assert(ready_logs==1 && !strcmp(s_ready_file.version,"1.1.0") && s_ready_file.partition==current_part);
+    p=(esp_mesh_lite_lan_ota_file_transfer_param_t){.fw_version="fw_v1.2.0.bin",.filesize=65536,.offset=0,.data=out,.data_size=16};
+    assert(provide_file_cb(&p)==ESP_ERR_NOT_FOUND);
+    puts("PASS interrupted next-slot upgrade preserves prior running cache but never serves it as the newer file");
+
+    reset_case(true);strcpy(server_metadata,"{\"version\":\"1.0.0\",\"file\":\"fw_v1.0.0.bin\"}");
+    s_recovery_pending=true;mesh_ota_service_poll(0);assert(ready_logs==1 && !s_otacp_pending);
+    block_read=true;pthread_t reader,writer;char thread_data[16];
+    pthread_create(&reader,NULL,concurrent_provider,thread_data);
+    pthread_mutex_lock(&read_gate);while(!read_entered)pthread_cond_wait(&read_condition,&read_gate);pthread_mutex_unlock(&read_gate);
+    assert(pthread_mutex_trylock(&s_ota_mutex->lock)!=0);
+    pthread_create(&writer,NULL,concurrent_withdrawal,NULL);
+    pthread_mutex_lock(&read_gate);while(!start_entered)pthread_cond_wait(&read_condition,&read_gate);
+    assert(!start_finished && !s_root_downloading);release_read=true;pthread_cond_broadcast(&read_condition);pthread_mutex_unlock(&read_gate);
+    pthread_join(reader,NULL);pthread_join(writer,NULL);block_read=false;
+    assert(!memcmp(thread_data,fixture,16) && s_root_downloading && !s_ready_file.valid && !body_downloads);
+    puts("PASS concurrent supply read finishes before next-upgrade withdrawal can admit a writer");
     return 0;
 }
 '''
@@ -452,13 +698,15 @@ def main():
         for name in ['esp_err.h', 'esp_partition.h', 'esp_app_format.h', 'esp_http_client.h',
                      'esp_log.h', 'esp_ota_ops.h', 'esp_system.h', 'esp_event.h', 'esp_mesh_lite.h',
                      'ConfigData.h', 'task_config.h', 'mqtt_app.h', 'freertos/FreeRTOS.h', 'freertos/task.h',
-                     'freertos/semphr.h', 'freertos/event_groups.h', 'mbedtls/sha256.h']:
+                     'freertos/semphr.h', 'freertos/event_groups.h', 'mbedtls/sha256.h',
+                     'nvs.h', 'esp_rom_crc.h', 'esp_image_format.h']:
             path = tmp / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text('#include "mock_sdk.h"\n')
         source = tmp / 'test.c'
         source.write_text('#include "mock_sdk.h"\n#define TAG SIMPLE_OTA_TAG\n'
                           f'#include "{ROOT / "main/APP/OTA/ota.c"}"\n#undef TAG\n'
+                          f'#include "{ROOT / "main/APP/OTA/ota_cache.c"}"\n'
                           '#define TAG MESH_OTA_TAG\n'
                           f'#include "{ROOT / "main/APP/OTA/mesh_ota.c"}"\n#undef TAG\n' + TESTS)
         cjson = IDF / 'components/json/cJSON'
@@ -469,7 +717,7 @@ def main():
         if os.getenv('TEST_SANITIZE') == '1':
             command[1:1] = ['-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-g', '-no-pie']
         subprocess.run(command, check=True)
-        subprocess.run([str(tmp / 'test')], check=True)
+        subprocess.run([str(tmp / 'test')], check=True, timeout=30)
 
 
 if __name__ == '__main__':

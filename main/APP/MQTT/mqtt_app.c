@@ -6,6 +6,7 @@
 #include "esp_system.h"
 #include "esp_random.h"
 #include "app_mem.h"
+#include "app_queue.h"
 #include "Json_data.h"
 #include "esp_netif.h"
 #include "esp_tls.h"
@@ -26,6 +27,7 @@ static unsigned s_client_start_count;
 static unsigned s_mqtt_connect_count;
 
 static QueueHandle_t Data_queue = NULL;
+static AppPsramQueue s_data_queue_storage;
 
 /*
  * 统一消息封装：topic 只随首片数据一起入队，与 payload 同队同序。
@@ -34,7 +36,7 @@ static QueueHandle_t Data_queue = NULL;
  *  - JSON/Seq 非法时消费端不取 topic，导致后续命令错配到旧 topic。
  * QoS 1 订阅下 Broker 会持续重投直到 PUBACK，队列满又静默丢弃会把
  * "可观测的丢"变成"观测不到的丢"，因此深度按批量下发峰值取 32。
- * 内存：单槽约 1.1KB（含 topic 字段），32 槽约 35KB 内部 RAM。
+ * 内存：单槽 1090B，32 槽 34880B；控制块内部，数据区使用 PSRAM。
  */
 #define MQTT_DATA_QUEUE_LEN 32
 #define MQTT_TOPIC_ITEM_CAPACITY 64
@@ -116,6 +118,7 @@ static StaticSemaphore_t s_mqtt_admission_storage;
 static SemaphoreHandle_t s_mqtt_admission_mutex;
 static TaskHandle_t s_mqtt_service_task;
 static QueueHandle_t s_runtime_queue;
+static AppPsramQueue s_runtime_queue_storage;
 /* 启动期分配、模块终生持有，优先 PSRAM。半字节/消息 ID 可无损捕捉接口返回前
  * 的确认，不依赖有限事件队列（大量业务 PUBACK 可把上线确认挤出普通队列）。
  * 仅 capture 期间写；清表时先关闭 capture，在临界区外 memset。 */
@@ -1353,7 +1356,8 @@ static esp_err_t mqtt_init_locked(void)
     /* Allow repeated initialization calls without leaking or replacing queues. */
     if (Data_queue == NULL)
     {
-        Data_queue = xQueueCreate(MQTT_DATA_QUEUE_LEN, sizeof(mqtt_data_msg_t));
+        Data_queue = app_psram_queue_create(&s_data_queue_storage, MQTT_DATA_QUEUE_LEN,
+                                            sizeof(mqtt_data_msg_t), "mqtt_rx");
         if (Data_queue == NULL)
         {
             ESP_LOGE(TAG, "Failed to create Data_queue");
@@ -1366,7 +1370,8 @@ static esp_err_t mqtt_init_locked(void)
         if (s_ack_map == NULL) return ESP_ERR_NO_MEM;
     }
     if (s_runtime_queue == NULL) {
-        s_runtime_queue = xQueueCreate(MQTT_RUNTIME_QUEUE_LEN, sizeof(MqttRuntimeLog));
+        s_runtime_queue = app_psram_queue_create(&s_runtime_queue_storage, MQTT_RUNTIME_QUEUE_LEN,
+                                                 sizeof(MqttRuntimeLog), "mqtt_runtime");
         if (s_runtime_queue == NULL) return ESP_ERR_NO_MEM;
     }
     if (s_mqtt_service_task == NULL &&

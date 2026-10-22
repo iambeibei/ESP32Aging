@@ -1,4 +1,5 @@
 #include "Json_data.h"
+#include "app_mem.h"
 
 #include <ctype.h>
 #include <stdlib.h>
@@ -791,7 +792,7 @@ char *create_json_agingStage(int timestamp, const char *aging_stage, const char 
         return NULL; // 截断或编码错误
     }
 
-    char *json_str = malloc(len + 1);
+    char *json_str = app_malloc_prefer_psram(len + 1);
     if (json_str == NULL)
     {
         return NULL;
@@ -821,7 +822,7 @@ char *create_json_agingComplete(int timestamp, int is_complete, const char *agin
         return NULL;
     }
 
-    char *json_str = malloc(len + 1);
+    char *json_str = app_malloc_prefer_psram(len + 1);
     if (json_str == NULL)
     {
         return NULL;

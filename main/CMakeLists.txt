@@ -18,6 +18,7 @@ idf_component_register(SRCS "main.c"
                             "Tool/app_enc.c"
                             "Tool/Json_data.c"
                             "Tool/app_mem.c"
+                            "Tool/app_queue.c"
                             "Tool/SelfRecovery.c"
                             
                             
@@ -35,7 +36,9 @@ idf_component_register(SRCS "main.c"
                             "APP/MQTT/mqtt_app.c"
                             "APP/HTTP/GetProto.c"
                             "APP/OTA/ota.c"
+                            "APP/OTA/ota_cache.c"
                             "APP/OTA/mesh_ota.c"
+                            "APP/Restart/system_restart.c"
 
                             INCLUDE_DIRS 
                             "Communication/Uart"
@@ -56,4 +59,5 @@ idf_component_register(SRCS "main.c"
                             "APP/MQTT"
                             "APP/HTTP"
                             "APP/OTA"
+                            "APP/Restart"
                     )

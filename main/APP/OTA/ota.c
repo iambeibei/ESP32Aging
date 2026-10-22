@@ -4,6 +4,7 @@
  */
 
 #include "ota.h"
+#include "ota_cache.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -190,6 +191,14 @@ static int compare_semver(const ota_semver_t *a, const ota_semver_t *b)
         return (a->patch > b->patch) ? 1 : -1;
     }
     return 0;
+}
+
+esp_err_t simple_ota_compare_versions(const char *left, const char *right, int *comparison)
+{
+    ota_semver_t a, b;
+    if (comparison == NULL || !parse_semver(left, &a) || !parse_semver(right, &b)) return ESP_ERR_INVALID_VERSION;
+    *comparison = compare_semver(&a, &b);
+    return ESP_OK;
 }
 
 static bool validate_firmware_filename(const char *file)
@@ -556,6 +565,15 @@ static esp_err_t perform_http_ota(const char *firmware_url,
              update_partition->subtype,
              (unsigned long)update_partition->address);
 
+    /* 服务任务在唤醒 HTTP worker 前已撤销内存供数，等待在途读取结束。
+     * 只有对应持久记录成功失效，才允许开始擦写。 */
+    err = ota_cache_before_write(update_partition);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Cannot invalidate OTA cache before erase: %s", esp_err_to_name(err));
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return err;
+    }
     esp_ota_handle_t ota_handle = 0;
     err = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &ota_handle);
     if (err != ESP_OK) {
@@ -638,19 +656,7 @@ static esp_err_t perform_http_ota(const char *firmware_url,
         return err != ESP_OK ? err : ESP_ERR_INVALID_VERSION;
     }
 
-    err = esp_ota_set_boot_partition(update_partition);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    /*
-     * 2026-10-16：不再自动重启。新固件已写入非运行槽并设为启动分区，
-     * 重启由外部触发（MQTT CanRestart），以便多点位 mesh 场景下各节点
-     * 先全部完成下载再统一重启，避免自动重启打断老化/MQTT/mesh 拓扑。
-     * 重复 OTA 命令在此状态下会被 simple_ota_check_and_update() 忽略，
-     * 防止二次下载覆盖正在运行的槽位。
-     */
+    /* 此处仅生成已校验下载快照。服务任务先持久化，再设置启动分区。 */
     portENTER_CRITICAL(&s_ota_state_lock);
     s_download_result = (simple_ota_download_result_t){
         .metadata = *metadata,
@@ -658,9 +664,8 @@ static esp_err_t perform_http_ota(const char *firmware_url,
         .partition = update_partition,
     };
     s_download_result_valid = true;
-    s_ota_state = SIMPLE_OTA_STATE_PENDING_RESTART;
     portEXIT_CRITICAL(&s_ota_state_lock);
-    ESP_LOGI(TAG, "OTA download completed and set as boot partition; restart deferred to external trigger (CanRestart)");
+    ESP_LOGI(TAG, "OTA download validated; persistence and boot selection deferred to service task");
     return ESP_OK;
 
 ota_fail:
@@ -697,8 +702,8 @@ static esp_err_t perform_firmware_ota(const char *firmware_url,
 
 /*
  * OTA 检查与下载实现（状态管理见外层包装 simple_ota_check_and_update）。
- * 保持原有下载链路不变：配置校验 → 本地版本 → update.json → 版本比较 →
- * HTTP 下载 → 双槽写入 → 设置启动分区。
+ * 配置校验 → 本地版本 → update.json → 版本比较 → HTTP 下载 → 双槽写入/校验。
+ * 这里只生成本次下载结果；持久化及启动选择由 Mesh OTA 服务按顺序收尾。
  */
 static esp_err_t ota_check_and_update_impl(const simple_ota_config_t *config)
 {
@@ -783,8 +788,8 @@ static esp_err_t ota_check_and_update_impl(const simple_ota_config_t *config)
  * OTA 状态管理薄包装：在每个错误返回点散落状态赋值容易漏，统一在此收敛。
  * - PENDING_RESTART 期间收到新命令：忽略（防二次下载覆盖运行槽）；
  * - 进入时置 RUNNING；失败置 FAILED；
- * - 无需升级（版本不新/更旧，ESP_OK 且状态仍为 RUNNING）回 IDLE；
- * - 下载成功时 perform_http_ota 已置 PENDING_RESTART，此处不覆盖。
+ * - 无需升级（ESP_OK 且无实际下载结果）回 IDLE；
+ * - 下载成功保留 RUNNING，服务任务先提交供数记录，再设置启动分区。
  */
 esp_err_t simple_ota_check_and_update(const simple_ota_config_t *config)
 {
@@ -802,8 +807,10 @@ esp_err_t simple_ota_check_and_update(const simple_ota_config_t *config)
     if (err != ESP_OK) {
         simple_ota_set_state(SIMPLE_OTA_STATE_FAILED);
     } else if (simple_ota_get_state() == SIMPLE_OTA_STATE_RUNNING) {
-        /* 无需升级路径：回到 IDLE（下载成功路径已是 PENDING_RESTART） */
-        simple_ota_set_state(SIMPLE_OTA_STATE_IDLE);
+        /* 已下载仍由服务任务收尾；无需升级才回到 IDLE。 */
+        portENTER_CRITICAL(&s_ota_state_lock);
+        if (!s_download_result_valid) s_ota_state = SIMPLE_OTA_STATE_IDLE;
+        portEXIT_CRITICAL(&s_ota_state_lock);
     }
     return err;
 }
@@ -943,7 +950,7 @@ esp_err_t simple_ota_probe_firmware_size(const char *file_name, size_t *out_size
         return ESP_FAIL;
     }
 
-    if (content_length <= 0) {
+    if (content_length <= 0 || (uint64_t)content_length > SIZE_MAX) {
         ESP_LOGE(TAG, "Firmware size unknown or chunked");
         return ESP_ERR_INVALID_SIZE;
     }

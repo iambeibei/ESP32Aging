@@ -10,11 +10,15 @@
  *   - 子节点：transmit_file_start(BINARY) 以文件名走 mesh 内逐级请求/分发，
  *     extern_url_ota_cb 为禁用桩（mesh 内拿不到即失败，无外网兜底）；
  *   - 根节点：notify_child_node_pause() → dl_task 外网下载唯一 1 份 →
- *     完成后登记备用分区中的已校验文件，保持旧固件运行，不自动重启。
- *   完成本地校验、文件名登记和恢复下级 OTA 后输出 OTA_BINARY_READY。
+ *     cmd_task 校验/计算 SHA、提交 NVS、设置启动分区、登记已校验文件；
+ *     保持旧固件运行，不自动重启。
+ *   启动先恢复 NVS 供数记录并核验完整镜像及 SHA；允许备用槽和当前运行槽供数。
+ *   无记录时仅在服务器元数据/长度与当前镜像一致后绑定当前槽，不下载 BIN 正文。
+ *   完成本地校验、持久化、文件名登记和恢复下级 OTA 后输出 OTA_BINARY_READY。
  *   就绪后以 QoS1 发布 device/<DEVICE_ID>/event/OTACP，包含完成时间戳、
  *   IsComplete=1 与本机 AgingNumber。断线/入队失败保留通知、每 5 秒重试。
- *   不调整 CanRestart，也不承诺断电后继续运行旧固件。
+ *   原完成时间和设备身份随镜像持久化，启动恢复后以原 Seq 补报；首次绑定不报完成。
+ *   外部 CanRestart 由独立重启服务分层调度，不承诺断电后继续运行旧固件。
  *
  * 可靠性补偿（无外网兜底后的必要措施）：
  *   - 失败有限重试：最多 2 次、间隔 90 秒；子复用首次 metadata/size；
@@ -39,7 +43,7 @@ extern "C" {
  * @brief 初始化 Mesh-Lite 原生 OTA 适配层
  *
  * 注册 LAN OTA 文件传输三回调（provide/get/get_done）+ OTA 事件处理器，
- * 并创建 CPU1 任务：cmd_task 所有节点创建；dl_task 仅根节点创建
+ * 并创建 CPU1 任务：cmd_task 所有节点创建（先本地恢复再消费命令）；dl_task 仅根节点创建
  * （DL_EVT_START 唯一置位点在根节点路径，子节点无外网下载需求）。
  *
  * 调用上下文：app_task_init，mesh_init_Custom() 成功后调用一次；不可重入
@@ -56,7 +60,8 @@ esp_err_t mesh_ota_init(void);
  *
  * 调用上下文：mqtt_rx 任务。非阻塞，立即返回——只通知 cmd_task，下载与 mesh
  * 请求均在 cmd_task/dl_task 执行，mqtt_rx 不再被阻塞。重复命令由服务任务
- * 合并；已就绪不会重复擦写，登记/恢复失败仅重试收尾。
+ * 合并；待重启的新镜像不会重复擦写，持久化/登记失败仅重试收尾。
+ * 已运行新镜像并恢复供数的节点可继续接受下一版本升级。
  */
 void mesh_ota_handle_mqtt_command(void);
 

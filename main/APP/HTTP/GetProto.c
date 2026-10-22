@@ -7,6 +7,7 @@
 #include "freertos/queue.h"
 #include "esp_heap_caps.h"
 #include "esp_crt_bundle.h"
+#include "app_mem.h"
 
 static const char *TAG = "HTTP";
 #define HTTP_DATA_QUEUE_LEN 3
@@ -77,6 +78,7 @@ static esp_err_t http_request_execute(esp_http_client_config_t *config,
     config->user_data = &ctx;
     esp_http_client_handle_t client = esp_http_client_init(config);
     if (client == NULL) return ESP_ERR_NO_MEM;
+    if (target != NULL) app_memory_log("protocol_http_start");
     esp_err_t err = ESP_OK;
     if (post_data != NULL) {
         err = esp_http_client_set_header(client, "Content-Type", "application/json");
@@ -98,6 +100,7 @@ static esp_err_t http_request_execute(esp_http_client_config_t *config,
     esp_err_t cleanup_err = esp_http_client_cleanup(client);
     if (cleanup_err != ESP_OK) ESP_LOGW(TAG, "HTTP cleanup failed: %s", esp_err_to_name(cleanup_err));
     http_protocol_response_release(&ctx.response);
+    if (target != NULL) app_memory_log("protocol_http_done");
     if (err != ESP_OK)
         ESP_LOGW(TAG, "HTTP request rejected: status=%d error=%s", status, esp_err_to_name(err));
     return err;

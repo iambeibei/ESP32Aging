@@ -19,6 +19,8 @@
 
 #include "Uart.h"
 #include "task_config.h"
+#include "app_queue.h"
+#include "esp_attr.h"
 
 #define TAG "app_uart0"
 
@@ -95,6 +97,7 @@ typedef struct {
 
 static QueueHandle_t     s_uart_event_queue = NULL;
 static QueueHandle_t     s_data_queue       = NULL;
+static AppPsramQueue     s_data_queue_storage;
 
 static SemaphoreHandle_t s_uart_write_mutex = NULL;
 static SemaphoreHandle_t s_uart_read_mutex  = NULL;
@@ -103,20 +106,21 @@ static SemaphoreHandle_t s_uart_read_mutex  = NULL;
  * 接收任务使用的累积缓冲区。
  * 放在静态区，避免占用任务栈。
  */
-static uint8_t s_rx_acc_buf[APP_UART_BLOCK_SIZE];
+/* 以下是任务上下文复制缓冲，不是 UART ISR/ring buffer 或 DMA 描述符。 */
+EXT_RAM_BSS_ATTR static uint8_t s_rx_acc_buf[APP_UART_BLOCK_SIZE];
 
 /**
  * 入队缓存。
  * 放在静态区，避免 data_to_queue() 内部创建 1 KB 以上的局部变量。
  */
-static app_uart_data_t s_queue_cache;
+EXT_RAM_BSS_ATTR static app_uart_data_t s_queue_cache;
 
 /**
  * 出队缓存。
  * 放在静态区，避免 app_read_UART0_data() 内部创建 1 KB 以上的局部变量。
  * 通过 s_uart_read_mutex 保护。
  */
-static app_uart_data_t s_read_cache;
+EXT_RAM_BSS_ATTR static app_uart_data_t s_read_cache;
 
 /* ---------------- 内部函数声明 ---------------- */
 
@@ -251,10 +255,11 @@ static esp_err_t app_UART0_init_internal(void)
      * 每个队列元素包含：
      * uint16_t data_len + uint8_t data[1024]
      *
-     * 队列长度为 10 时，队列本身大约占用 10 KB 以上 RAM。
+     * 当前 3 项，数据区占 3078 字节 PSRAM，控制块保留在内部 RAM。
      * 优点是不再频繁 malloc/free，运行稳定性更好。
      */
-    s_data_queue = xQueueCreate(APP_UART_DATA_QUEUE_LEN, sizeof(app_uart_data_t));
+    s_data_queue = app_psram_queue_create(&s_data_queue_storage, APP_UART_DATA_QUEUE_LEN,
+                                         sizeof(app_uart_data_t), "uart0_data");
     if (s_data_queue == NULL) {
         ESP_LOGE(TAG, "data queue create failed");
         ret = ESP_ERR_NO_MEM;
@@ -304,7 +309,7 @@ fail:
     }
 
     if (s_data_queue != NULL) {
-        vQueueDelete(s_data_queue);
+        app_psram_queue_delete(&s_data_queue_storage);
         s_data_queue = NULL;
     }
 
