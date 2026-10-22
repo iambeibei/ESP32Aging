@@ -22,6 +22,8 @@ extern "C" {
 /* 完整上报 JSON = Value(<=2048) + 外层字段，预留足够余量。 */
 #define DB_JSON_DATA_MAX_LEN      2560
 #define DB_VALUE_MAX_COUNT        32
+/* 与 appTask.c 全局 RecordId[28] 等宽：采样时固化的老化会话身份。 */
+#define DB_RECORD_ID_MAX_LEN      28
 
 /*
  * 为了降低旧 UDP 代码的编译影响，结构体保留少量旧字段：
@@ -34,6 +36,9 @@ typedef struct
 {
     int seq_no;
     char PN[DB_PN_MAX_LEN];
+    /* 采样时固化的老化会话 RecordId（v7 schema 新增）。
+     * 补传/点播 JSON 必须用本字段而非全局 RecordId，否则跨 PN 会串批。 */
+    char record_id[DB_RECORD_ID_MAX_LEN + 1];
     short current_step;
     int timestamp;
     bool pushed;

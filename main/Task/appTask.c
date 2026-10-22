@@ -579,7 +579,13 @@ esp_err_t storage_print_all_records(void)
                 valid_count++;
             }
         }
-        vTaskDelay(100);
+        /*
+         * 修复裸 tick bug（v：可靠性改造）：原 vTaskDelay(100) 在 100Hz
+         * 下每条记录阻塞 1 秒，3000 条约 50 分钟独占 mqtt_rx，命令接收
+         * 全停。改为 100ms（仍偏慢，但恢复一个数量级；后续如仍有排障
+         * 阻塞问题，应改为异步限速队列，不在本命令路径同步发完）。
+         */
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 
     // printf("=========================================\n");
@@ -591,6 +597,12 @@ esp_err_t storage_print_all_records(void)
 
 #pragma endregion
 
+/*
+ * 去重/重放表定义在本文档后部（"MQTT 命令 Seq 去重与回复重放"区块），
+ * 但下面的回复函数需要先登记缓存再发布，故此处前向声明。
+ */
+static void mqtt_seq_record_reply(int seq, const char *suffix, const char *payload);
+
 #pragma region MQTT响应与状态上报
 
 static void device_response_publish_point(int cmd_seq, int code, const char *msg)
@@ -598,6 +610,8 @@ static void device_response_publish_point(int cmd_seq, int code, const char *msg
     char *response = create_device_response(time(NULL), cmd_seq, code, msg);
     if (response)
     {
+        /* 发布前缓存：入队失败的重试也要能重放（构造后、发送前）。 */
+        mqtt_seq_record_reply(cmd_seq, "point", response);
         if (app_mqtt_publish("device/%s/cmd/reply/point", response, DEVICE_ID) < 0)
         {
 
@@ -614,6 +628,8 @@ static void device_response_publish_state(int cmd_seq, int code, const char *msg
     char *response = create_device_response(time(NULL), cmd_seq, code, msg);
     if (response)
     {
+        /* 发布前缓存：入队失败的重试也要能重放（构造后、发送前）。 */
+        mqtt_seq_record_reply(cmd_seq, "state", response);
         if (app_mqtt_publish("device/%s/cmd/reply/state", response, DEVICE_ID) < 0)
         {
 
@@ -630,6 +646,8 @@ static void device_response_publish_setlog(int cmd_seq, int code, const char *ms
     char *response = create_device_response(time(NULL), cmd_seq, code, msg);
     if (response)
     {
+        /* 发布前缓存：入队失败的重试也要能重放（构造后、发送前）。 */
+        mqtt_seq_record_reply(cmd_seq, "setlog", response);
         if (app_mqtt_publish("device/%s/cmd/reply/setlog", response, DEVICE_ID) < 0)
         {
 
@@ -647,6 +665,8 @@ void Config_Report(int cmd_seq)
     char *json_str = CreateReadConfigJsonFromFiles_MQTT(time(NULL), cmd_seq, 1, NULL);
     if (json_str)
     {
+        /* 发布前缓存（超长不缓存，退化为静默忽略，见 mqtt_seq_record_reply）。 */
+        mqtt_seq_record_reply(cmd_seq, "config", json_str);
         if (app_mqtt_publish("device/%s/cmd/reply/config", json_str, DEVICE_ID) < 0)
         {
             ESP_LOGE(TAG, "MQTT ReadConfig reply publish failed");
@@ -2097,7 +2117,15 @@ static void app_HTTP_Auto_GetProtocol(void *arg)
                 {
                     retry_count = 0;
                     storage_write_record_cyclic(current_log_pn(), "Failed to ExDevice_Check online and protocol match");
-                    if (app_mqtt_publish("device/%s/event/warn", "Failed to ExDevice_Check online and protocol match", DEVICE_ID) < 0)
+                    /*
+                     * warn 必须发标准 JSON：服务端 DeviceEventHandler 首行即
+                     * JObject.Parse，裸字符串 100% 丢弃（Code=1001 外接设备自检失败）。
+                     */
+                    char warn_json[192];
+                    (void)snprintf(warn_json, sizeof(warn_json),
+                                   "{\"Seq\":%lld,\"Data\":{\"Code\":1001,\"Msg\":\"Failed to ExDevice_Check online and protocol match\"}}",
+                                   (long long)time(NULL));
+                    if (app_mqtt_publish("device/%s/event/warn", warn_json, DEVICE_ID) < 0)
                     {
                         storage_write_record_cyclic(current_log_pn(), "MQTT AgingStartCheck Error Publish Failed");
                     }
@@ -2141,6 +2169,9 @@ static void publish_pn_reply(int cmd_seq, int code, const char *pn)
     {
         return;
     }
+
+    /* 发布前缓存：入队失败的重试也要能重放（构造后、发送前）。 */
+    mqtt_seq_record_reply(cmd_seq, "pn", json);
 
     if (app_mqtt_publish("device/%s/cmd/reply/pn", json, DEVICE_ID) < 0)
     {
@@ -2361,43 +2392,381 @@ static bool start_aging_with_ready_pn(const char *aging_json, int start_seq)
 }
 
 /*
- * MQTT 命令 Seq 去重（2026-10-21）：
- * 服务器重试（未收到 reply）或重复下发会产生相同 Seq 的命令，直接忽略，
- * 防止重复执行业务（如重复 start_aging 会重复消耗 PN/创建老化任务）。
+ * MQTT 命令 Seq 去重与回复重放（v：2026-10 可靠性改造）：
+ * 服务器重试（未收到 reply）或重复下发会产生相同 Seq 的命令。
+ * 命中时不执行业务，但必须重放上次的回复——否则服务端永远拿不到
+ * ack，命令永久悬挂，只能重启设备恢复。
  *
- * 环形记录最近 MQTT_SEQ_DEDUP_CAPACITY 个已处理 Seq；正常命令流 Seq 单调
- * （时间戳/计数器）不会在容量内重访，仅重试会命中。命中后静默忽略——不回
- * reply、不上 MQTT、不执行业务；服务器未收 ack 的后续同 Seq 重试同样被
- * 收敛，直至服务器侧放弃。
+ * 设计要点（对照独立分析评审意见逐条落实）：
+ *  1. 回复在"构造后、发布前"缓存：发布入队失败的重试也能被重放；
+ *  2. 不随连接 epoch 清表：断线重连正是服务端原 Seq 重试的高概率
+ *     场景，清表会把旧命令当新命令重新执行（重复 start_aging）；
+ *     改用时间窗口过期（远大于服务端重试间隔）；
+ *  3. 容量 16→32（PSRAM 约 17KB），环形淘汰最旧条目；
+ *  4. 分配失败/停用时退化到旧 16 项静默防重——关重放绝不顺带关防重；
+ *  5. 超长回复（典型是 config）不缓存，退化为静默忽略并打 Warning。
  *
  * 同步：仅由 mqtt_rx 任务经 parse_jsonCommand_MQTT 单线调用（单写者），
- * 无需同步原语。s_mqtt_seq_history_count 使未写位置不参与比较，避免
- * Seq=0 与静态零初始化误撞。
+ * 无需同步原语。
  */
-#define MQTT_SEQ_DEDUP_CAPACITY 16
-static int s_mqtt_seq_history[MQTT_SEQ_DEDUP_CAPACITY];
+#define MQTT_SEQ_DEDUP_CAPACITY 32
+#define MQTT_SEQ_REPLY_MAX      512
+/* 去重/重放有效期：覆盖服务端重试窗口（约 30 秒量级），留 10 分钟余量。 */
+#define MQTT_SEQ_WINDOW_MS      (10 * 60 * 1000)
+/* 重放表不可用时的退化防重容量（旧行为）。 */
+#define MQTT_SEQ_FALLBACK_CAPACITY 16
+
+typedef struct
+{
+    int seq;
+    bool valid;
+    TickType_t first_seen;            /* 时间窗口过期，替代随 epoch 清表 */
+    char topic_suffix[16];            /* "point"/"state"/"pn"/"config"/"setlog" */
+    char payload[MQTT_SEQ_REPLY_MAX]; /* 原始回复 JSON；空串=尚未产生回复 */
+} MqttSeqRecord;
+
+static MqttSeqRecord *s_mqtt_seq_history; /* PSRAM，首次命令时惰性分配 */
 static size_t s_mqtt_seq_history_count;
 static size_t s_mqtt_seq_next;
+static bool s_mqtt_seq_alloc_failed;
 
-static bool mqtt_seq_is_duplicate(int seq)
+/* 重放表不可用（分配失败）时的旧行为防重表。 */
+static int s_mqtt_seq_fallback[MQTT_SEQ_FALLBACK_CAPACITY];
+static size_t s_mqtt_seq_fallback_count;
+static size_t s_mqtt_seq_fallback_next;
+
+static bool mqtt_seq_fallback_is_duplicate(int seq)
 {
-    for (size_t i = 0; i < s_mqtt_seq_history_count; ++i) {
-        if (s_mqtt_seq_history[i] == seq) {
+    for (size_t i = 0; i < s_mqtt_seq_fallback_count; ++i)
+    {
+        if (s_mqtt_seq_fallback[i] == seq)
+        {
             return true;
         }
     }
     return false;
 }
 
-static void mqtt_seq_record(int seq)
+static void mqtt_seq_fallback_record(int seq)
 {
-    if (s_mqtt_seq_history_count < MQTT_SEQ_DEDUP_CAPACITY) {
-        s_mqtt_seq_history[s_mqtt_seq_history_count++] = seq;
+    if (mqtt_seq_fallback_is_duplicate(seq))
+    {
         return;
     }
+
+    if (s_mqtt_seq_fallback_count < MQTT_SEQ_FALLBACK_CAPACITY)
+    {
+        s_mqtt_seq_fallback[s_mqtt_seq_fallback_count++] = seq;
+        return;
+    }
+
     /* 满员后环形覆盖最旧条目。 */
-    s_mqtt_seq_history[s_mqtt_seq_next] = seq;
-    s_mqtt_seq_next = (s_mqtt_seq_next + 1) % MQTT_SEQ_DEDUP_CAPACITY;
+    s_mqtt_seq_fallback[s_mqtt_seq_fallback_next] = seq;
+    s_mqtt_seq_fallback_next = (s_mqtt_seq_fallback_next + 1) % MQTT_SEQ_FALLBACK_CAPACITY;
+}
+
+static bool mqtt_seq_history_ensure(void)
+{
+    if (s_mqtt_seq_history != NULL)
+    {
+        return true;
+    }
+
+    if (s_mqtt_seq_alloc_failed)
+    {
+        return false; /* 每电周期只尝试一次，失败后走退化防重 */
+    }
+
+    s_mqtt_seq_history = (MqttSeqRecord *)app_malloc_prefer_psram(
+        sizeof(MqttSeqRecord) * MQTT_SEQ_DEDUP_CAPACITY);
+    if (s_mqtt_seq_history == NULL)
+    {
+        s_mqtt_seq_alloc_failed = true;
+        ESP_LOGE(TAG,
+                 "MQTT seq replay table alloc failed (%u bytes); fallback to silent dedup",
+                 (unsigned)(sizeof(MqttSeqRecord) * MQTT_SEQ_DEDUP_CAPACITY));
+        return false;
+    }
+
+    memset(s_mqtt_seq_history, 0, sizeof(MqttSeqRecord) * MQTT_SEQ_DEDUP_CAPACITY);
+    s_mqtt_seq_history_count = 0;
+    s_mqtt_seq_next = 0;
+    ESP_LOGI(TAG, "MQTT seq replay table ready: %u entries, %u bytes PSRAM",
+             (unsigned)MQTT_SEQ_DEDUP_CAPACITY,
+             (unsigned)(sizeof(MqttSeqRecord) * MQTT_SEQ_DEDUP_CAPACITY));
+    return true;
+}
+
+/*
+ * 查找已登记 Seq。返回值：
+ *  - NULL：新命令（或表不可用，或记录已超窗被作废）；
+ *  - 非 NULL：重复命令，调用方按 payload 是否为空决定重放/静默忽略。
+ */
+static MqttSeqRecord *mqtt_seq_find(int seq)
+{
+    if (s_mqtt_seq_history == NULL)
+    {
+        return NULL;
+    }
+
+    TickType_t now = xTaskGetTickCount();
+    for (size_t i = 0; i < s_mqtt_seq_history_count; ++i)
+    {
+        MqttSeqRecord *record = &s_mqtt_seq_history[i];
+        if (record->valid && record->seq == seq)
+        {
+            if (now - record->first_seen > pdMS_TO_TICKS(MQTT_SEQ_WINDOW_MS))
+            {
+                /* 超窗作废：服务端重试窗口远小于此，正常不会到达；
+                 * 真到达时按新命令处理，好过永久悬挂。 */
+                record->valid = false;
+                ESP_LOGW(TAG, "MQTT command seq=%d expired from dedup window", seq);
+                return NULL;
+            }
+            return record;
+        }
+    }
+    return NULL;
+}
+
+/* 只登记 Seq（防止重复执行），payload 由回复函数后续填充。 */
+static void mqtt_seq_record(int seq)
+{
+    if (mqtt_seq_history_ensure())
+    {
+        if (mqtt_seq_find(seq) != NULL)
+        {
+            return;
+        }
+
+        size_t idx;
+        if (s_mqtt_seq_history_count < MQTT_SEQ_DEDUP_CAPACITY)
+        {
+            idx = s_mqtt_seq_history_count++;
+        }
+        else
+        {
+            idx = s_mqtt_seq_next;
+            s_mqtt_seq_next = (s_mqtt_seq_next + 1) % MQTT_SEQ_DEDUP_CAPACITY;
+        }
+
+        MqttSeqRecord *record = &s_mqtt_seq_history[idx];
+        memset(record, 0, sizeof(*record));
+        record->seq = seq;
+        record->valid = true;
+        record->first_seen = xTaskGetTickCount();
+        return;
+    }
+
+    mqtt_seq_fallback_record(seq);
+}
+
+/*
+ * 回复发出前登记缓存，供重复命令原样重放。
+ * 必须复用原始 payload：create_device_response 等的外层 Seq 是发送时刻
+ * time(NULL)，重建会变成新 Seq，服务端可能当新回复处理。
+ */
+static void mqtt_seq_record_reply(int seq, const char *suffix, const char *payload)
+{
+    if (s_mqtt_seq_history == NULL || suffix == NULL || payload == NULL)
+    {
+        return;
+    }
+
+    MqttSeqRecord *record = mqtt_seq_find(seq);
+    if (record == NULL)
+    {
+        return; /* 未登记或已过期：不创建 */
+    }
+
+    if (strlen(payload) >= MQTT_SEQ_REPLY_MAX)
+    {
+        /* 超长（典型是 config 回复）不缓存，退化为旧行为：重复命令静默忽略。 */
+        ESP_LOGW(TAG, "Reply too long to cache for replay, seq=%d, len=%u",
+                 seq, (unsigned)strlen(payload));
+        return;
+    }
+
+    strlcpy(record->topic_suffix, suffix, sizeof(record->topic_suffix));
+    strlcpy(record->payload, payload, sizeof(record->payload));
+}
+
+/* -------------------------------------------------------------------------- */
+/* PUBACK 三态结算：PUBLISHED→acked(2)，DELETED→pending(0)                     */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * pushed 三态（DB 列语义，与 SqLite.h 注释一致）：
+ *   0 pending   待发，补传 worker 的扫描对象；
+ *   1 inflight  已交 SDK 等 PUBACK，重启时统一复位为 pending；
+ *   2 acked     broker 已确认，不再重传。
+ *
+ * 跨任务边界（关键）：app_mqtt_publish_settled 在 SDK MQTT 任务上下文被
+ * 调用，只把 (msg_id, acked) 非阻塞入队；追踪表与 DB 更新全部留在
+ * mqtt_rx（单写者，无需同步原语）。绝不在 SDK 回调里写 SQLite——
+ * journal_mode=DELETE + synchronous=FULL 的提交会 fsync，阻塞 SDK 任务。
+ */
+enum
+{
+    PUSH_STATE_PENDING = 0,
+    PUSH_STATE_INFLIGHT = 1,
+    PUSH_STATE_ACKED = 2
+};
+
+#define MQTT_PUBLISH_TRACK_CAPACITY 64
+#define MQTT_PUSH_SETTLE_QUEUE_LEN  64
+
+typedef struct
+{
+    int msg_id;
+    bool acked;
+} MqttPublishSettleId;
+
+typedef struct
+{
+    int msg_id;
+    bool valid;
+    char pn[DB_PN_MAX_LEN];
+    char record_id[DB_RECORD_ID_MAX_LEN + 1];
+    int seq_no;
+} MqttPublishTrack;
+
+static MqttPublishTrack *s_mqtt_publish_track; /* PSRAM，首次发布时惰性分配 */
+static size_t s_mqtt_publish_track_count;
+static size_t s_mqtt_publish_track_next;
+static bool s_mqtt_publish_track_alloc_failed;
+static QueueHandle_t s_publish_settle_queue;
+
+static bool mqtt_publish_track_ensure(void)
+{
+    if (s_mqtt_publish_track != NULL)
+    {
+        return true;
+    }
+
+    if (s_publish_settle_queue == NULL)
+    {
+        s_publish_settle_queue = xQueueCreate(MQTT_PUSH_SETTLE_QUEUE_LEN,
+                                              sizeof(MqttPublishSettleId));
+        if (s_publish_settle_queue == NULL)
+        {
+            ESP_LOGE(TAG, "Publish settle queue create failed");
+            return false;
+        }
+    }
+
+    if (s_mqtt_publish_track_alloc_failed)
+    {
+        return false; /* 每电周期只尝试一次，失败后靠重启复位兜底 */
+    }
+
+    s_mqtt_publish_track = (MqttPublishTrack *)app_malloc_prefer_psram(
+        sizeof(MqttPublishTrack) * MQTT_PUBLISH_TRACK_CAPACITY);
+    if (s_mqtt_publish_track == NULL)
+    {
+        s_mqtt_publish_track_alloc_failed = true;
+        ESP_LOGE(TAG,
+                 "MQTT publish track alloc failed (%u bytes); inflight records rely on reboot recovery",
+                 (unsigned)(sizeof(MqttPublishTrack) * MQTT_PUBLISH_TRACK_CAPACITY));
+        return false;
+    }
+
+    memset(s_mqtt_publish_track, 0, sizeof(MqttPublishTrack) * MQTT_PUBLISH_TRACK_CAPACITY);
+    s_mqtt_publish_track_count = 0;
+    s_mqtt_publish_track_next = 0;
+    ESP_LOGI(TAG, "MQTT publish track ready: %u entries, %u bytes PSRAM",
+             (unsigned)MQTT_PUBLISH_TRACK_CAPACITY,
+             (unsigned)(sizeof(MqttPublishTrack) * MQTT_PUBLISH_TRACK_CAPACITY));
+    return true;
+}
+
+/* 入队成功后登记：msg_id ↔ 记录身份，等待 PUBLISHED/DELETED 结算。 */
+static void mqtt_publish_track(int msg_id, const char *pn, const char *record_id, int seq_no)
+{
+    if (msg_id <= 0 || pn == NULL || record_id == NULL)
+    {
+        return;
+    }
+
+    if (!mqtt_publish_track_ensure())
+    {
+        return;
+    }
+
+    size_t idx;
+    if (s_mqtt_publish_track_count < MQTT_PUBLISH_TRACK_CAPACITY)
+    {
+        idx = s_mqtt_publish_track_count++;
+    }
+    else
+    {
+        /* 环形淘汰最旧条目：其结算丢失，记录停留 inflight，由重启复位兜底。 */
+        idx = s_mqtt_publish_track_next;
+        s_mqtt_publish_track_next =
+            (s_mqtt_publish_track_next + 1) % MQTT_PUBLISH_TRACK_CAPACITY;
+    }
+
+    MqttPublishTrack *entry = &s_mqtt_publish_track[idx];
+    memset(entry, 0, sizeof(*entry));
+    entry->msg_id = msg_id;
+    entry->valid = true;
+    strlcpy(entry->pn, pn, sizeof(entry->pn));
+    strlcpy(entry->record_id, record_id, sizeof(entry->record_id));
+    entry->seq_no = seq_no;
+}
+
+/* SDK 事件回调入口：只入队 (msg_id, acked)，不碰追踪表、不写 DB。 */
+void app_mqtt_publish_settled(int msg_id, bool acked)
+{
+    if (msg_id <= 0 || s_publish_settle_queue == NULL)
+    {
+        return;
+    }
+
+    MqttPublishSettleId item = {
+        .msg_id = msg_id,
+        .acked = acked,
+    };
+
+    if (xQueueSend(s_publish_settle_queue, &item, 0) != pdTRUE)
+    {
+        /* 队列满：丢弃本次结算，记录停留 inflight，由重启复位兜底。 */
+        ESP_LOGW(TAG, "Publish settle queue full; settlement dropped, msg_id=%d", msg_id);
+    }
+}
+
+/* mqtt_rx 循环调用：查表结算并写 DB（单行 UPDATE，持锁时间短）。 */
+static void mqtt_push_settle_drain(void)
+{
+    if (s_publish_settle_queue == NULL || s_mqtt_publish_track == NULL)
+    {
+        return;
+    }
+
+    for (;;)
+    {
+        MqttPublishSettleId item;
+        if (xQueueReceive(s_publish_settle_queue, &item, 0) != pdTRUE)
+        {
+            break;
+        }
+
+        for (size_t i = 0; i < s_mqtt_publish_track_count; ++i)
+        {
+            MqttPublishTrack *entry = &s_mqtt_publish_track[i];
+            if (!entry->valid || entry->msg_id != item.msg_id)
+            {
+                continue;
+            }
+
+            entry->valid = false; /* 结算一次即失效 */
+            (void)UpdateRecordPushStateByPNAndID(entry->pn,
+                                                 entry->record_id,
+                                                 entry->seq_no,
+                                                 item.acked ? PUSH_STATE_ACKED : PUSH_STATE_PENDING);
+            break;
+        }
+    }
 }
 
 // Json数据解析
@@ -2431,12 +2800,44 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
         {
             /*
              * Seq 去重（2026-10-21）：命中已处理过的 Seq 直接忽略。
-             * 位置约束：必须在 app_read_MQTT_topic 之后——topic 队列是 FIFO，
-             * 不取出会与后续命令错位；取出后命中即走 cleanup（已解析的
-             * packet_copy/pRoot 由 cleanup 统一释放）。
+             * 位置约束：先取 topic 再判去重——统一消息封装下 topic 由
+             * 数据首片携带（mqtt_app.c 暂存区），先取出既可让去重日志
+             * 带上主题名，也保证暂存区不会跨消息残留。
              */
-            if (mqtt_seq_is_duplicate(Seq->valueint)) {
-                ESP_LOGW(TAG, "Duplicate MQTT command seq=%d ignored, topic=%.*s",
+            /*
+             * 重复命令：不执行业务，但必须重放上次的回复。
+             * payload 为空说明首次执行尚未产生回复（极窄窗口）或回复超长
+             * 未缓存——此时退化为静默忽略；重放表不可用时由 find 返回
+             * NULL，落到下面的退化防重（关重放绝不关防重）。
+             */
+            MqttSeqRecord *dup = mqtt_seq_find(Seq->valueint);
+            if (dup != NULL)
+            {
+                if (dup->payload[0] != '\0')
+                {
+                    ESP_LOGW(TAG,
+                             "Duplicate MQTT command seq=%d, replaying last reply (%s), topic=%.*s",
+                             Seq->valueint, dup->topic_suffix, len1, TopicBuf);
+                    char replay_topic[64];
+                    int n = snprintf(replay_topic, sizeof(replay_topic),
+                                     "device/%%s/cmd/reply/%s", dup->topic_suffix);
+                    if (n > 0 && n < (int)sizeof(replay_topic))
+                    {
+                        (void)app_mqtt_publish(replay_topic, dup->payload, DEVICE_ID);
+                    }
+                }
+                else
+                {
+                    ESP_LOGW(TAG,
+                             "Duplicate MQTT command seq=%d ignored (no cached reply yet), topic=%.*s",
+                             Seq->valueint, len1, TopicBuf);
+                }
+                goto cleanup;
+            }
+            if (s_mqtt_seq_history == NULL && mqtt_seq_fallback_is_duplicate(Seq->valueint))
+            {
+                ESP_LOGW(TAG,
+                         "Duplicate MQTT command seq=%d ignored (replay table disabled), topic=%.*s",
                          Seq->valueint, len1, TopicBuf);
                 goto cleanup;
             }
@@ -2684,6 +3085,12 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                 char *json_str = CreateStateUPJsonFromFiles_MQTT(time(NULL), Seq->valueint, 1, NULL);
                 if (json_str)
                 {
+                    /*
+                     * get_state 直连发布（报文格式与 device_response_publish_state
+                     * 不同，不能改走统一函数），但去重重放登记不能漏——
+                     * 发布前缓存，同 Seq 重试时原样重放本 JSON。
+                     */
+                    mqtt_seq_record_reply(Seq->valueint, "state", json_str);
                     if (app_mqtt_publish("device/%s/cmd/reply/state", json_str, DEVICE_ID) < 0)
                     {
                         ESP_LOGE(TAG, "MQTT State reply publish failed");
@@ -2729,11 +3136,23 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                     {
                         printf("ids[%d] = %d\n", i, ids[i]);
                         query_db1_to_global(ids[i]);
-                        if (g_db1_result->json_data[0] != '\0')
+                        /* 坏记录隔离（v7）：无 RecordId 的历史记录不可补发。 */
+                        if (g_db1_result->record_id[0] != '\0' && g_db1_result->json_data[0] != '\0')
                         {
-                            if (app_mqtt_publish("device/%s/data/aging", g_db1_result->json_data, DEVICE_ID) > 0)
+                            int publish_id = app_mqtt_publish("device/%s/data/aging", g_db1_result->json_data, DEVICE_ID);
+                            if (publish_id > 0)
                             {
+                                (void)UpdateRecordPushStateByPNAndID(g_db1_result->PN,
+                                                                     g_db1_result->record_id,
+                                                                     g_db1_result->seq_no,
+                                                                     PUSH_STATE_INFLIGHT);
+                                mqtt_publish_track(publish_id, g_db1_result->PN,
+                                                   g_db1_result->record_id, g_db1_result->seq_no);
                             }
+                        }
+                        else
+                        {
+                            ESP_LOGW(TAG, "Point-query backfill skipped seq_no=%d (unattributable)", ids[i]);
                         }
                         vTaskDelay(pdMS_TO_TICKS(100));
                     }
@@ -2778,10 +3197,12 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                 if (CanRestart == 1)
                 {
                     /*
-                     * 外部触发重启（2026-10-16 起 OTA 的唯一重启入口）：
-                     * OTA 下载完成后不再自动 esp_restart()，由服务器通过
-                     * rack 级 CanRestart 主题统一调度——多点位 OTA 场景下
-                     * 各节点先全部完成下载，再统一下发重启。
+                     * 外部触发重启（保留为运维重启入口）：
+                     * 2026-10-16 起 OTA 曾以此主题统一点火；2026-10-19
+                     * mesh_ota 改为"完成即重启"（LG_MESH_OTA_RESTART_DELAY_MS
+                     * 延迟自行 esp_restart），本主题不再是 OTA 必经路径，
+                     * 但保留订阅作为外部/运维手动重启通道——删除需确认无
+                     * 外部系统使用（独立分析评审意见）。
                      * 重启前打印 OTA 状态并留 100ms 让日志与 publish ack 落盘。
                      * 未下载新固件的节点重启后运行旧固件，无害。
                      */
@@ -2821,6 +3242,15 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                 }
             }
         }
+        else
+        {
+            /*
+             * 统一消息封装下取不到 topic 只有一种原因：该消息首片在入队前
+             * 已被丢弃（队列满或 topic 超长），payload 不完整、不可路由。
+             * 记录后走 cleanup 统一释放；绝不能用旧主题补猜。
+             */
+            ESP_LOGW(TAG, "MQTT command without paired topic dropped, seq=%d", Seq->valueint);
+        }
     }
     else
     {
@@ -2859,6 +3289,9 @@ static void app_MQTT_Rdata_handle(void *arg)
 
     while (1)
     {
+        /* 抽干发布确认结算：PUBLISHED→acked(2)，DELETED→pending(0)。
+         * DB 更新在此执行，SDK MQTT 任务回调只负责入队。 */
+        mqtt_push_settle_drain();
 
         memset(Databuf, 0, sizeof(Databuf));
 
@@ -2991,6 +3424,18 @@ void Init_ByNetwork_Flag(void *arg)
             }
 
             /*
+             * 断线补传 worker：与 mqtt_rx 同条件创建（MQTT 客户端就绪后）。
+             * 优先级 4 低于 mqtt_rx(7)，不抢占命令接收；扫描由上线完成
+             * （MQTT_SETUP_DONE）唤醒，60 秒兜底。
+             */
+            if (app_create_mqtt_backfill_task() != pdPASS)
+            {
+                storage_write_record_cyclic(current_log_pn(), "Failed to create MQTT backfill task");
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+
+            /*
              * SQLite 重置延迟上报：SqLite_Init 远早于 MQTT 建立，重置结果
              * （sqlite_mount_fail/db_rebuilt/rebuild_fail）写入了 NVS 标志。
              * 此处 MQTT 已就绪，读取并上报后清除——保证"缓存已丢"对服务器
@@ -3003,9 +3448,17 @@ void Init_ByNetwork_Flag(void *arg)
                 sqlite_reset_flag[0] != '\0')
             {
                 char warn_msg[96] = {0};
+                char warn_json[224] = {0};
                 (void)snprintf(warn_msg, sizeof(warn_msg), "SQLite cache reset: %s, ts=%lld",
                                sqlite_reset_flag, (long long)time(NULL));
-                if (app_mqtt_publish("device/%s/event/warn", warn_msg, DEVICE_ID) < 0)
+                /*
+                 * 服务端 DeviceEventHandler 首行即 JObject.Parse：裸字符串必抛。
+                 * warn 必须发标准 JSON（Code=1002 缓存重置）。
+                 */
+                (void)snprintf(warn_json, sizeof(warn_json),
+                               "{\"Seq\":%lld,\"Data\":{\"Code\":1002,\"Msg\":\"SQLite cache reset: %s\"}}",
+                               (long long)time(NULL), sqlite_reset_flag);
+                if (app_mqtt_publish("device/%s/event/warn", warn_json, DEVICE_ID) < 0)
                 {
                     storage_write_record_cyclic(current_log_pn(), "SQLite reset warn publish failed");
                 }
@@ -4744,6 +5197,7 @@ void Aging_Test_Task(void *arg)
         }
         case AgingDataCheck:
         {
+            int skipped_records = 0;
             while (QueryLatestRecordByPNAndPushState(PN_Code, false, g_db1_result) == 0)
             {
                 /* 历史数据补发轮询：循环内检查 BLE 断开。 */
@@ -4754,20 +5208,68 @@ void Aging_Test_Task(void *arg)
                     Aging_Task_Abort_And_Delete();
                     return;
                 }
-                if (g_db1_result->json_data[0] != '\0')
+
+                /*
+                 * 坏记录隔离（v7 轮次身份）：
+                 *  - record_id 为空：schema 迁移前的历史记录，无法归属老化轮次，
+                 *    补发会把旧数据挂到当前会话上（串批）；
+                 *  - json_data 为空：value_data 无法重构上报 JSON。
+                 * 两类记录都必须标记后跳过——不更新 pushed 会因 while 反复
+                 * 取到同一条记录而死循环（空 json_data 路径改造前即可死循环）。
+                 */
+                if (g_db1_result->record_id[0] == '\0' || g_db1_result->json_data[0] == '\0')
                 {
-                    if (app_mqtt_publish("device/%s/data/aging", g_db1_result->json_data, DEVICE_ID) > 0)
-                    {
-                        UpdateRecordPushStateByPNAndID(PN_Code, g_db1_result->seq_no, true);
-                    }
-                    else
-                    {
-                        aging_error_log("Historical aging-data retransmission failed, seq_no=%d",
-                                        g_db1_result->seq_no);
-                        break;
-                    }
+                    ESP_LOGE(TAG,
+                             "Aging backfill record dropped (unattributable): PN=%s seq_no=%d record_id_empty=%d json_empty=%d",
+                             PN_Code,
+                             g_db1_result->seq_no,
+                             g_db1_result->record_id[0] == '\0' ? 1 : 0,
+                             g_db1_result->json_data[0] == '\0' ? 1 : 0);
+                    storage_write_record_cyclic(current_log_pn(),
+                                                "Aging backfill record dropped: unattributable legacy/invalid record");
+                    /* 置 acked 退休：不再重试、不再进补传扫描。 */
+                    (void)UpdateRecordPushStateByPNAndID(PN_Code,
+                                                         g_db1_result->record_id,
+                                                         g_db1_result->seq_no,
+                                                         PUSH_STATE_ACKED);
+                    skipped_records++;
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    continue;
+                }
+
+                int publish_id = app_mqtt_publish("device/%s/data/aging", g_db1_result->json_data, DEVICE_ID);
+                if (publish_id > 0)
+                {
+                    (void)UpdateRecordPushStateByPNAndID(PN_Code,
+                                                         g_db1_result->record_id,
+                                                         g_db1_result->seq_no,
+                                                         PUSH_STATE_INFLIGHT);
+                    mqtt_publish_track(publish_id, PN_Code, g_db1_result->record_id, g_db1_result->seq_no);
+                }
+                else
+                {
+                    aging_error_log("Historical aging-data retransmission failed, seq_no=%d",
+                                    g_db1_result->seq_no);
+                    break;
                 }
                 vTaskDelay(pdMS_TO_TICKS(100));
+            }
+
+            /*
+             * 跳过的历史记录对服务端即"数据缺口"，发一条 warn 让其知晓
+             * （标准 JSON 格式，与服务端 DeviceEventHandler 兼容）。
+             */
+            if (skipped_records > 0)
+            {
+                char warn_json[192];
+                (void)snprintf(warn_json, sizeof(warn_json),
+                               "{\"Seq\":%lld,\"Data\":{\"Code\":1003,\"Msg\":\"%d aging records skipped: missing RecordId or invalid JSON\"}}",
+                               (long long)time(NULL), skipped_records);
+                if (app_mqtt_publish("device/%s/event/warn", warn_json, DEVICE_ID) < 0)
+                {
+                    storage_write_record_cyclic(current_log_pn(), "Skipped records warn publish failed");
+                }
+                ESP_LOGW(TAG, "Aging backfill skipped %d unattributable record(s)", skipped_records);
             }
             // 清空数据
             memset(s_aging_lost_data_list, 0, 1024);
@@ -4783,11 +5285,23 @@ void Aging_Test_Task(void *arg)
                     {
                         printf("ids[%d] = %d\n", i, ids[i]);
                         query_db1_to_global(ids[i]);
-                        if (g_db1_result->json_data[0] != '\0')
+                        /* 坏记录隔离（v7）：无 RecordId 的历史记录不可补发。 */
+                        if (g_db1_result->record_id[0] != '\0' && g_db1_result->json_data[0] != '\0')
                         {
-                            if (app_mqtt_publish("device/%s/data/aging", g_db1_result->json_data, DEVICE_ID) > 0)
+                            int publish_id = app_mqtt_publish("device/%s/data/aging", g_db1_result->json_data, DEVICE_ID);
+                            if (publish_id > 0)
                             {
+                                (void)UpdateRecordPushStateByPNAndID(g_db1_result->PN,
+                                                                     g_db1_result->record_id,
+                                                                     g_db1_result->seq_no,
+                                                                     PUSH_STATE_INFLIGHT);
+                                mqtt_publish_track(publish_id, g_db1_result->PN,
+                                                   g_db1_result->record_id, g_db1_result->seq_no);
                             }
+                        }
+                        else
+                        {
+                            ESP_LOGW(TAG, "HTTP gap backfill skipped seq_no=%d (unattributable)", ids[i]);
                         }
                         vTaskDelay(pdMS_TO_TICKS(1000));
                     }
@@ -5201,7 +5715,8 @@ static void app_DataUpload_Functiong(const AgingUploadPacket *packet, int idnum)
                                         packet->current_step,
                                         packet->timestamp,
                                         false,
-                                        packet->value_json);
+                                        packet->value_json,
+                                        RecordId);
 
     if (db_ret != 0)
     {
@@ -5217,14 +5732,15 @@ static void app_DataUpload_Functiong(const AgingUploadPacket *packet, int idnum)
                  (unsigned)packet->value_count);
     }
 
-    bool upload_success = Network_Flag &&
-                          (app_mqtt_publish("device/%s/data/aging",
-                                            publish_string,
-                                            DEVICE_ID) > 0);
+    int publish_id = Network_Flag ? app_mqtt_publish("device/%s/data/aging",
+                                                     publish_string,
+                                                     DEVICE_ID)
+                                  : -1;
+    bool upload_success = publish_id > 0;
 
     if (upload_success && db_ret == 0)
     {
-        if (UpdateRecordPushStateByPNAndID(packet->pn, idnum, true) != 0)
+        if (UpdateRecordPushStateByPNAndID(packet->pn, RecordId, idnum, PUSH_STATE_INFLIGHT) != 0)
         {
             /*
              * MQTT已提交但状态更新失败时保持 pushed=0 更安全。
@@ -5234,6 +5750,14 @@ static void app_DataUpload_Functiong(const AgingUploadPacket *packet, int idnum)
                             idnum,
                             packet->pn);
         }
+
+        /*
+         * 登记 msg_id ↔ 记录身份：任一 PUBACK 到达即证明已送达（结算为
+         * acked）；DELETED（outbox 淘汰/过期）回滚为 pending 等补传。
+         * 即使上面的状态更新失败也登记——记录此时是 pending，补传会
+         * 重发，而首个 PUBACK 同样能把它结算为 acked。
+         */
+        mqtt_publish_track(publish_id, packet->pn, RecordId, idnum);
     }
 
     aging_data_upload_result(upload_success, idnum);
@@ -5290,6 +5814,166 @@ void app_AgingData_Upload_handle(void *arg)
         app_DataUpload_Functiong(packet, idnum);
         idnum++;
         AgingUploadPacket_Free(packet);
+    }
+}
+
+#pragma endregion
+
+#pragma region 断线补传
+
+/* -------------------------------------------------------------------------- */
+/* 断线补传 worker（v7）                                                        */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * 存在的理由：QueryUnpushedRecords 长期无调用者，断线/中止/换 PN 后滞留的
+ * pushed=0 记录只能等下次老化结束的 AgingDataCheck（且只补当前 PN）。
+ * Broker 离线队列指望不上：30 台 × 5 秒/条 ≈ 2.1 万条/小时，远超默认
+ * max_queued_messages（约 1000 量级）——补偿只能来自设备端 SQLite。
+ *
+ * 触发：MQTT_SETUP_DONE 唤醒 + 1 秒轮询 + 60 秒兜底扫描（防通知丢失）。
+ * 为什么不能复用 AgingDataCheck 的补传段：
+ *   - 那段只补当前 PN（PN_Code），依赖全局 g_db1_result；
+ *   - 耦合 BLE 断链中止与老化任务删除，在别的任务调用会误触发中止；
+ *   - 失败即 break，剩余记录静默滞留。
+ *
+ * 前置依赖：服务端老化采样幂等（S2-1）。补传必然产生重复投递
+ * （inflight 掉电/重启即按 pending 重传），需要服务端按
+ * PN+RecordId+IDNUM 去重兜底。
+ */
+#define MQTT_BACKFILL_BATCH        4
+#define MQTT_BACKFILL_BATCH_MS     100   /* 批间隔：防打满 outbox 56KB 准入预算 */
+#define MQTT_BACKFILL_POLL_MS      1000  /* 无通知时的轮询周期 */
+#define MQTT_BACKFILL_SCAN_MS      60000 /* 通知丢失的兜底扫描周期 */
+#define MQTT_BACKFILL_BACKOFF_MS   5000  /* outbox 预算不足退避 */
+
+static TaskHandle_t s_mqtt_backfill_task = NULL;
+
+static void mqtt_backfill_task(void *arg)
+{
+    (void)arg;
+
+    /* QueryResult 约 4.7KB/条，4 条约 19KB，必须 PSRAM（禁上栈）。 */
+    QueryResult *batch = (QueryResult *)app_malloc_prefer_psram(
+        sizeof(QueryResult) * MQTT_BACKFILL_BATCH);
+    if (batch == NULL)
+    {
+        ESP_LOGE(TAG, "Backfill buffer alloc failed, size=%u",
+                 (unsigned)(sizeof(QueryResult) * MQTT_BACKFILL_BATCH));
+        vTaskDelete(NULL);
+        return;
+    }
+
+    TickType_t last_scan = xTaskGetTickCount();
+
+    for (;;)
+    {
+        bool notified = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(MQTT_BACKFILL_POLL_MS)) > 0;
+        TickType_t now = xTaskGetTickCount();
+
+        bool scan_due = notified ||
+                        (now - last_scan) >= pdMS_TO_TICKS(MQTT_BACKFILL_SCAN_MS);
+        if (!scan_due)
+        {
+            continue;
+        }
+        last_scan = now;
+
+        if (!app_mqtt_is_connected())
+        {
+            continue; /* 离线：等 SETUP_DONE 唤醒或下一轮兜底 */
+        }
+
+        ESP_LOGI(TAG, "Backfill scan start (notified=%u)", notified ? 1U : 0U);
+
+        bool blocked = false;
+        while (!blocked)
+        {
+            int count = 0;
+            if (QueryUnpushedRecords(batch, MQTT_BACKFILL_BATCH, &count) != 0 || count == 0)
+            {
+                break; /* 无待发记录（或查询失败）：本轮结束 */
+            }
+
+            int sent = 0;
+            for (int i = 0; i < count; ++i)
+            {
+                /*
+                 * 双保险隔离：SQL 已过滤 record_id/value_data 为空的记录，
+                 * 此处再兜底一次（7 列兼容模式下 SQL 不过滤）。跳过而不更新
+                 * 状态——同批后续记录仍会被处理，scan 持续推进；整批无可发
+                 * 记录时退出本轮，避免紧循环打爆 SQLite。
+                 */
+                if (batch[i].record_id[0] == '\0' || batch[i].json_data[0] == '\0')
+                {
+                    ESP_LOGW(TAG,
+                             "Backfill record skipped (unattributable): PN=%s seq_no=%d",
+                             batch[i].PN, batch[i].seq_no);
+                    continue;
+                }
+
+                int publish_id = app_mqtt_publish("device/%s/data/aging",
+                                                  batch[i].json_data,
+                                                  DEVICE_ID);
+                if (publish_id > 0)
+                {
+                    (void)UpdateRecordPushStateByPNAndID(batch[i].PN,
+                                                         batch[i].record_id,
+                                                         batch[i].seq_no,
+                                                         PUSH_STATE_INFLIGHT);
+                    mqtt_publish_track(publish_id, batch[i].PN,
+                                       batch[i].record_id, batch[i].seq_no);
+                    sent++;
+                    vTaskDelay(pdMS_TO_TICKS(MQTT_BACKFILL_BATCH_MS));
+                }
+                else if (publish_id == -2)
+                {
+                    /*
+                     * outbox 预算不足：退避后重试，绝不能 break 退出整个
+                     * 循环——那会让剩余记录滞留直到下次唤醒（旧代码缺陷）。
+                     */
+                    ESP_LOGW(TAG, "Backfill blocked by outbox budget; backoff %u ms",
+                             (unsigned)MQTT_BACKFILL_BACKOFF_MS);
+                    blocked = true;
+                    vTaskDelay(pdMS_TO_TICKS(MQTT_BACKFILL_BACKOFF_MS));
+                    break;
+                }
+                else
+                {
+                    /* 未连接/其他失败：本轮结束，等下次唤醒或兜底扫描。 */
+                    ESP_LOGW(TAG, "Backfill publish failed id=%d rc=%d; retry next scan",
+                             batch[i].seq_no, publish_id);
+                    blocked = true;
+                    break;
+                }
+            }
+
+            if (sent == 0)
+            {
+                break; /* 整批都是坏记录：退出本轮，60 秒后再来 */
+            }
+        }
+    }
+}
+
+BaseType_t app_create_mqtt_backfill_task(void)
+{
+    if (s_mqtt_backfill_task != NULL)
+    {
+        return pdPASS; /* 已创建：复用句柄，不重复建任务 */
+    }
+
+    return create_cpu1_task(mqtt_backfill_task, "mqtt_backfill",
+                            LG_STACK_MQTT_BACKFILL, LG_PRIO_MQTT_BACKFILL,
+                            &s_mqtt_backfill_task);
+}
+
+/* mqtt_app.c 在 MQTT_SETUP_DONE（上线完成）调用：立即触发一次补传扫描。 */
+void app_mqtt_backfill_wake(void)
+{
+    if (s_mqtt_backfill_task != NULL)
+    {
+        xTaskNotifyGive(s_mqtt_backfill_task);
     }
 }
 

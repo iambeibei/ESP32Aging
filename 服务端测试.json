@@ -1,0 +1,611 @@
+[
+  {
+    "id": "ac8c28e4-eb23-44a3-b014-22dced6b935a",
+    "clientId": "mqttx_c1ca70db",
+    "name": "服务端测试",
+    "clean": false,
+    "protocol": "mqtt",
+    "host": "192.168.1.65",
+    "port": 1883,
+    "keepalive": 60,
+    "connectTimeout": 10,
+    "reconnect": true,
+    "reconnectPeriod": 4000,
+    "username": "dev",
+    "password": "123456",
+    "path": "/mqtt",
+    "certType": "",
+    "ssl": false,
+    "mqttVersion": "5.0",
+    "unreadMessageCount": 0,
+    "clientIdWithTime": true,
+    "parentId": null,
+    "orderId": null,
+    "rejectUnauthorized": true,
+    "ALPNProtocols": "",
+    "ca": "",
+    "cert": "",
+    "key": "",
+    "isCollection": false,
+    "createAt": "2026-03-14T01:32:33.587Z",
+    "updateAt": "2026-10-22T01:06:44.780Z",
+    "subscriptions": [
+      {
+        "id": "scription_92594345-74f4-4f0b-a766-3d0d673f9eb3",
+        "topic": "device/#",
+        "qos": 0,
+        "disabled": false,
+        "alias": "客户端",
+        "retain": false,
+        "nl": false,
+        "rap": false,
+        "rh": 0,
+        "subscriptionIdentifier": null,
+        "color": "#A187DD",
+        "createAt": "2026-06-04T01:05:34.549Z",
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a"
+      },
+      {
+        "id": "scription_cb5d305f-da72-41c9-9494-a20e32771581",
+        "topic": "server/#",
+        "qos": 0,
+        "disabled": false,
+        "alias": "服务端",
+        "retain": false,
+        "nl": false,
+        "rap": false,
+        "rh": 0,
+        "subscriptionIdentifier": null,
+        "color": "#98325F",
+        "createAt": "2026-10-20T11:07:02.298Z",
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a"
+      }
+    ],
+    "will": {
+      "id": "12cc4961-1d31-4f67-beb9-64668adf6897",
+      "lastWillTopic": "",
+      "lastWillPayload": "",
+      "lastWillQos": 0,
+      "lastWillRetain": false,
+      "properties": {
+        "willDelayInterval": null,
+        "payloadFormatIndicator": null,
+        "messageExpiryInterval": null,
+        "contentType": "",
+        "responseTopic": "",
+        "correlationData": null
+      }
+    },
+    "properties": {
+      "sessionExpiryInterval": 0,
+      "receiveMaximum": null,
+      "maximumPacketSize": null,
+      "topicAliasMaximum": null,
+      "requestResponseInformation": null,
+      "requestProblemInformation": null,
+      "authenticationMethod": null
+    },
+    "messages": [
+      {
+        "id": "message_e3ed23a7-b05b-475e-9703-6a898745f7b9",
+        "createAt": "2026-10-22 09:06:56:384",
+        "out": false,
+        "payload": "{\"Seq\": 1782373502,\"Data\": {\"PN\": \"AC702336910071810\"}}",
+        "qos": 0,
+        "retain": false,
+        "topic": "server/6/public/cmd/stop_aging",
+        "meta": "{\"msgType\":\"Plaintext\"}",
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a",
+        "properties": {
+          "payloadFormatIndicator": null,
+          "messageExpiryInterval": null,
+          "topicAlias": null,
+          "responseTopic": null,
+          "correlationData": null,
+          "subscriptionIdentifier": null,
+          "contentType": null
+        }
+      },
+      {
+        "id": "message_d64cec44-a255-4ea2-86d2-21cd69a0c82b",
+        "createAt": "2026-10-22 09:06:56:426",
+        "out": true,
+        "payload": "{\"Seq\": 1782373502,\"Data\": {\"PN\": \"AC702336910071810\"}}",
+        "qos": 1,
+        "retain": false,
+        "topic": "server/6/public/cmd/stop_aging",
+        "meta": null,
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a",
+        "properties": {
+          "payloadFormatIndicator": null,
+          "messageExpiryInterval": null,
+          "topicAlias": null,
+          "responseTopic": null,
+          "correlationData": null,
+          "subscriptionIdentifier": null,
+          "contentType": null
+        }
+      },
+      {
+        "id": "message_ab3918b8-6cb4-4d82-9376-62d9777645e3",
+        "createAt": "2026-10-22 09:06:57:036",
+        "out": false,
+        "payload": "{\"Seq\":1792631217,\"Data\":{\"AgingState\":\"agingStop\"}}",
+        "qos": 0,
+        "retain": false,
+        "topic": "device/200000012/event/state",
+        "meta": "{\"msgType\":\"Plaintext\"}",
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a",
+        "properties": {
+          "payloadFormatIndicator": null,
+          "messageExpiryInterval": null,
+          "topicAlias": null,
+          "responseTopic": null,
+          "correlationData": null,
+          "subscriptionIdentifier": null,
+          "contentType": null
+        }
+      },
+      {
+        "id": "message_7ce97c0d-7a46-4e27-a2d7-cae843db53d9",
+        "createAt": "2026-10-22 09:06:57:084",
+        "out": false,
+        "payload": "{\"Seq\":1792631217,\"Data\":{\"AgingState\":\"agingStop\"}}",
+        "qos": 0,
+        "retain": false,
+        "topic": "device/200000007/event/state",
+        "meta": "{\"msgType\":\"Plaintext\"}",
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a",
+        "properties": {
+          "payloadFormatIndicator": null,
+          "messageExpiryInterval": null,
+          "topicAlias": null,
+          "responseTopic": null,
+          "correlationData": null,
+          "subscriptionIdentifier": null,
+          "contentType": null
+        }
+      },
+      {
+        "id": "message_f3413251-53dc-47c5-b680-7febad714fe1",
+        "createAt": "2026-10-22 09:06:57:150",
+        "out": false,
+        "payload": "{\"Seq\":1792631217,\"Data\":{\"AgingState\":\"agingStop\"}}",
+        "qos": 0,
+        "retain": false,
+        "topic": "device/200000014/event/state",
+        "meta": "{\"msgType\":\"Plaintext\"}",
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a",
+        "properties": {
+          "payloadFormatIndicator": null,
+          "messageExpiryInterval": null,
+          "topicAlias": null,
+          "responseTopic": null,
+          "correlationData": null,
+          "subscriptionIdentifier": null,
+          "contentType": null
+        }
+      },
+      {
+        "id": "message_a7b85279-a9f1-4fed-a809-ddbed293f276",
+        "createAt": "2026-10-22 09:06:57:375",
+        "out": false,
+        "payload": "{\"Seq\":1792631217,\"Data\":{\"AgingState\":\"agingStop\"}}",
+        "qos": 0,
+        "retain": false,
+        "topic": "device/200000001/event/state",
+        "meta": "{\"msgType\":\"Plaintext\"}",
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a",
+        "properties": {
+          "payloadFormatIndicator": null,
+          "messageExpiryInterval": null,
+          "topicAlias": null,
+          "responseTopic": null,
+          "correlationData": null,
+          "subscriptionIdentifier": null,
+          "contentType": null
+        }
+      },
+      {
+        "id": "message_21d65172-9a7b-4590-8691-1d055ad5b4b9",
+        "createAt": "2026-10-22 09:06:57:420",
+        "out": false,
+        "payload": "{\"Seq\":1792631218,\"Data\":{\"AgingState\":\"agingStop\"}}",
+        "qos": 0,
+        "retain": false,
+        "topic": "device/200000002/event/state",
+        "meta": "{\"msgType\":\"Plaintext\"}",
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a",
+        "properties": {
+          "payloadFormatIndicator": null,
+          "messageExpiryInterval": null,
+          "topicAlias": null,
+          "responseTopic": null,
+          "correlationData": null,
+          "subscriptionIdentifier": null,
+          "contentType": null
+        }
+      },
+      {
+        "id": "message_ca84cdf6-aa37-4866-98de-0c0a9dd0ad98",
+        "createAt": "2026-10-22 09:06:57:936",
+        "out": false,
+        "payload": "{\"Seq\":1792631218,\"Data\":{\"AgingState\":\"agingStop\"}}",
+        "qos": 0,
+        "retain": false,
+        "topic": "device/200000003/event/state",
+        "meta": "{\"msgType\":\"Plaintext\"}",
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a",
+        "properties": {
+          "payloadFormatIndicator": null,
+          "messageExpiryInterval": null,
+          "topicAlias": null,
+          "responseTopic": null,
+          "correlationData": null,
+          "subscriptionIdentifier": null,
+          "contentType": null
+        }
+      },
+      {
+        "id": "message_ac89b35f-e66a-4b74-92e3-f3f1720cdac6",
+        "createAt": "2026-10-22 09:06:57:979",
+        "out": false,
+        "payload": "{\"Seq\":1792631218,\"Data\":{\"AgingState\":\"agingStop\"}}",
+        "qos": 0,
+        "retain": false,
+        "topic": "device/200000004/event/state",
+        "meta": "{\"msgType\":\"Plaintext\"}",
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a",
+        "properties": {
+          "payloadFormatIndicator": null,
+          "messageExpiryInterval": null,
+          "topicAlias": null,
+          "responseTopic": null,
+          "correlationData": null,
+          "subscriptionIdentifier": null,
+          "contentType": null
+        }
+      },
+      {
+        "id": "message_d8e869f7-945d-40c9-9782-5248cc5b77ed",
+        "createAt": "2026-10-22 09:06:58:256",
+        "out": false,
+        "payload": "{\"Seq\":1792631217,\"Data\":{\"AgingState\":\"agingStop\"}}",
+        "qos": 0,
+        "retain": false,
+        "topic": "device/200000006/event/state",
+        "meta": "{\"msgType\":\"Plaintext\"}",
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a",
+        "properties": {
+          "payloadFormatIndicator": null,
+          "messageExpiryInterval": null,
+          "topicAlias": null,
+          "responseTopic": null,
+          "correlationData": null,
+          "subscriptionIdentifier": null,
+          "contentType": null
+        }
+      },
+      {
+        "id": "message_7fd71ba8-3173-4200-b271-f6ccc25902cd",
+        "createAt": "2026-10-22 09:06:58:431",
+        "out": false,
+        "payload": "{\"Seq\":1792631218,\"Data\":{\"AgingState\":\"agingStop\"}}",
+        "qos": 0,
+        "retain": false,
+        "topic": "device/200000010/event/state",
+        "meta": "{\"msgType\":\"Plaintext\"}",
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a",
+        "properties": {
+          "payloadFormatIndicator": null,
+          "messageExpiryInterval": null,
+          "topicAlias": null,
+          "responseTopic": null,
+          "correlationData": null,
+          "subscriptionIdentifier": null,
+          "contentType": null
+        }
+      },
+      {
+        "id": "message_392239f2-fdcd-46dd-902b-66c28a245515",
+        "createAt": "2026-10-22 09:06:58:474",
+        "out": false,
+        "payload": "{\"Seq\":1792631218,\"Data\":{\"AgingState\":\"agingStop\"}}",
+        "qos": 0,
+        "retain": false,
+        "topic": "device/200000016/event/state",
+        "meta": "{\"msgType\":\"Plaintext\"}",
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a",
+        "properties": {
+          "payloadFormatIndicator": null,
+          "messageExpiryInterval": null,
+          "topicAlias": null,
+          "responseTopic": null,
+          "correlationData": null,
+          "subscriptionIdentifier": null,
+          "contentType": null
+        }
+      },
+      {
+        "id": "message_e343510a-9bc3-4130-9b83-1c8aa55a46cb",
+        "createAt": "2026-10-22 09:06:59:075",
+        "out": false,
+        "payload": "{\"Seq\":1792631218,\"Data\":{\"AgingState\":\"agingStop\"}}",
+        "qos": 0,
+        "retain": false,
+        "topic": "device/200000009/event/state",
+        "meta": "{\"msgType\":\"Plaintext\"}",
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a",
+        "properties": {
+          "payloadFormatIndicator": null,
+          "messageExpiryInterval": null,
+          "topicAlias": null,
+          "responseTopic": null,
+          "correlationData": null,
+          "subscriptionIdentifier": null,
+          "contentType": null
+        }
+      },
+      {
+        "id": "message_1c8d452c-fda2-43cc-b619-8e9a4ba14f9b",
+        "createAt": "2026-10-22 09:07:00:168",
+        "out": false,
+        "payload": "{\"Seq\":1792631218,\"Data\":{\"AgingState\":\"agingStop\"}}",
+        "qos": 0,
+        "retain": false,
+        "topic": "device/200000005/event/state",
+        "meta": "{\"msgType\":\"Plaintext\"}",
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a",
+        "properties": {
+          "payloadFormatIndicator": null,
+          "messageExpiryInterval": null,
+          "topicAlias": null,
+          "responseTopic": null,
+          "correlationData": null,
+          "subscriptionIdentifier": null,
+          "contentType": null
+        }
+      },
+      {
+        "id": "message_58f958a0-1642-4c80-bb42-84d453668cbe",
+        "createAt": "2026-10-22 09:07:00:212",
+        "out": false,
+        "payload": "{\"Seq\":1792631217,\"Data\":{\"AgingState\":\"agingStop\"}}",
+        "qos": 0,
+        "retain": false,
+        "topic": "device/200000017/event/state",
+        "meta": "{\"msgType\":\"Plaintext\"}",
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a",
+        "properties": {
+          "payloadFormatIndicator": null,
+          "messageExpiryInterval": null,
+          "topicAlias": null,
+          "responseTopic": null,
+          "correlationData": null,
+          "subscriptionIdentifier": null,
+          "contentType": null
+        }
+      },
+      {
+        "id": "message_22b25d79-f01e-4bdb-8c5e-dd657eb992b4",
+        "createAt": "2026-10-22 09:07:00:212",
+        "out": false,
+        "payload": "{\"Seq\":1792631218,\"Data\":{\"AgingState\":\"agingStop\"}}",
+        "qos": 0,
+        "retain": false,
+        "topic": "device/200000008/event/state",
+        "meta": "{\"msgType\":\"Plaintext\"}",
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a",
+        "properties": {
+          "payloadFormatIndicator": null,
+          "messageExpiryInterval": null,
+          "topicAlias": null,
+          "responseTopic": null,
+          "correlationData": null,
+          "subscriptionIdentifier": null,
+          "contentType": null
+        }
+      },
+      {
+        "id": "message_c5df593c-00d4-40c9-a086-129cf46381d0",
+        "createAt": "2026-10-22 09:07:00:257",
+        "out": false,
+        "payload": "{\"Seq\":1792631219,\"Data\":{\"AgingState\":\"agingStop\"}}",
+        "qos": 0,
+        "retain": false,
+        "topic": "device/200000011/event/state",
+        "meta": "{\"msgType\":\"Plaintext\"}",
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a",
+        "properties": {
+          "payloadFormatIndicator": null,
+          "messageExpiryInterval": null,
+          "topicAlias": null,
+          "responseTopic": null,
+          "correlationData": null,
+          "subscriptionIdentifier": null,
+          "contentType": null
+        }
+      },
+      {
+        "id": "message_e10f6580-8183-4c96-8c1d-82940294e73b",
+        "createAt": "2026-10-22 09:07:00:403",
+        "out": false,
+        "payload": "{\"Seq\":1792631218,\"Data\":{\"AgingState\":\"agingStop\"}}",
+        "qos": 0,
+        "retain": false,
+        "topic": "device/200000008/event/state",
+        "meta": "{\"msgType\":\"Plaintext\"}",
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a",
+        "properties": {
+          "payloadFormatIndicator": null,
+          "messageExpiryInterval": null,
+          "topicAlias": null,
+          "responseTopic": null,
+          "correlationData": null,
+          "subscriptionIdentifier": null,
+          "contentType": null
+        }
+      },
+      {
+        "id": "message_02c86bbf-1cd2-4375-85da-2fa571272e6c",
+        "createAt": "2026-10-22 09:07:01:222",
+        "out": false,
+        "payload": "{\"Seq\":1792631218,\"Data\":{\"AgingState\":\"agingStop\"}}",
+        "qos": 0,
+        "retain": false,
+        "topic": "device/200000005/event/state",
+        "meta": "{\"msgType\":\"Plaintext\"}",
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a",
+        "properties": {
+          "payloadFormatIndicator": null,
+          "messageExpiryInterval": null,
+          "topicAlias": null,
+          "responseTopic": null,
+          "correlationData": null,
+          "subscriptionIdentifier": null,
+          "contentType": null
+        }
+      },
+      {
+        "id": "message_bb8a9b7a-c22f-42d0-baf7-394130494215",
+        "createAt": "2026-10-22 09:07:01:267",
+        "out": false,
+        "payload": "{\"Seq\":1792631218,\"Data\":{\"AgingState\":\"agingStop\"}}",
+        "qos": 0,
+        "retain": false,
+        "topic": "device/200000005/event/state",
+        "meta": "{\"msgType\":\"Plaintext\"}",
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a",
+        "properties": {
+          "payloadFormatIndicator": null,
+          "messageExpiryInterval": null,
+          "topicAlias": null,
+          "responseTopic": null,
+          "correlationData": null,
+          "subscriptionIdentifier": null,
+          "contentType": null
+        }
+      },
+      {
+        "id": "message_6b41bad4-266e-4158-af57-95298dea6a0b",
+        "createAt": "2026-10-22 09:07:01:429",
+        "out": false,
+        "payload": "{\"Seq\":1792631219,\"Data\":{\"AgingState\":\"agingStop\"}}",
+        "qos": 0,
+        "retain": false,
+        "topic": "device/200000011/event/state",
+        "meta": "{\"msgType\":\"Plaintext\"}",
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a",
+        "properties": {
+          "payloadFormatIndicator": null,
+          "messageExpiryInterval": null,
+          "topicAlias": null,
+          "responseTopic": null,
+          "correlationData": null,
+          "subscriptionIdentifier": null,
+          "contentType": null
+        }
+      },
+      {
+        "id": "message_c02b8bf5-29cb-4a05-ad1d-f8bc13a91f7e",
+        "createAt": "2026-10-22 09:07:01:952",
+        "out": false,
+        "payload": "{\"Seq\":1792631218,\"Data\":{\"AgingState\":\"agingStop\"}}",
+        "qos": 0,
+        "retain": false,
+        "topic": "device/200000013/event/state",
+        "meta": "{\"msgType\":\"Plaintext\"}",
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a",
+        "properties": {
+          "payloadFormatIndicator": null,
+          "messageExpiryInterval": null,
+          "topicAlias": null,
+          "responseTopic": null,
+          "correlationData": null,
+          "subscriptionIdentifier": null,
+          "contentType": null
+        }
+      },
+      {
+        "id": "message_9f4da2f8-fb58-4259-942b-a96b55583448",
+        "createAt": "2026-10-22 09:07:02:034",
+        "out": false,
+        "payload": "{\"Seq\":1792631217,\"Data\":{\"AgingState\":\"agingStop\"}}",
+        "qos": 0,
+        "retain": false,
+        "topic": "device/200000015/event/state",
+        "meta": "{\"msgType\":\"Plaintext\"}",
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a",
+        "properties": {
+          "payloadFormatIndicator": null,
+          "messageExpiryInterval": null,
+          "topicAlias": null,
+          "responseTopic": null,
+          "correlationData": null,
+          "subscriptionIdentifier": null,
+          "contentType": null
+        }
+      },
+      {
+        "id": "message_dfd2fa3c-c4fb-4bc4-bf48-c2c0883979f0",
+        "createAt": "2026-10-22 09:07:03:739",
+        "out": false,
+        "payload": "{\"Seq\":1792631218,\"Data\":{\"AgingState\":\"agingStop\"}}",
+        "qos": 0,
+        "retain": false,
+        "topic": "device/200000013/event/state",
+        "meta": "{\"msgType\":\"Plaintext\"}",
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a",
+        "properties": {
+          "payloadFormatIndicator": null,
+          "messageExpiryInterval": null,
+          "topicAlias": null,
+          "responseTopic": null,
+          "correlationData": null,
+          "subscriptionIdentifier": null,
+          "contentType": null
+        }
+      },
+      {
+        "id": "message_a471f899-c0a7-4cac-b927-1f66c3111c23",
+        "createAt": "2026-10-22 09:07:03:783",
+        "out": false,
+        "payload": "{\"Seq\":1792631218,\"Data\":{\"AgingState\":\"agingStop\"}}",
+        "qos": 0,
+        "retain": false,
+        "topic": "device/200000013/event/state",
+        "meta": "{\"msgType\":\"Plaintext\"}",
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a",
+        "properties": {
+          "payloadFormatIndicator": null,
+          "messageExpiryInterval": null,
+          "topicAlias": null,
+          "responseTopic": null,
+          "correlationData": null,
+          "subscriptionIdentifier": null,
+          "contentType": null
+        }
+      },
+      {
+        "id": "message_de707e24-0a68-431d-a9a2-4144aec2e204",
+        "createAt": "2026-10-22 09:07:03:783",
+        "out": false,
+        "payload": "{\"Seq\":1792631218,\"Data\":{\"AgingState\":\"agingStop\"}}",
+        "qos": 0,
+        "retain": false,
+        "topic": "device/200000013/event/state",
+        "meta": "{\"msgType\":\"Plaintext\"}",
+        "connectionId": "ac8c28e4-eb23-44a3-b014-22dced6b935a",
+        "properties": {
+          "payloadFormatIndicator": null,
+          "messageExpiryInterval": null,
+          "topicAlias": null,
+          "responseTopic": null,
+          "correlationData": null,
+          "subscriptionIdentifier": null,
+          "contentType": null
+        }
+      }
+    ]
+  }
+]

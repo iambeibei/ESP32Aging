@@ -38,6 +38,19 @@ void Config_Report(int cmd_seq);
 
 int publish_device_mode(int mode);
 
+/*
+ * PUBACK/DELETED 结算钩子：由 mqtt_app.c 的 SDK 事件回调调用。
+ * 只做 msg_id 查表与结算入队，绝不在回调（SDK MQTT 任务）上下文
+ * 直接写 SQLite——DB 更新由 mqtt_rx 循环抽干队列时执行。
+ */
+void app_mqtt_publish_settled(int msg_id, bool acked);
+
+/** 创建断线补传任务（幂等：已建则直接成功）。任务上下文调用，非ISR。 */
+BaseType_t app_create_mqtt_backfill_task(void);
+
+/** 唤醒补传扫描：mqtt_app.c 在 MQTT_SETUP_DONE（上线完成）时调用。 */
+void app_mqtt_backfill_wake(void);
+
 
 
 extern bool IsEnc;

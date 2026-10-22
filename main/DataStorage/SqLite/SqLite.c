@@ -45,6 +45,12 @@ static wl_handle_t s_wl_handle = WL_INVALID_HANDLE;
 static SemaphoreHandle_t s_sqlite_mutex = NULL;
 static sqlite3 *s_db = NULL;
 static bool s_db_ready = false;
+/*
+ * v7 新增 record_id 列的运行期探测结果：init 成功后为 true。
+ * false（迁移失败但旧库保留）时查询不带该列，record_id 留空串，
+ * 由补传路径按"旧记录隔离"处理，保证旧库仍可读可用。
+ */
+static bool s_record_id_column_ready = false;
 
 /*
  * 每上电重置守卫：mount 重建分区与 DB 重建各只允许一次，防止"重置后再次
@@ -144,6 +150,14 @@ static void fill_query_result_from_stmt(sqlite3_stmt *stmt, QueryResult *result)
     safe_copy(result->value_data, sizeof(result->value_data), (const char *)value_data);
 
     result->created_at = sqlite3_column_int(stmt, 6);
+
+    /* v7：可选第 8 列 record_id（7 列兼容模式或旧库时留空串）。
+     * 列数守卫保证旧 SELECT 契约（7 列）不受影响。 */
+    if (sqlite3_column_count(stmt) > 7)
+    {
+        const unsigned char *record_id = sqlite3_column_text(stmt, 7);
+        safe_copy(result->record_id, sizeof(result->record_id), (const char *)record_id);
+    }
 
     /* 兼容旧业务字段 */
     result->IDNUM = result->seq_no;
@@ -776,7 +790,7 @@ static int get_user_version(sqlite3 *db)
     return version;
 }
 
-static int create_schema_v6(sqlite3 *db)
+static int create_schema_v7(sqlite3 *db)
 {
     if (db == NULL)
     {
@@ -786,18 +800,23 @@ static int create_schema_v6(sqlite3 *db)
     /*
      * local_id 是数据库内部主键；IDNUM(seq_no)只在同一个PN内唯一。
      * 这修复了“第二台设备IDNUM重新从0开始时覆盖第一台设备记录”的问题。
+     *
+     * v7：唯一键加入 record_id（老化会话身份）。同一 PN 重新开轮时
+     * RecordId 不同 → 写入新行，不再覆盖上一轮记录；补传 JSON 用
+     * 记录自身 record_id，服务端可正确归属轮次。
      */
     int rc = db_exec(db,
                      "CREATE TABLE IF NOT EXISTS " SQLITE_CACHE_TABLE_NAME " ("
                      "local_id INTEGER PRIMARY KEY,"
                      "seq_no INTEGER NOT NULL,"
                      "pn TEXT NOT NULL CHECK(length(pn) < 64),"
+                     "record_id TEXT NOT NULL DEFAULT '' CHECK(length(record_id) < 40),"
                      "current_step INTEGER NOT NULL,"
                      "timestamp INTEGER NOT NULL,"
-                     "pushed INTEGER NOT NULL DEFAULT 0 CHECK(pushed IN (0,1)),"
+                     "pushed INTEGER NOT NULL DEFAULT 0 CHECK(pushed IN (0,1,2)),"
                      "value_data TEXT NOT NULL CHECK(length(CAST(value_data AS BLOB)) <= 2048),"
                      "created_at INTEGER NOT NULL,"
-                     "UNIQUE(pn, seq_no)"
+                     "UNIQUE(pn, record_id, seq_no)"
                      ");");
     if (rc != SQLITE_OK) return rc;
 
@@ -816,10 +835,10 @@ static int create_schema_v6(sqlite3 *db)
                  "ON " SQLITE_CACHE_TABLE_NAME " (pushed, local_id);");
     if (rc != SQLITE_OK) return rc;
 
-    return db_exec(db, "PRAGMA user_version = 6;");
+    return db_exec(db, "PRAGMA user_version = 7;");
 }
 
-static bool sqlite_schema_is_v6(sqlite3 *db)
+static bool sqlite_schema_is_v7(sqlite3 *db)
 {
     if (db == NULL || !sqlite_table_exists(db, SQLITE_CACHE_TABLE_NAME))
     {
@@ -835,6 +854,7 @@ static bool sqlite_schema_is_v6(sqlite3 *db)
         "local_id",
         "seq_no",
         "pn",
+        "record_id",
         "current_step",
         "timestamp",
         "pushed",
@@ -849,43 +869,71 @@ static bool sqlite_schema_is_v6(sqlite3 *db)
         sizeof(required_columns) / sizeof(required_columns[0]));
 }
 
-static int create_v6_temp_table(sqlite3 *db)
+/* v6 基础列（不含 record_id）：用于识别"只差 record_id 一列"的存量 v6 库。 */
+static bool sqlite_schema_is_v6_base(sqlite3 *db)
+{
+    if (db == NULL || !sqlite_table_exists(db, SQLITE_CACHE_TABLE_NAME))
+    {
+        return false;
+    }
+
+    static const char *base_columns[] = {
+        "local_id",
+        "seq_no",
+        "pn",
+        "current_step",
+        "timestamp",
+        "pushed",
+        "value_data",
+        "created_at",
+    };
+
+    return sqlite_table_has_columns(
+        db,
+        SQLITE_CACHE_TABLE_NAME,
+        base_columns,
+        sizeof(base_columns) / sizeof(base_columns[0]));
+}
+
+static int create_v7_temp_table(sqlite3 *db)
 {
     if (db == NULL)
     {
         return SQLITE_MISUSE;
     }
 
-    int rc = db_exec(db, "DROP TABLE IF EXISTS data_cache_v6_tmp;");
+    int rc = db_exec(db, "DROP TABLE IF EXISTS data_cache_v7_tmp;");
     if (rc != SQLITE_OK)
     {
         return rc;
     }
 
     return db_exec(db,
-                   "CREATE TABLE data_cache_v6_tmp ("
+                   "CREATE TABLE data_cache_v7_tmp ("
                    "local_id INTEGER PRIMARY KEY,"
                    "seq_no INTEGER NOT NULL,"
                    "pn TEXT NOT NULL CHECK(length(pn) < 64),"
+                   "record_id TEXT NOT NULL DEFAULT '' CHECK(length(record_id) < 40),"
                    "current_step INTEGER NOT NULL,"
                    "timestamp INTEGER NOT NULL,"
-                   "pushed INTEGER NOT NULL DEFAULT 0 CHECK(pushed IN (0,1)),"
+                   "pushed INTEGER NOT NULL DEFAULT 0 CHECK(pushed IN (0,1,2)),"
                    "value_data TEXT NOT NULL CHECK(length(CAST(value_data AS BLOB)) <= 2048),"
                    "created_at INTEGER NOT NULL,"
-                   "UNIQUE(pn, seq_no)"
+                   "UNIQUE(pn, record_id, seq_no)"
                    ");");
 }
 
 /*
- * v3/v4/v5 的老表都把电池包编号存放在 sn 列；v6 统一改名为 pn。
+ * v3/v4/v5 的老表都把电池包编号存放在 sn 列；v6 统一改名为 pn，v7 增加 record_id。
  * 不使用 ALTER TABLE RENAME：当前嵌入式 SQLite 组件实测
  * ALTER TABLE ... RENAME 可能返回 SQLITE_ERROR，
  * 因此改成事务内“临时表复制 -> 重建主表 -> 回填”。
  *
  * 注意：老表可能带 local_id（v5）也可能不带（v3/v4）。
  * local_id 只是数据库内部主键，重建时重新生成不影响业务数据。
+ * 老记录没有 record_id，重建后留空串，由补传路径按旧记录隔离处理。
  */
-static int migrate_legacy_schema_to_v6(sqlite3 *db)
+static int migrate_legacy_schema_to_v7(sqlite3 *db)
 {
     if (db == NULL)
     {
@@ -921,12 +969,12 @@ static int migrate_legacy_schema_to_v6(sqlite3 *db)
         return rc;
     }
 
-    rc = create_v6_temp_table(db);
+    rc = create_v7_temp_table(db);
     if (rc != SQLITE_OK) goto rollback;
 
-    /* 源列是老表的 sn，目标列是新表的 pn。 */
+    /* 源列是老表的 sn，目标列是新表的 pn；record_id 取默认空串。 */
     rc = db_exec(db,
-                 "INSERT OR REPLACE INTO data_cache_v6_tmp "
+                 "INSERT OR REPLACE INTO data_cache_v7_tmp "
                  "(seq_no, pn, current_step, timestamp, pushed, value_data, created_at) "
                  "SELECT seq_no, sn, current_step, timestamp, pushed, value_data, created_at "
                  "FROM " SQLITE_CACHE_TABLE_NAME " "
@@ -942,12 +990,13 @@ static int migrate_legacy_schema_to_v6(sqlite3 *db)
                  "local_id INTEGER PRIMARY KEY,"
                  "seq_no INTEGER NOT NULL,"
                  "pn TEXT NOT NULL CHECK(length(pn) < 64),"
+                 "record_id TEXT NOT NULL DEFAULT '' CHECK(length(record_id) < 40),"
                  "current_step INTEGER NOT NULL,"
                  "timestamp INTEGER NOT NULL,"
-                 "pushed INTEGER NOT NULL DEFAULT 0 CHECK(pushed IN (0,1)),"
+                 "pushed INTEGER NOT NULL DEFAULT 0 CHECK(pushed IN (0,1,2)),"
                  "value_data TEXT NOT NULL CHECK(length(CAST(value_data AS BLOB)) <= 2048),"
                  "created_at INTEGER NOT NULL,"
-                 "UNIQUE(pn, seq_no)"
+                 "UNIQUE(pn, record_id, seq_no)"
                  ");");
     if (rc != SQLITE_OK) goto rollback;
 
@@ -955,10 +1004,10 @@ static int migrate_legacy_schema_to_v6(sqlite3 *db)
                  "INSERT OR REPLACE INTO " SQLITE_CACHE_TABLE_NAME " "
                  "(seq_no, pn, current_step, timestamp, pushed, value_data, created_at) "
                  "SELECT seq_no, pn, current_step, timestamp, pushed, value_data, created_at "
-                 "FROM data_cache_v6_tmp;");
+                 "FROM data_cache_v7_tmp;");
     if (rc != SQLITE_OK) goto rollback;
 
-    rc = db_exec(db, "DROP TABLE data_cache_v6_tmp;");
+    rc = db_exec(db, "DROP TABLE data_cache_v7_tmp;");
     if (rc != SQLITE_OK) goto rollback;
 
     rc = db_exec(db,
@@ -977,23 +1026,114 @@ static int migrate_legacy_schema_to_v6(sqlite3 *db)
     if (rc != SQLITE_OK) goto rollback;
 
     /* 仅作为版本标记尝试写入；后续启动不依赖它判断 schema。 */
-    (void)db_exec(db, "PRAGMA user_version = 6;");
+    (void)db_exec(db, "PRAGMA user_version = 7;");
 
     rc = db_exec(db, "COMMIT;");
     if (rc == SQLITE_OK)
     {
-        ESP_LOGI(TAG, "SQLite legacy schema migrated to v6 (column sn renamed to pn)");
+        ESP_LOGI(TAG, "SQLite legacy schema migrated to v7 (column sn renamed to pn, record_id added)");
     }
     return rc;
 
 rollback:
     (void)db_exec(db, "ROLLBACK;");
-    ESP_LOGE(TAG, "SQLite legacy schema migration to v6 failed: rc=%d, errmsg=%s",
+    ESP_LOGE(TAG, "SQLite legacy schema migration to v7 failed: rc=%d, errmsg=%s",
              rc, sqlite3_errmsg(db));
     return rc;
 }
 
-static int ensure_schema_v6(sqlite3 *db, int reported_user_version)
+/*
+ * 存量 v6 库（结构完整、只差 record_id 列与轮次唯一键）升级到 v7。
+ * 不能只用 ALTER TABLE ADD COLUMN：唯一键要从 UNIQUE(pn, seq_no) 改为
+ * UNIQUE(pn, record_id, seq_no)，ADD COLUMN 无法修改约束，
+ * 因此沿用“临时表复制 -> 重建主表 -> 回填”的事务模式。
+ * 老记录 record_id 置空串；失败时 ROLLBACK，旧库结构与数据原样保留。
+ */
+static int migrate_v6_to_v7(sqlite3 *db)
+{
+    if (db == NULL)
+    {
+        return SQLITE_MISUSE;
+    }
+
+    int rc = db_exec(db, "BEGIN IMMEDIATE TRANSACTION;");
+    if (rc != SQLITE_OK)
+    {
+        return rc;
+    }
+
+    rc = create_v7_temp_table(db);
+    if (rc != SQLITE_OK) goto rollback;
+
+    rc = db_exec(db,
+                 "INSERT OR REPLACE INTO data_cache_v7_tmp "
+                 "(seq_no, pn, current_step, timestamp, pushed, value_data, created_at) "
+                 "SELECT seq_no, pn, current_step, timestamp, pushed, value_data, created_at "
+                 "FROM " SQLITE_CACHE_TABLE_NAME " "
+                 "WHERE length(pn) < 64 "
+                 "AND length(CAST(value_data AS BLOB)) <= 2048;");
+    if (rc != SQLITE_OK) goto rollback;
+
+    rc = db_exec(db, "DROP TABLE " SQLITE_CACHE_TABLE_NAME ";");
+    if (rc != SQLITE_OK) goto rollback;
+
+    rc = db_exec(db,
+                 "CREATE TABLE " SQLITE_CACHE_TABLE_NAME " ("
+                 "local_id INTEGER PRIMARY KEY,"
+                 "seq_no INTEGER NOT NULL,"
+                 "pn TEXT NOT NULL CHECK(length(pn) < 64),"
+                 "record_id TEXT NOT NULL DEFAULT '' CHECK(length(record_id) < 40),"
+                 "current_step INTEGER NOT NULL,"
+                 "timestamp INTEGER NOT NULL,"
+                 "pushed INTEGER NOT NULL DEFAULT 0 CHECK(pushed IN (0,1,2)),"
+                 "value_data TEXT NOT NULL CHECK(length(CAST(value_data AS BLOB)) <= 2048),"
+                 "created_at INTEGER NOT NULL,"
+                 "UNIQUE(pn, record_id, seq_no)"
+                 ");");
+    if (rc != SQLITE_OK) goto rollback;
+
+    rc = db_exec(db,
+                 "INSERT OR REPLACE INTO " SQLITE_CACHE_TABLE_NAME " "
+                 "(seq_no, pn, current_step, timestamp, pushed, value_data, created_at) "
+                 "SELECT seq_no, pn, current_step, timestamp, pushed, value_data, created_at "
+                 "FROM data_cache_v7_tmp;");
+    if (rc != SQLITE_OK) goto rollback;
+
+    rc = db_exec(db, "DROP TABLE data_cache_v7_tmp;");
+    if (rc != SQLITE_OK) goto rollback;
+
+    rc = db_exec(db,
+                 "CREATE INDEX IF NOT EXISTS idx_cache_pn_seq_v6 "
+                 "ON " SQLITE_CACHE_TABLE_NAME " (pn, seq_no DESC);");
+    if (rc != SQLITE_OK) goto rollback;
+
+    rc = db_exec(db,
+                 "CREATE INDEX IF NOT EXISTS idx_cache_pn_push_seq_v6 "
+                 "ON " SQLITE_CACHE_TABLE_NAME " (pn, pushed, seq_no);");
+    if (rc != SQLITE_OK) goto rollback;
+
+    rc = db_exec(db,
+                 "CREATE INDEX IF NOT EXISTS idx_cache_push_local_v6 "
+                 "ON " SQLITE_CACHE_TABLE_NAME " (pushed, local_id);");
+    if (rc != SQLITE_OK) goto rollback;
+
+    (void)db_exec(db, "PRAGMA user_version = 7;");
+
+    rc = db_exec(db, "COMMIT;");
+    if (rc == SQLITE_OK)
+    {
+        ESP_LOGI(TAG, "SQLite schema migrated v6 -> v7 (record_id column and per-round unique key added)");
+    }
+    return rc;
+
+rollback:
+    (void)db_exec(db, "ROLLBACK;");
+    ESP_LOGE(TAG, "SQLite schema migration v6 -> v7 failed: rc=%d, errmsg=%s",
+             rc, sqlite3_errmsg(db));
+    return rc;
+}
+
+static int ensure_schema_v7(sqlite3 *db, int reported_user_version)
 {
     if (db == NULL)
     {
@@ -1002,32 +1142,46 @@ static int ensure_schema_v6(sqlite3 *db, int reported_user_version)
 
     if (!sqlite_table_exists(db, SQLITE_CACHE_TABLE_NAME))
     {
-        ESP_LOGI(TAG, "SQLite data_cache table does not exist; creating v6 schema");
-        return create_schema_v6(db);
+        ESP_LOGI(TAG, "SQLite data_cache table does not exist; creating v7 schema");
+        return create_schema_v7(db);
     }
 
-    if (sqlite_schema_is_v6(db))
+    if (sqlite_schema_is_v7(db))
     {
         /*
-         * 真实结构已经是 v6。即使 PRAGMA user_version 返回 0 也绝不能迁移。
+         * 真实结构已经是 v7。即使 PRAGMA user_version 返回 0 也绝不能迁移。
          * 只补齐索引并尝试重新写版本标记。
          */
         if (reported_user_version != SQLITE_SCHEMA_VERSION)
         {
             ESP_LOGW(TAG,
-                     "SQLite table structure is already v6 but user_version=%d; "
+                     "SQLite table structure is already v7 but user_version=%d; "
                      "ignoring version mismatch and keeping existing data",
                      reported_user_version);
         }
 
-        return create_schema_v6(db);
+        return create_schema_v7(db);
+    }
+
+    /*
+     * 存量 v6 库：基础列齐全、仅缺 record_id 与轮次唯一键。
+     * 走增量迁移补列，不动 legacy 的老表迁移路径。
+     */
+    if (sqlite_schema_is_v6_base(db) &&
+        !sqlite_table_has_column(db, SQLITE_CACHE_TABLE_NAME, "record_id"))
+    {
+        ESP_LOGW(TAG,
+                 "SQLite v6 table detected (user_version=%d); migrating to v7 "
+                 "(add record_id, per-round unique key)",
+                 reported_user_version);
+        return migrate_v6_to_v7(db);
     }
 
     ESP_LOGW(TAG,
-             "SQLite legacy table detected by schema probe (user_version=%d); migrating to v6",
+             "SQLite legacy table detected by schema probe (user_version=%d); migrating to v7",
              reported_user_version);
 
-    return migrate_legacy_schema_to_v6(db);
+    return migrate_legacy_schema_to_v7(db);
 }
 
 static int get_record_count_locked(int *record_count)
@@ -1148,7 +1302,7 @@ static int init_database_locked(void)
         sqlite_log_table_definition(s_db, SQLITE_CACHE_TABLE_NAME);
     }
 
-    rc = ensure_schema_v6(s_db, version);
+    rc = ensure_schema_v7(s_db, version);
     if (rc != SQLITE_OK)
     {
         ESP_LOGE(TAG,
@@ -1156,6 +1310,19 @@ static int init_database_locked(void)
                  rc,
                  sqlite3_errmsg(s_db));
         goto fail;
+    }
+
+    /*
+     * 迁移成功后再探测一次 record_id 列：为 false 时（理论仅防御路径）
+     * 结构化查询走 7 列兼容模式，旧库仍可读可用。
+     */
+    s_record_id_column_ready =
+        sqlite_table_has_column(s_db, SQLITE_CACHE_TABLE_NAME, "record_id");
+    if (!s_record_id_column_ready)
+    {
+        ESP_LOGW(TAG,
+                 "SQLite record_id column unavailable after schema ensure; "
+                 "queries fall back to 7-column compatibility mode");
     }
 
     rc = sqlite_quick_check(s_db);
@@ -1278,14 +1445,21 @@ static bool sqlite_storage_low_on_free_space(void)
     return free_bytes < DB_MIN_FREE_BYTES;
 }
 
-static int get_existing_local_id_locked(const char *pn, int seq_no, sqlite3_int64 *local_id)
+/*
+ * v7：存在性判断键为 (pn, seq_no, record_id)。
+ * record_id 为空串时退化为旧行为 (pn, seq_no)——兼容尚未开轮的记录。
+ */
+static int get_existing_local_id_locked(const char *pn,
+                                        const char *record_id,
+                                        int seq_no,
+                                        sqlite3_int64 *local_id)
 {
     *local_id = -1;
 
     sqlite3_stmt *stmt = NULL;
     const char *sql =
         "SELECT local_id FROM " SQLITE_CACHE_TABLE_NAME " "
-        "WHERE pn=? AND seq_no=? LIMIT 1;";
+        "WHERE pn=? AND seq_no=? AND record_id=? LIMIT 1;";
 
     int rc = sqlite3_prepare_v2(s_db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK)
@@ -1295,6 +1469,7 @@ static int get_existing_local_id_locked(const char *pn, int seq_no, sqlite3_int6
 
     sqlite3_bind_text(stmt, 1, pn, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, 2, seq_no);
+    sqlite3_bind_text(stmt, 3, record_id != NULL ? record_id : "", -1, SQLITE_TRANSIENT);
 
     rc = sqlite3_step(stmt);
     if (rc == SQLITE_ROW)
@@ -1371,7 +1546,8 @@ int InsertStructuredRecord(int seq_no,
                            int current_step,
                            int timestamp,
                            bool pushed,
-                           const char *value_data)
+                           const char *value_data,
+                           const char *record_id)
 {
     if (seq_no < 0 || pn == NULL || pn[0] == '\0' || value_data == NULL)
     {
@@ -1384,6 +1560,14 @@ int InsertStructuredRecord(int seq_no,
         ESP_LOGE(TAG, "PN length invalid: %u bytes", (unsigned)strlen(pn));
         return -1;
     }
+
+    if (record_id != NULL && strlen(record_id) >= DB_RECORD_ID_MAX_LEN)
+    {
+        ESP_LOGE(TAG, "RecordId length invalid: %u bytes", (unsigned)strlen(record_id));
+        return -1;
+    }
+
+    const char *record_id_value = (record_id != NULL) ? record_id : "";
 
     if (!is_valid_value_data(value_data))
     {
@@ -1413,7 +1597,7 @@ int InsertStructuredRecord(int seq_no,
 
     sqlite3_stmt *stmt = NULL;
     sqlite3_int64 existing_local_id = -1;
-    int existing_rc = get_existing_local_id_locked(pn, seq_no, &existing_local_id);
+    int existing_rc = get_existing_local_id_locked(pn, record_id_value, seq_no, &existing_local_id);
 
     if (existing_rc != SQLITE_OK && existing_rc != SQLITE_NOTFOUND)
     {
@@ -1462,7 +1646,7 @@ int InsertStructuredRecord(int seq_no,
     {
         const char *sql =
             "UPDATE " SQLITE_CACHE_TABLE_NAME " "
-            "SET current_step=?, timestamp=?, pushed=?, value_data=?, created_at=? "
+            "SET current_step=?, timestamp=?, pushed=?, value_data=?, created_at=?, record_id=? "
             "WHERE local_id=?;";
 
         rc = sqlite3_prepare_v2(s_db, sql, -1, &stmt, NULL);
@@ -1477,14 +1661,15 @@ int InsertStructuredRecord(int seq_no,
         sqlite3_bind_int(stmt, 3, pushed ? 1 : 0);
         sqlite3_bind_text(stmt, 4, value_data, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(stmt, 5, created_at);
-        sqlite3_bind_int64(stmt, 6, existing_local_id);
+        sqlite3_bind_text(stmt, 6, record_id_value, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 7, existing_local_id);
     }
     else
     {
         const char *sql =
             "INSERT INTO " SQLITE_CACHE_TABLE_NAME " "
-            "(seq_no, pn, current_step, timestamp, pushed, value_data, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?);";
+            "(seq_no, pn, current_step, timestamp, pushed, value_data, created_at, record_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?);";
 
         rc = sqlite3_prepare_v2(s_db, sql, -1, &stmt, NULL);
         if (rc != SQLITE_OK)
@@ -1500,6 +1685,7 @@ int InsertStructuredRecord(int seq_no,
         sqlite3_bind_int(stmt, 5, pushed ? 1 : 0);
         sqlite3_bind_text(stmt, 6, value_data, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(stmt, 7, created_at);
+        sqlite3_bind_text(stmt, 8, record_id_value, -1, SQLITE_TRANSIENT);
     }
 
     rc = sqlite3_step(stmt);
@@ -1525,9 +1711,10 @@ int InsertStructuredRecord(int seq_no,
     }
 
     ESP_LOGI(TAG,
-             "structured record committed: seq_no=%d, PN=%s, step=%d, timestamp=%d, pushed=%d, value_len=%u",
+             "structured record committed: seq_no=%d, PN=%s, RecordId=%s, step=%d, timestamp=%d, pushed=%d, value_len=%u",
              seq_no,
              pn,
+             record_id_value,
              current_step,
              timestamp,
              pushed ? 1 : 0,
@@ -1552,7 +1739,8 @@ int InsertDataReportValues(int seq_no,
                            int timestamp,
                            bool pushed,
                            const double *values,
-                           int value_count)
+                           int value_count,
+                           const char *record_id)
 {
     if (values == NULL || value_count <= 0 || value_count > DB_VALUE_MAX_COUNT)
     {
@@ -1599,7 +1787,7 @@ int InsertDataReportValues(int seq_no,
         return -1;
     }
 
-    int ret = InsertStructuredRecord(seq_no, pn, current_step, timestamp, pushed, value_json);
+    int ret = InsertStructuredRecord(seq_no, pn, current_step, timestamp, pushed, value_json, record_id);
     free(value_json);
     return ret;
 }
@@ -1608,12 +1796,20 @@ int InsertDataReportValues(int seq_no,
 /* 更新                                                                        */
 /* -------------------------------------------------------------------------- */
 
-int UpdateRecordPushStateByPNAndID(const char *pn, int seq_no, bool pushed)
+/*
+ * push_state 三态（v7）：0=pending 待发；1=inflight 已交 SDK 等 PUBACK；
+ * 2=acked broker 已确认。传 0/1/2 之外的值按 0 处理。
+ * record_id 限定轮次：同一 PN 重开轮后不会误更新上一轮记录。
+ * 传 NULL/空串时退化为旧行为（仅 pn+seq_no）。
+ */
+int UpdateRecordPushStateByPNAndID(const char *pn, const char *record_id, int seq_no, int push_state)
 {
     if (pn == NULL || pn[0] == '\0' || seq_no < 0)
     {
         return -1;
     }
+
+    int state = (push_state == 1 || push_state == 2) ? push_state : 0;
 
     if (!sqlite_lock()) return -1;
     if (!sqlite_ready_locked())
@@ -1624,7 +1820,9 @@ int UpdateRecordPushStateByPNAndID(const char *pn, int seq_no, bool pushed)
 
     sqlite3_stmt *stmt = NULL;
     const char *sql =
-        "UPDATE " SQLITE_CACHE_TABLE_NAME " SET pushed=? WHERE pn=? AND seq_no=?;";
+        (record_id != NULL && record_id[0] != '\0')
+            ? "UPDATE " SQLITE_CACHE_TABLE_NAME " SET pushed=? WHERE pn=? AND seq_no=? AND record_id=?;"
+            : "UPDATE " SQLITE_CACHE_TABLE_NAME " SET pushed=? WHERE pn=? AND seq_no=?;";
 
     int rc = sqlite3_prepare_v2(s_db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK)
@@ -1634,9 +1832,13 @@ int UpdateRecordPushStateByPNAndID(const char *pn, int seq_no, bool pushed)
         return -1;
     }
 
-    sqlite3_bind_int(stmt, 1, pushed ? 1 : 0);
+    sqlite3_bind_int(stmt, 1, state);
     sqlite3_bind_text(stmt, 2, pn, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, 3, seq_no);
+    if (record_id != NULL && record_id[0] != '\0')
+    {
+        sqlite3_bind_text(stmt, 4, record_id, -1, SQLITE_TRANSIENT);
+    }
 
     rc = sqlite3_step(stmt);
     int changed = (rc == SQLITE_DONE) ? sqlite3_changes(s_db) : 0;
@@ -1644,14 +1846,13 @@ int UpdateRecordPushStateByPNAndID(const char *pn, int seq_no, bool pushed)
 
     if (rc != SQLITE_DONE || changed <= 0)
     {
-        ESP_LOGW(TAG, "Push-state update failed/not found: PN=%s seq_no=%d rc=%d",
-                 pn, seq_no, rc);
+        ESP_LOGW(TAG, "Push-state update failed/not found: PN=%s seq_no=%d state=%d rc=%d",
+                 pn, seq_no, state, rc);
         sqlite_unlock();
         return -1;
     }
 
-    ESP_LOGI(TAG, "Push-state updated: PN=%s seq_no=%d pushed=%d",
-             pn, seq_no, pushed ? 1 : 0);
+    ESP_LOGI(TAG, "Push-state updated: PN=%s seq_no=%d state=%d", pn, seq_no, state);
     sqlite_unlock();
     return 0;
 }
@@ -1693,6 +1894,21 @@ int UpdateRecordPushState(int seq_no, bool pushed)
 /* -------------------------------------------------------------------------- */
 /* 查询                                                                        */
 /* -------------------------------------------------------------------------- */
+
+/*
+ * 结构化查询列清单：record_id 列可用时作为第 8 列返回。
+ * 调用方用 snprintf 拼完整 SQL（缓冲区 >= 256 字节）；
+ * fill_query_result_from_stmt 按列数守卫读取，7 列旧库自动兼容。
+ */
+static const char *structured_select_columns(void)
+{
+    static const char with_record_id[] =
+        "SELECT seq_no, pn, current_step, timestamp, pushed, value_data, created_at, record_id ";
+    static const char without_record_id[] =
+        "SELECT seq_no, pn, current_step, timestamp, pushed, value_data, created_at ";
+
+    return s_record_id_column_ready ? with_record_id : without_record_id;
+}
 
 static int query_one_locked(const char *sql,
                             const char *pn,
@@ -1755,10 +1971,12 @@ int QueryStructuredRecordLatestByPN(const char *pn, QueryResult *out_result)
         return -1;
     }
 
-    const char *sql =
-        "SELECT seq_no, pn, current_step, timestamp, pushed, value_data, created_at "
-        "FROM " SQLITE_CACHE_TABLE_NAME " "
-        "WHERE pn=? ORDER BY seq_no DESC, local_id DESC LIMIT 1;";
+    char sql[256];
+    (void)snprintf(sql, sizeof(sql),
+                   "%s"
+                   "FROM " SQLITE_CACHE_TABLE_NAME " "
+                   "WHERE pn=? ORDER BY seq_no DESC, local_id DESC LIMIT 1;",
+                   structured_select_columns());
 
     int ret = query_one_locked(sql, pn, -1, -1, out_result);
     if (ret == 0)
@@ -1788,10 +2006,12 @@ int QueryStructuredRecordBySeq(int seq_no, QueryResult *out_result)
     }
 
     /* legacy：跨PN时返回最近插入的同seq_no记录。 */
-    const char *sql =
-        "SELECT seq_no, pn, current_step, timestamp, pushed, value_data, created_at "
-        "FROM " SQLITE_CACHE_TABLE_NAME " "
-        "WHERE seq_no=? ORDER BY local_id DESC LIMIT 1;";
+    char sql[256];
+    (void)snprintf(sql, sizeof(sql),
+                   "%s"
+                   "FROM " SQLITE_CACHE_TABLE_NAME " "
+                   "WHERE seq_no=? ORDER BY local_id DESC LIMIT 1;",
+                   structured_select_columns());
 
     int ret = query_one_locked(sql, NULL, seq_no, -1, out_result);
     sqlite_unlock();
@@ -1837,11 +2057,13 @@ int QueryStructuredRecordsByPNAndPushState(const char *pn,
         return -1;
     }
 
-    const char *sql =
-        "SELECT seq_no, pn, current_step, timestamp, pushed, value_data, created_at "
-        "FROM " SQLITE_CACHE_TABLE_NAME " "
-        "WHERE pn=? AND pushed=? "
-        "ORDER BY seq_no ASC, local_id ASC LIMIT ?;";
+    char sql[256];
+    (void)snprintf(sql, sizeof(sql),
+                   "%s"
+                   "FROM " SQLITE_CACHE_TABLE_NAME " "
+                   "WHERE pn=? AND pushed=? "
+                   "ORDER BY seq_no ASC, local_id ASC LIMIT ?;",
+                   structured_select_columns());
 
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(s_db, sql, -1, &stmt, NULL);
@@ -1893,11 +2115,13 @@ int QueryLatestRecordByPNAndPushState(const char *pn,
     }
 
     /* 补发按IDNUM从小到大，避免乱序。 */
-    const char *sql =
-        "SELECT seq_no, pn, current_step, timestamp, pushed, value_data, created_at "
-        "FROM " SQLITE_CACHE_TABLE_NAME " "
-        "WHERE pn=? AND pushed=? "
-        "ORDER BY seq_no ASC, local_id ASC LIMIT 1;";
+    char sql[256];
+    (void)snprintf(sql, sizeof(sql),
+                   "%s"
+                   "FROM " SQLITE_CACHE_TABLE_NAME " "
+                   "WHERE pn=? AND pushed=? "
+                   "ORDER BY seq_no ASC, local_id ASC LIMIT 1;",
+                   structured_select_columns());
 
     int ret = query_one_locked(sql, pn, -1, pushed ? 1 : 0, out_result);
     sqlite_unlock();
@@ -1921,10 +2145,26 @@ int QueryUnpushedRecords(QueryResult *out_array, int max_count, int *out_count)
         return -1;
     }
 
-    const char *sql =
-        "SELECT seq_no, pn, current_step, timestamp, pushed, value_data, created_at "
-        "FROM " SQLITE_CACHE_TABLE_NAME " "
-        "WHERE pushed=0 ORDER BY local_id ASC LIMIT ?;";
+    /*
+     * 契约（v7）：只返回"可补传"的待发记录——
+     *   - pushed=0（pending；inflight/acked 不重传）；
+     *   - record_id 非空（迁移前历史记录无法归属轮次，补发即串批）；
+     *   - value_data 非空（空值无法重构上报 JSON）。
+     * 坏记录被此过滤挡在扫描外，不会每轮顶住队列头部饿死后续数据；
+     * 它们由缓存淘汰（pushed=0 最后淘汰）或 AgingDataCheck 退休。
+     * record_id 列不可用（防御路径）时退化为仅 pushed=0。
+     */
+    const char *filter = s_record_id_column_ready
+        ? "WHERE pushed=0 AND length(record_id) > 0 AND length(value_data) > 0 "
+        : "WHERE pushed=0 ";
+
+    char sql[256];
+    (void)snprintf(sql, sizeof(sql),
+                   "%s"
+                   "FROM " SQLITE_CACHE_TABLE_NAME " "
+                   "%s"
+                   "ORDER BY local_id ASC LIMIT ?;",
+                   structured_select_columns(), filter);
 
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(s_db, sql, -1, &stmt, NULL);
@@ -2040,7 +2280,7 @@ static int serialize_value_array_for_storage(cJSON *value_item,
     return 0;
 }
 
-int InsertJsonRecord(int seq_no, const char *pn, bool pushed, const char *json_data)
+int InsertJsonRecord(int seq_no, const char *pn, bool pushed, const char *json_data, const char *record_id)
 {
     if (json_data == NULL)
     {
@@ -2102,7 +2342,8 @@ int InsertJsonRecord(int seq_no, const char *pn, bool pushed, const char *json_d
                                      final_step,
                                      final_timestamp,
                                      pushed,
-                                     value_data);
+                                     value_data,
+                                     record_id);
     cJSON_Delete(root);
     return ret;
 }

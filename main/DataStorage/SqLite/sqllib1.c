@@ -180,8 +180,12 @@ int db_build_data_report_json(const QueryResult *record,
     cJSON_AddNumberToObject(data, "IDNUM", record->seq_no);
     cJSON_AddNumberToObject(data, "TIMESTAMP", record->timestamp);
     cJSON_AddStringToObject(data, "PN", record->PN);
-    cJSON_AddStringToObject(data, "RecordId", RecordId);
-    cJSON_AddNumberToObject(data, "CurrentStep", record->current_step);
+    /* 必须用采样时固化的 record_id：全局 RecordId 在补传时可能已属于
+     * 下一个老化会话，跨 PN 补发会把旧数据挂到新会话上（串批）。 */
+    cJSON_AddStringToObject(data, "RecordId", record->record_id);
+    /* CurrentStep 与实时上报路径（Json_data.c create_sensor_json 的 current_step+1）
+     * 保持一致：协议为 1 基，数据库存 0 基。 */
+    cJSON_AddNumberToObject(data, "CurrentStep", record->current_step + 1);
     cJSON_AddItemToObject(data, "Value", value_array);
 
     char *json = cJSON_PrintUnformatted(root);
@@ -226,9 +230,16 @@ static void fill_query_result_from_stmt(sqlite3_stmt *stmt, QueryResult *result)
 
     result->created_at = sqlite3_column_int(stmt, 6);
 
+    /* v7：可选第 8 列 record_id（旧 7 列查询保持兼容，留空串）。 */
+    if (sqlite3_column_count(stmt) > 7)
+    {
+        const unsigned char *record_id = sqlite3_column_text(stmt, 7);
+        safe_copy(result->record_id, sizeof(result->record_id), (const char *)record_id);
+    }
+
     /* legacy compatibility */
     result->IDNUM = result->seq_no;
-    
+
 
     (void)db_build_data_report_json(result, result->json_data, sizeof(result->json_data));
 }
@@ -300,6 +311,7 @@ int db_exec(sqlite3 *db, const char *sql)
  * 通用查询函数。
  * 传入 SQL 必须按如下列顺序返回：
  *   seq_no, pn, current_step, timestamp, pushed, value_data, created_at
+ * 可选第 8 列 record_id（v7 schema；缺省时按空串处理）。
  */
 int db_query_to_variable(sqlite3 *db, const char *sql, QueryResult *result)
 {

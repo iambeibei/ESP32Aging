@@ -25,29 +25,41 @@ static esp_mqtt_client_handle_t s_client = NULL;
 static unsigned s_client_start_count;
 static unsigned s_mqtt_connect_count;
 
-static QueueHandle_t Topic_queue = NULL;
 static QueueHandle_t Data_queue = NULL;
 
-#define MQTT_TOPIC_QUEUE_LEN 10
-#define MQTT_DATA_QUEUE_LEN 10
+/*
+ * 统一消息封装：topic 只随首片数据一起入队，与 payload 同队同序。
+ * 取代旧双 FIFO（Topic_queue + Data_queue），从结构上消除两类缺陷：
+ *  - 任一侧溢出留下孤立项（topic 入队成功而数据被丢，或反之）；
+ *  - JSON/Seq 非法时消费端不取 topic，导致后续命令错配到旧 topic。
+ * QoS 1 订阅下 Broker 会持续重投直到 PUBACK，队列满又静默丢弃会把
+ * "可观测的丢"变成"观测不到的丢"，因此深度按批量下发峰值取 32。
+ * 内存：单槽约 1.1KB（含 topic 字段），32 槽约 35KB 内部 RAM。
+ */
+#define MQTT_DATA_QUEUE_LEN 32
 #define MQTT_TOPIC_ITEM_CAPACITY 64
 #define MQTT_DATA_ITEM_CAPACITY 1024
 
-typedef struct
-{
-    uint16_t len;
-    char data[MQTT_TOPIC_ITEM_CAPACITY];
-} mqtt_topic_msg_t;
+/*
+ * 下行订阅 QoS（v：可靠性改造）。全部存活订阅统一请求 QoS1；
+ * SUBACK 校验（MQTT_EVENT_SUBSCRIBED）必须确认实际授予值等于本宏，
+ * 只判 <=2 会让 Broker 静默降级为 QoS0——改了等于没改，且日志看起来
+ * 一切正常。降级时订阅判失败，由 mqtt_setup_retry 重试（响亮失败）。
+ */
+#define MQTT_SUBSCRIBE_QOS 1
 
 typedef struct
 {
     uint16_t len;
+    char topic[MQTT_TOPIC_ITEM_CAPACITY]; /* 仅首片携带；后续分片为空串 */
     char data[MQTT_DATA_ITEM_CAPACITY];
 } mqtt_data_msg_t;
 
 static atomic_bool s_mqtt_connected;
 static atomic_uint s_deleted_count;
 static atomic_uint s_rejected_count;
+/* 接收队列满计数：入队失败即丢消息（SDK 仍会回 PUBACK），必须可观测。 */
+static atomic_uint s_queue_overflow_count;
 static atomic_uint s_last_outbox_bytes;
 
 /* 根/子节点保活均为60秒。多跳抖动由恢复调度处理，保活时间不代替拥塞控制。 */
@@ -514,8 +526,14 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
         unsigned expected = s_service_ack.subscribe_count;
         portEXIT_CRITICAL(&s_mqtt_state_lock);
         accepted = accepted && event->data_len == expected;
+        /*
+         * 严格校验：请求 QoS1 时必须确认 Broker 真的授予了 1。
+         * 旧逻辑 <=2U 把降级授予 0 也算成功——那会让"切 QoS1"看起来
+         * 生效实则静默降级。任一条 filter 被降级即整批判失败，走上线
+         * 重试（MQTT_SETUP_SUBSCRIBE → mqtt_setup_retry），可观测。
+         */
         for (int i = 0; i < event->data_len && accepted; ++i)
-            accepted = (uint8_t)event->data[i] <= 2U;
+            accepted = ((uint8_t)event->data[i] == MQTT_SUBSCRIBE_QOS);
         mqtt_service_ack_event(event, accepted ? MQTT_ACK_SUBSCRIBED : MQTT_ACK_REJECTED);
         break;
     }
@@ -529,11 +547,16 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
     case MQTT_EVENT_PUBLISHED:
     {
         mqtt_service_ack_event(event, MQTT_ACK_PUBLISHED);
+        /* 业务发布确认（PUBACK）：appTask 按 msg_id 结算 pushed=acked。
+         * 钩子只入队，不写 DB——SDK 任务上下文禁止 SQLite 提交。 */
+        app_mqtt_publish_settled(event->msg_id, true);
         break;
     }
 
     case MQTT_EVENT_DELETED:
         mqtt_service_ack_event(event, MQTT_ACK_DELETED);
+        /* outbox 淘汰/过期：回滚 inflight → pending，等补传 worker 重试。 */
+        app_mqtt_publish_settled(event->msg_id, false);
         /* 汇总诊断在服务任务输出，回调不递归发布日志。 */
         atomic_fetch_add(&s_deleted_count, 1);
         break;
@@ -547,7 +570,7 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
                  event->current_data_offset,
                  event->total_data_len);
 
-        if (Topic_queue == NULL || Data_queue == NULL)
+        if (Data_queue == NULL)
         {
             ESP_LOGE(TAG, "MQTT receive queue is not initialized");
             break;
@@ -559,34 +582,10 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
          * JSON string values.
          *
          * ESP-MQTT may deliver one publish in multiple MQTT_EVENT_DATA callbacks.
-         * Only enqueue the topic for the first fragment; data fragments are
-         * accumulated by app_MQTT_Rdata_handle().
+         * Unified message: the topic rides on the first fragment (offset==0) of the
+         * same message, so topic and payload can never be paired with the wrong
+         * message. Fragments are accumulated by app_MQTT_Rdata_handle().
          */
-        if (event->current_data_offset == 0 && event->topic != NULL && event->topic_len > 0)
-        {
-            mqtt_topic_msg_t topic_msg = {0};
-            size_t topic_len = (size_t)event->topic_len;
-
-            if (topic_len >= MQTT_TOPIC_ITEM_CAPACITY)
-            {
-                ESP_LOGE(TAG,
-                         "MQTT topic is too long: %u, capacity=%u",
-                         (unsigned)topic_len,
-                         (unsigned)(MQTT_TOPIC_ITEM_CAPACITY - 1));
-                break;
-            }
-
-            memcpy(topic_msg.data, event->topic, topic_len);
-            topic_msg.data[topic_len] = '\0';
-            topic_msg.len = (uint16_t)topic_len;
-
-            if (xQueueSend(Topic_queue, &topic_msg, pdMS_TO_TICKS(100)) != pdTRUE)
-            {
-                ESP_LOGE(TAG, "Failed to enqueue MQTT topic");
-                break;
-            }
-        }
-
         int remaining = event->data_len;
         int offset = 0;
         int send_count = 0;
@@ -603,12 +602,29 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
             memcpy(data_msg.data, event->data + offset, (size_t)chunk_size);
             data_msg.len = (uint16_t)chunk_size;
 
+            if (send_count == 0 && event->topic != NULL && event->topic_len > 0)
+            {
+                size_t topic_len = (size_t)event->topic_len;
+                if (topic_len >= MQTT_TOPIC_ITEM_CAPACITY)
+                {
+                    ESP_LOGE(TAG,
+                             "MQTT topic is too long: %u, capacity=%u; whole message dropped",
+                             (unsigned)topic_len,
+                             (unsigned)(MQTT_TOPIC_ITEM_CAPACITY - 1));
+                    break;
+                }
+                memcpy(data_msg.topic, event->topic, topic_len);
+                data_msg.topic[topic_len] = '\0';
+            }
+
             if (xQueueSend(Data_queue, &data_msg, pdMS_TO_TICKS(100)) != pdTRUE)
             {
+                atomic_fetch_add(&s_queue_overflow_count, 1);
                 ESP_LOGE(TAG,
-                         "Failed to enqueue MQTT data fragment %d, len=%d",
+                         "Failed to enqueue MQTT data fragment %d, len=%d, queue_overflow_total=%u",
                          send_count + 1,
-                         chunk_size);
+                         chunk_size,
+                         (unsigned)atomic_load(&s_queue_overflow_count));
                 break;
             }
 
@@ -893,6 +909,11 @@ static int mqtt_enqueue_for_session(const char *topic, const char *payload, uint
     return result;
 }
 
+bool app_mqtt_is_connected(void)
+{
+    return atomic_load(&s_mqtt_connected);
+}
+
 int app_mqtt_publish(char *topic_name, char *publish_string, char *device_id)
 {
     if (topic_name == NULL || publish_string == NULL) return -1;
@@ -985,6 +1006,12 @@ static uint8_t mqtt_ack_result(uint32_t epoch)
 /* 生命周期锁由调用者持有。SDK subscribe 写入可能阻塞，回调不获取本锁。 */
 static int mqtt_restore_subscriptions(uint32_t epoch)
 {
+    /*
+     * 下行命令必须 QoS1：QoS0 下命令可静默丢失，服务端只能等超时。
+     * 与 SUBACK 严格校验共用此宏，避免两处不一致。
+     * 前置条件（实施顺序硬约束）：接收队列加深与统一消息封装必须已生效，
+     * 否则 QoS1 的重投会把"可观测的丢"放大为"静默丢 + 重传风暴"。
+     */
     static const struct { const char *format; bool rack; } common[] = {
         {"server/%s/cmd/ota", false}, {"server/rack/%s/CanRestart", true},
         {"server/%s/cmd/set_config", false}, {"server/%s/cmd/get_config", false},
@@ -1002,20 +1029,20 @@ static int mqtt_restore_subscriptions(uint32_t epoch)
         int n = snprintf(names[count], sizeof(names[count]), common[i].format,
                          common[i].rack ? AgingNumber : DEVICE_ID);
         if (n < 0 || n >= sizeof(names[count])) return -1;
-        topics[count] = (esp_mqtt_topic_t){.filter = names[count], .qos = 0};
+        topics[count] = (esp_mqtt_topic_t){.filter = names[count], .qos = MQTT_SUBSCRIBE_QOS};
         count++;
     }
     if (IsRoot == 1) {
         int n = snprintf(names[count], sizeof(names[count]), "server/%s/cmd/CPower", DEVICE_ID);
         if (n < 0 || n >= sizeof(names[count])) return -1;
-        topics[count] = (esp_mqtt_topic_t){.filter = names[count], .qos = 0};
+        topics[count] = (esp_mqtt_topic_t){.filter = names[count], .qos = MQTT_SUBSCRIBE_QOS};
         count++;
     } else {
         for (unsigned i = 0; i < sizeof(child) / sizeof(child[0]); ++i) {
             int n = snprintf(names[count], sizeof(names[count]), child[i].format,
                              child[i].rack ? AgingNumber : DEVICE_ID);
             if (n < 0 || n >= sizeof(names[count])) return -1;
-            topics[count] = (esp_mqtt_topic_t){.filter = names[count], .qos = 0};
+            topics[count] = (esp_mqtt_topic_t){.filter = names[count], .qos = MQTT_SUBSCRIBE_QOS};
             count++;
         }
     }
@@ -1180,8 +1207,10 @@ static void mqtt_service_poll(void)
                 atomic_fetch_add(&s_rejected_count, 1);
                 ESP_LOGE(TAG, "MQTT config exceeds budget; full payload rejected, bytes=%u", (unsigned)strlen(json));
                 work->phase = MQTT_SETUP_DONE;
+                app_mqtt_backfill_wake(); /* 上线完成：触发断线补传扫描 */
             } else if (mqtt_enqueue_for_session(topic, json, epoch, false) > 0) {
                 work->phase = MQTT_SETUP_DONE;
+                app_mqtt_backfill_wake(); /* 上线完成：触发断线补传扫描 */
             } else mqtt_setup_retry(work, now);
         } else mqtt_setup_retry(work, now);
         free(json);
@@ -1209,23 +1238,35 @@ static void mqtt_runtime_poll(void)
 void mqtt_app_service_task(void *arg)
 {
     TickType_t last_diagnostic = xTaskGetTickCount();
-    unsigned last_rejected = 0, last_deleted = 0;
+    unsigned last_rejected = 0, last_deleted = 0, last_overflow = 0;
     for (;;) {
         mqtt_service_poll();
         mqtt_runtime_poll();
         TickType_t now = xTaskGetTickCount();
         if (now - last_diagnostic >= pdMS_TO_TICKS(10000)) {
             unsigned rejected = atomic_load(&s_rejected_count), deleted = atomic_load(&s_deleted_count);
-            if (rejected != last_rejected || deleted != last_deleted)
-                ESP_LOGW(TAG, "MQTT pressure: rejected=%u expired=%u last_outbox_bytes=%u",
-                         rejected, deleted, atomic_load(&s_last_outbox_bytes));
+            unsigned overflow = atomic_load(&s_queue_overflow_count);
+            if (rejected != last_rejected || deleted != last_deleted || overflow != last_overflow)
+                ESP_LOGW(TAG, "MQTT pressure: rejected=%u expired=%u queue_overflow=%u last_outbox_bytes=%u",
+                         rejected, deleted, overflow, atomic_load(&s_last_outbox_bytes));
             last_rejected = rejected;
             last_deleted = deleted;
+            last_overflow = overflow;
             last_diagnostic = now;
         }
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(MQTT_SERVICE_POLL_MS));
     }
 }
+
+/*
+ * 统一消息封装的消费端暂存区：topic 由数据首片携带，app_read_MQTT_data
+ * 取出首片时在此暂存，app_read_MQTT_topic 随后取用。二者被同一任务
+ * （mqtt_rx）顺序调用，单写者单读者，无需同步原语。
+ * 暂存区永不过期匹配：新消息的首片会覆盖旧暂存值，因此旧 topic 不可能
+ * 与后续命令的 payload 错配（旧双 FIFO 的根因）。
+ */
+static char s_pending_topic[MQTT_TOPIC_ITEM_CAPACITY];
+static bool s_pending_topic_valid;
 
 int app_read_MQTT_topic(char *topic_buffer, int buffer_len, uint32_t timeout)
 {
@@ -1235,28 +1276,29 @@ int app_read_MQTT_topic(char *topic_buffer, int buffer_len, uint32_t timeout)
         return -1;
     }
 
-    if (Topic_queue == NULL)
+    (void)timeout; /* topic 与数据同源，无需独立等待 */
+
+    if (!s_pending_topic_valid)
     {
-        ESP_LOGE(TAG, "Topic queue not initialized");
+        /*
+         * 当前没有与数据配对的主题：对应消息的首片在入队前已被丢弃
+         * （队列满/topic 超长）。返回 -1 让调用方按不可路由处理，
+         * 绝不去猜一条旧主题——那正是旧双 FIFO 错配的成因。
+         */
         return -1;
     }
 
-    mqtt_topic_msg_t msg = {0};
-    if (xQueueReceive(Topic_queue, &msg, timeout) != pdTRUE)
-    {
-        return -1;
-    }
-
-    size_t copy_len = msg.len;
+    size_t copy_len = strlen(s_pending_topic);
     if (copy_len > (size_t)(buffer_len - 1))
     {
         copy_len = (size_t)(buffer_len - 1);
         ESP_LOGW(TAG, "MQTT topic truncated from %u to %u bytes",
-                 (unsigned)msg.len, (unsigned)copy_len);
+                 (unsigned)strlen(s_pending_topic), (unsigned)copy_len);
     }
 
-    memcpy(topic_buffer, msg.data, copy_len);
+    memcpy(topic_buffer, s_pending_topic, copy_len);
     topic_buffer[copy_len] = '\0';
+    s_pending_topic_valid = false;
     return (int)copy_len;
 }
 
@@ -1280,6 +1322,19 @@ int app_read_MQTT_data(char *data_buffer, int buffer_len, uint32_t timeout)
         return -1;
     }
 
+    /* 首片携带 topic：先暂存供 app_read_MQTT_topic 取用（同队同序，必然配对）。 */
+    if (msg.topic[0] != '\0')
+    {
+        size_t topic_len = strlen(msg.topic);
+        if (topic_len >= sizeof(s_pending_topic))
+        {
+            topic_len = sizeof(s_pending_topic) - 1;
+        }
+        memcpy(s_pending_topic, msg.topic, topic_len);
+        s_pending_topic[topic_len] = '\0';
+        s_pending_topic_valid = true;
+    }
+
     size_t copy_len = msg.len;
     if (copy_len > (size_t)(buffer_len - 1))
     {
@@ -1296,16 +1351,6 @@ int app_read_MQTT_data(char *data_buffer, int buffer_len, uint32_t timeout)
 static esp_err_t mqtt_init_locked(void)
 {
     /* Allow repeated initialization calls without leaking or replacing queues. */
-    if (Topic_queue == NULL)
-    {
-        Topic_queue = xQueueCreate(MQTT_TOPIC_QUEUE_LEN, sizeof(mqtt_topic_msg_t));
-        if (Topic_queue == NULL)
-        {
-            ESP_LOGE(TAG, "Failed to create Topic_queue");
-            return ESP_ERR_NO_MEM;
-        }
-    }
-
     if (Data_queue == NULL)
     {
         Data_queue = xQueueCreate(MQTT_DATA_QUEUE_LEN, sizeof(mqtt_data_msg_t));

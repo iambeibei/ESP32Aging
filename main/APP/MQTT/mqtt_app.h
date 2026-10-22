@@ -17,6 +17,9 @@ void mqtt_app_service_task(void *arg);
 /** 返回 >=0 表示接受（QoS0 为0）；-2容量不足，-1其他失败，不表示服务器落库。 */
 int app_mqtt_publish(char *topic_name, char *publish_string, char *UDP_ID);
 
+/** 当前是否已连接 Broker（原子读，供补传 worker 等轮询方使用）。 */
+bool app_mqtt_is_connected(void);
+
 esp_err_t mqtt_init(void);
 
 /** 根节点上行变化回调：提交最新出口，不阻塞、不重建客户端。仅任务上下文，非ISR。 */
