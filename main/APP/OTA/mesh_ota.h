@@ -22,6 +22,9 @@
  *
  * 可靠性补偿（无外网兜底后的必要措施）：
  *   - 失败有限重试：最多 2 次、间隔 90 秒；子复用首次 metadata/size；
+ *   - 子节点父链路/IP 中断取消未完成写入，进入 WAIT_PARENT 保留本次启动内任务；
+ *     旧 SDK 传输结束且重新取得 IP 稳定 10s 后，随机 0..3s 从头获取原目标文件。
+ *     等待父节点不消耗上述重试次数；MQTT 单独断开不取消，已就绪镜像不重下。
  *   - 根下载期间 pause/restart 让子节点请求在库内排队。
  *   升级时序由上位机分级下发控制（先根 READY，再逐层下发子节点），
  *   设备侧不做层级错峰（2026-10-20 移除）；服务器若同时全层下发，子首次
@@ -65,12 +68,18 @@ esp_err_t mesh_ota_init(void);
  */
 void mesh_ota_handle_mqtt_command(void);
 
+/** 子节点父链路/IP 状态通知；GOT_IP=true，STA_DISCONNECTED/LOST_IP=false。
+ * 默认事件任务调用，短临界区保存状态并唤醒服务任务，不等待 OTA 锁、不执行 Flash 操作。
+ * 可早于本模块初始化调用；根节点忽略。仅已收到 OTA 命令的未完成任务会自动恢复。
+ * 接收期间断链立即禁止后续写入，旧 SDK 传输终态到达后才能重新请求。非 ISR。 */
+void mesh_ota_parent_link_changed(bool has_ip);
+
 /**
  * @brief 查询 OTA 状态（透传 ota.c 状态机当前值）
  *
  * 调用上下文：任意任务；无阻塞。
  *
- * @return 当前 simple_ota_state_t（IDLE/RUNNING/PENDING_RESTART/FAILED）
+ * @return 当前 simple_ota_state_t（IDLE/RUNNING/PENDING_RESTART/FAILED/WAIT_PARENT）
  */
 simple_ota_state_t mesh_ota_get_state(void);
 

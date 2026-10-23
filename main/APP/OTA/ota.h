@@ -38,6 +38,8 @@ extern "C" {
  *   IDLE --OTA命令--> RUNNING --校验/持久化/设置启动成功--> PENDING_RESTART
  *                        |                （无需升级/版本不新）--> IDLE
  *                        +--任何失败--> FAILED（可再次收到命令重试）
+ *   子节点未完成任务 --父链路/IP中断--> WAIT_PARENT --连接稳定且库旧传输结束--> RUNNING
+ *   WAIT_PARENT 的升级意图仅保存在本次启动的 RAM 中，不提供整机重启后的未完成下载恢复。
  *
  * PENDING_RESTART 表示新固件已写入非运行槽并设为启动分区，
  * 重启后即运行新固件；重启由外部触发（MQTT CanRestart 命令等），
@@ -48,6 +50,7 @@ typedef enum {
     SIMPLE_OTA_STATE_RUNNING,            /**< 检查/下载/校验或持久化收尾进行中 */
     SIMPLE_OTA_STATE_PENDING_RESTART,    /**< 下载完成，等待外部触发重启 */
     SIMPLE_OTA_STATE_FAILED,             /**< 本次检查/下载失败 */
+    SIMPLE_OTA_STATE_WAIT_PARENT,        /**< 本次 OTA 因父链路中断取消，保留任务等待重新下载 */
 } simple_ota_state_t;
 
 /**

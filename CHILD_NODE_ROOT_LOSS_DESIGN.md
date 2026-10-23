@@ -152,8 +152,8 @@ appTask.c:4982），根恢复后经 SDK 重连 + 补发路径收回。
 
 ### 6.3 无法源码修复的次要风险（闭源库）
 
-- `sdkconfig.defaults:30` 注释记录过「LoadProhibited crash during mesh scan retry」；
-  coredump 已启用（`CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH`）。
+- 曾记录过「LoadProhibited crash during mesh scan retry」；2026-10-23 已按要求停用
+  core dump 并删除分区，现场使用串口 panic/backtrace 配合本次构建 ELF 定位。
 - `DUAL_NET_DESIGN.md` 记录过两次 FreeRTOS 就绪链表 `StoreProhibited`，未最终定位。
 - 缓解：降低重扫频率（第 7.3 节）+ 健康监视任务提供现场证据（第 7.2 节）。
 
@@ -164,7 +164,7 @@ appTask.c:4982），根恢复后经 SDK 重连 + 补发路径收回。
 | 观察 | 结论 |
 |---|---|
 | 重启前出现 `BLE disconnected,Restarting...` / `BLE abnormal disconnection; gateway is restarting` | R1 确认，本次修复直接消除 |
-| 出现 `Guru Meditation` / `StoreProhibited` / `LoadProhibited` | R7，用 coredump（已烧录启用）解析；修复降暴露后仍复现则需升级 mesh-lite 组件 |
+| 出现 `Guru Meditation` / `StoreProhibited` / `LoadProhibited` | R7，保存完整串口 panic/backtrace 并用同版本 ELF 解析；修复降暴露后仍复现则需升级 mesh-lite 组件 |
 | 均无，但日志出现 `mesh_health` 父丢失记录后静默重启 | 查 brownout（`esp_reset_reason()`，建议在启动日志补充打印）。2026-10-16 起：无父约 12/24/36 分钟的带日志重启（`restarting node (n/3 this power cycle)`）属 7.7 watchdog 预期行为，不再是故障信号 |
 | 子节点在根掉线期间存活：最坏 3 次 watchdog 重启（约 12/24/36 分钟）后稳定扫描，老化经 SQLite(`pushed=0`)+NVS 断点恢复继续，缓存数据在根恢复后补发 | 修复生效（2026-10-16 起按 7.7 修订的验收标准） |
 

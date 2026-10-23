@@ -13,6 +13,8 @@
   直接拒绝回 IDLE 并经 MQTT 返回老化异常：消息格式、补偿机制、兼容性。
 - [NETWORK_RESTART_DESIGN.md](NETWORK_RESTART_DESIGN.md) —— 一键重启 30s 传播窗、暂停 Mesh、
   根先深层后重启；父连接失败计数与清 Mesh RTC 后的有界自愈。
+- [PARTITION_LAYOUT_REVIEW.md](PARTITION_LAYOUT_REVIEW.md) —— 8 MiB 布局、日志扩容至 832 KiB 及
+  core dump 移除；仅扩日志分区，更新布局需烧录分区表并安排旧日志卷迁移。
 
 ## 编译与烧录（代理可直接执行）
 
@@ -89,6 +91,9 @@ IDF_SKIP_CHECK_SUBMODULES=1 idf.py -B build/mesh-lite -D SDKCONFIG=build/mesh-li
   响应头，不下载 BIN 正文，不伪造下载完成通知。擦写前必须先使重叠记录失效并提交；NVS
   错误阻止擦写或启动选择，禁止为 OTA 清空整个 NVS。详细边界见 `MESH_LITE_OTA_INTEGRATION.md`。
 - 升级只写另一个 ota 槽，SQLite 数据库（`data_storage` 分区）与配置（`storage` 分区）不受影响。
+- 子节点收到 OTA 后若父链路/IP 丢失，取消未完成写入并进入 `WAIT_PARENT`；旧 SDK 传输
+  结束、父连接取得 IP 稳定 10s 后随机 0～3s 从头重下原文件。MQTT 单独断线不取消，已就绪
+  文件不重下，一键重启优先；等待意图仅在本次启动内保留，SDK 不结束时禁止并发新传输。
 
 ## 重启与网络自愈
 

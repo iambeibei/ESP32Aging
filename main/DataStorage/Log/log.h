@@ -8,7 +8,7 @@
 #define MAX_STR_LEN  127 // 字符串最大长度（留1字节给结束符）
 #define LOG_PARTITION_LABEL "log_storage"
 
-#define MAX_RECORDS  3000 // 最大记录数
+#define MAX_RECORDS  3000 // 最大记录数；832 KiB 日志分区保留文件系统与磨损均衡余量
 
 /// @brief 挂载文件系统
 /// @return ESP_OK on success, ESP_FAIL on failure.

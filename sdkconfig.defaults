@@ -27,10 +27,8 @@ CONFIG_BRIDGE_ETH_SPI_INT0_GPIO=4
 # maximum would also recompile every open-source component with DEBUG/VERBOSE, which
 # does not fit the remaining space in the OTA partitions.
 
-# --- Diagnostics for the LoadProhibited crash during mesh scan retry ---
-CONFIG_ESP_COREDUMP_ENABLE=y
-CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
-CONFIG_ESP_COREDUMP_LOGS=y
+# 不生成 core dump；保留普通串口 panic/backtrace，随后按原延时重启。
+CONFIG_ESP_COREDUMP_ENABLE_TO_NONE=y
 CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
 # Keep the panic output on the serial console long enough to be captured in full.
 CONFIG_ESP_SYSTEM_PANIC_REBOOT_DELAY_SECONDS=5
@@ -114,9 +112,6 @@ CONFIG_LWIP_DHCPS_MAX_STATION_NUM=64
 
 # SoftAP SSID 带 MAC 后缀（mesh.c 两种模式之一，须与实际配置一致）
 CONFIG_BRIDGE_SOFTAP_SSID_END_WITH_THE_MAC=y
-
-# coredump 栈大小（诊断 LoadProhibited，保持既有值）
-CONFIG_ESP_COREDUMP_STACK_SIZE=1792
 
 # MQTT：有界 outbox，负载优先使用 PSRAM；删除通知驱动上线/订阅恢复。
 CONFIG_MQTT_USE_CUSTOM_CONFIG=y

@@ -127,6 +127,11 @@ static esp_err_t esp_wifi_sta_get_ap_info(wifi_ap_record_t *out) {
     *out=(wifi_ap_record_t){.bssid={1,2,3,4,5,6},.rssi=-50};return ESP_OK;
 }
 static void sntp_sync_task(void *arg) {(void)arg;}
+static unsigned ota_parent_notifications;
+static bool ota_parent_online;
+static void mesh_ota_parent_link_changed(bool online) {
+    ota_parent_notifications++;ota_parent_online=online;
+}
 static int xTaskCreatePinnedToCore(TaskFunction_t task,const char *name,int stack,void *arg,
     int priority,TaskHandle_t *out,int cpu) {
     (void)task;(void)name;(void)stack;(void)arg;(void)priority;(void)out;assert(cpu==1);return pdPASS;
@@ -153,6 +158,7 @@ static void reset_case(void) {
     now_us=0;IsRoot=0;sdk_level=2;disconnect_calls=connect_calls=rtc_erases=restart_calls=0;
     disconnect_error=ESP_OK;task_create_error=task_creates=0;notifications=0;
     Network_Flag=0;expect_restart=false;delay_hook=disconnect_hook=NULL;reply_calls=0;
+    ota_parent_notifications=0;ota_parent_online=false;
     assert(system_restart_init()==ESP_OK);
 }
 static void got_ip(void) {
@@ -266,7 +272,9 @@ int main(void) {
     puts("PASS wired arbitration remains active during propagation but cannot reconnect after planned pause");
 
     reset_case();for(int i=0;i<3;i++)disconnected(202);assert(s_parent_fail_count==3);
-    got_ip();assert(s_parent_fail_count==3);now_us=1000000;disconnected(5);lost_ip();
+    got_ip();assert(s_parent_fail_count==3 && ota_parent_online && ota_parent_notifications==4);
+    now_us=1000000;disconnected(5);lost_ip();
+    assert(!ota_parent_online && ota_parent_notifications==6);
     assert(s_parent_fail_count==4 && !s_parent_ip_online);
     now_us=50000000;disconnected(202);assert(s_parent_fail_count==5);
     puts("PASS brief GOT_IP does not clear failures, LOST_IP does not double count, stale online time cannot reset failures");

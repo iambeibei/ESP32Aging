@@ -72,7 +72,7 @@ cd /home/wbb/espidfProject/ESP32Aging
 |---|---|---|---|
 | `/spiffs` | `storage`（256 KB） | SPIFFS | 配置 JSON（`baseconfig.json`、`device*.json`） |
 | `/fatfs` | `data_storage`（约 2.4 MB） | FATFS + 磨损均衡 | SQLite `data.db` |
-| `/log` | `log_storage`（320 KB） | FATFS | `records.dat` 环形日志 |
+| `/log` | `log_storage`（832 KiB） | FATFS | `records.dat` 环形日志，上限 3000 条 |
 
 **任务固定在 CPU1** 上运行（双核 FreeRTOS）；CPU0 留给 Wi-Fi/Bluedroid。所有应用任务都通过
 `create_cpu1_task()`（[appTask.c:174](main/Task/appTask.c#L174)）创建，栈大小和优先级取自
@@ -177,9 +177,10 @@ AgingDeviceCheck → AgingAction → AgingComplete`，由 `Aging_Test_Task`
    互斥锁保护的是 DB 调用，而不是缓冲区的生命周期；`query_db1_*_to_global()` 填充它，调用方之后才使用。
    两个任务交错执行会互相发布对方的负载数据。应改用栈/堆上的 `QueryResult`
    （`appTask.c:5349` 处已经这么做了）。
-3. **日志环形区大于其所在分区**：`MAX_RECORDS 3000 × RECORD_SIZE 128` = 384 KB，而 `log_storage`
-   分区只有 320 KB（[log.h:7](main/DataStorage/Log/log.h#L7)），且文件从不预分配 ——
-   一旦超出可用空间，写入就会开始失败。
+3. **日志扩容需要部署新分区表并处理旧卷**：2026-10-23 将 `log_storage` 从 256 KiB 扩至
+   832 KiB，`MAX_RECORDS 3000 × RECORD_SIZE 128` = 384000 B 的容量不足问题已在新布局中消除。
+   旧 FATFS / wear levelling 卷不会因更新 app 自动扩容；更新分区表前先导出需要保留的日志，
+   安排日志卷重建。迁移说明见 `PARTITION_LAYOUT_REVIEW.md`，数据库及配置分区保持原位置和大小。
 4. **每条日志都写一次 NVS**（[log.c:143](main/DataStorage/Log/log.c#L143)）：每次写日志都会持久化
    `LogIndex` —— 这是一个显著的 flash 磨损来源。
 5. **BLE 接收截断**：`copy_len = ble_data.data_len % (max_len + 1)`

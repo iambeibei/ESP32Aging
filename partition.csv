@@ -1,13 +1,12 @@
 # Name,   Type, SubType, Offset,  Size, Flags
 # Note: if you have increased the bootloader size, make sure to update the offsets to avoid overlap
+# 8 MiB Flash；固定现有起始地址，日志分区扩展至 Flash 末尾。
 nvs,      data, nvs,     0x9000,  0x4000,
 otadata,  data, ota,     0xd000,  0x2000,
 phy_init, data, phy,     0xf000,  0x1000,
 ota_0,  app,  ota_0, 0x10000, 0x240000,
-ota_1,  app,  ota_1,        , 0x240000,
-storage,  data, spiffs,  ,     0x40000,
-data_storage, data, fat, ,     0x260000,
-log_storage, data, fat, ,      0x40000,
-# Diagnostics: core dump partition for the LoadProhibited crash on mesh scan retry.
-# Appended at the end so all existing partition offsets stay unchanged.
-coredump,    data, coredump, , 0x10000,
+ota_1,  app,  ota_1, 0x250000, 0x240000,
+storage,  data, spiffs, 0x490000, 0x40000,
+data_storage, data, fat, 0x4d0000, 0x260000,
+log_storage, data, fat, 0x730000, 0xd0000,
+# 日志占用 832 KiB，结束于 0x800000，无尾部未分配空间。

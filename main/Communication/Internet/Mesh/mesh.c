@@ -30,6 +30,7 @@
 #include "task_config.h"
 #include "system_restart.h"
 #include "app_mem.h"
+#include "mesh_ota.h"
 
 
 #define MESH_MAX_LEVEL 6
@@ -579,6 +580,7 @@ static void network_event_handler(void *arg, esp_event_base_t base,
          * 子节点上行由 mesh 父节点提供，dual_net 不运行，沿用原判据。
          */
         mesh_update_network_flag(true);
+        mesh_ota_parent_link_changed(true);
         s_failover_attempts = 0;
         mesh_parent_online_changed(true, xTaskGetTickCount());
         wifi_ap_record_t parent;
@@ -601,6 +603,7 @@ static void network_event_handler(void *arg, esp_event_base_t base,
                (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)) {
         /* 与上面 STA_GOT_IP 对称：根节点交给 dual_net 裁决，子节点沿用原判据 */
         mesh_update_network_flag(false);
+        mesh_ota_parent_link_changed(false);
         mesh_parent_online_changed(false, xTaskGetTickCount());
         if (s_trial_active) s_trial_success = false;
         /*

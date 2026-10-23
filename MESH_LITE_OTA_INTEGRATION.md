@@ -2,7 +2,7 @@
 
 当前实现支持父节点保持旧固件运行时提供备用槽中的新镜像，也支持意外重启运行新固件后
 恢复当前槽供数。已有根/子日志确认第一条链路中 BINARY 从根向第二层传输，真实文件长度
-2118656 字节、SHA 一致；第三层转发及本次新增的掉电恢复仍待实机验收。宿主检查与构建
+2118656 字节、SHA 一致；第三层转发、掉电恢复及父断链取消/重下仍待实机验收。宿主检查与构建
 不能替代闭源 Mesh-Lite 1.0.2 的无线互操作验证。
 
 关联：`MESH_LITE_MIGRATION.md`、`OTA_SERVER_MIGRATION_DESIGN.md`、
@@ -101,7 +101,8 @@ SHA 对应真实 BIN 的全部字节，排除 LAN 对齐填充，可与服务器
 
 ## 4. 重试与诊断
 
-- 保留最多 2 次自动重试，每次等待 90 秒，首试加重试最多 3 次。
+- 普通传输/校验/收尾失败保留最多 2 次自动重试，每次等待 90 秒，首试加重试最多 3 次。
+  2026-10-23 新增的子节点父断链等待不消耗这个次数，见下节。
 - 失败会话停止接收、abort 未消耗的 handle 并清理就绪事实；重试重新开始接收，复用已取得的
   子节点元数据/长度。新一轮人工命令重新获取元数据。
 - 持久化/启动选择/登记失败只重试收尾，不重新下载、不擦写。重试耗尽保留候选，新命令可重试收尾。
@@ -111,12 +112,53 @@ SHA 对应真实 BIN 的全部字节，排除 LAN 对齐填充，可与服务器
   flash 时并发启动新下载；服务任务保持可运行。这不是 HTTP 任务强制取消功能。
 - 根/子权限依据 `IsRoot`，子失去父节点而层级变为 0 也不能进入根的外网下载路径。
 
+### 子节点 OTA 期间父链路中断（2026-10-23）
+
+只对已收到 OTA 命令、尚未完成的子节点任务生效：
+
+```text
+RUNNING / 普通重试等待 → STA_DISCONNECTED 或 LOST_IP
+  → 回调后续写入按父连接代次立即拒绝
+  → OTA 服务任务 abort 本次写入，进入 WAIT_PARENT，保留升级意图
+  → 旧 SDK 传输终态到达 + GOT_IP 连续稳定 10s + 随机 0～3s
+  → 从头获取原版本/文件名/长度对应的 BIN
+```
+
+- 网络事件只保存父状态/代次并唤醒服务任务，不等待 OTA 锁、不操作 Flash。
+  `get_file_cb/get_file_done` 在写入或校验前检查代次；服务任务清理与回调写入共用同一 mutex，
+  已经开始的单次 Flash 操作会先结束，清理后不得再写旧会话。
+- 同一次断链的 LOST_IP / DISCONNECTED 通知可重复，取消不会重复 abort 已释放的 handle。
+  短暂断开/重连即使发生于两次服务轮询之间，也会由代次变化触发取消；重复 GOT_IP 续租不
+  重置稳定窗口；恢复临界点再次换父必须重新稳定 10s。
+- 已获取完整目标参数时保持原版本、文件名、长度，自动恢复不重新追逐变化的 update.json。
+  尚未取得目标参数时，恢复后先补充元数据/长度探测，仍需要服务器可达；子节点不下载外网 BIN。
+- 没有 OTA 任务的正常重连不发起升级。MQTT 单独断线不取消 LAN 接收；本地校验和 SDK 成功
+  都已经确认的完整候选继续收尾；已就绪文件及原 OTACP 补报不回退、不重擦写。
+- 新命令在本任务等待期间合并，不覆盖目标。父链路等待不计入普通两次失败重试预算；普通
+  失败耗尽后关闭意图，单纯重连不能复活该失败任务，需要新命令。
+- 已接受 CanRestart 时取消未完成子节点任务及自动恢复意图，不在计划重启窗口重新发起 OTA。
+  根节点 HTTP 下载、现有网络自愈重启规则及完整镜像的持久恢复流程保持原实现。
+- **未完成任务的等待意图仅存于 RAM。** 若掉电、看门狗或网络自愈使整机重启，需由上位机
+  重新发送 OTA 命令；这不是跨重启的断点续传功能。
+
+当前固定 Mesh-Lite 1.0.2 没有公开的本机 BINARY 取消/闲置查询接口。应用关闭接收、abort
+Flash handle 后，必须等待旧 SDK 的 `OTA_FINISH`，不能把 `esp_ota_abort()` 当成库线程已退出。
+库在 GOT_IP 后可能自行恢复旧请求，`OTA_START` 也纳入在途状态跟踪，隔离期间仍拒绝数据；
+禁用 extern 下载回调作为 LAN 已失败移交的返回点，沿用正常失败处理。
+若库迟迟不归还传输所有权，应用保持 `WAIT_PARENT`、每 30 秒告警，**不绕过隔离强行启动，
+不自动重启、不调用私有库函数**。因此实机必须验证不同断开原因下旧库传输最终能结束，
+不能仅凭宿主回归宣称所有断链都能自动恢复。
+
 重点日志：
 
 ```text
 OTA_BINARY_REQUEST level=2 file=... target=... bytes=...
 OTA_BINARY_PROVIDE level=1 request=... partition=ota_1 bytes=...
 OTA_BINARY_READY level=2 running=A target=B file=... partition=ota_1 bytes=... sha256=...
+OTA_PARENT_CANCEL: keep_request=1 target=...
+OTA_PARENT_RESUME_PENDING: stable_ms=10000 jitter_ms=...
+OTA_PARENT_RESTART: file=...; downloading from beginning
+OTA_PARENT_WAIT_SDK: old transfer has no terminal event; new request held safely
 ```
 
 仅 `OTA_BINARY_READY` 表示本地校验、SHA、文件登记和恢复下级均完成。READY 前仍可能已设置
@@ -145,10 +187,19 @@ python3 tests/test_mesh_ota_binary.py
 ASAN_OPTIONS=detect_leaks=0 TEST_SANITIZE=1 python3 tests/test_mesh_ota_binary.py
 ```
 
-依赖宿主 C 编译器、OpenSSL 开发库。38 组场景覆盖原 BINARY/OTACP 以及提交前后断电、
+依赖宿主 C 编译器、OpenSSL 开发库。场景覆盖原 BINARY/OTACP 以及提交前后断电、
 新固件运行后离线恢复、下一版本轮换、CRC/镜像/SHA 损坏、NVS 失败和供数与擦写互斥，
 普通及 ASan/UBSan 运行通过。SDK 镜像解析和 NVS 使用宿主替身，不证明真实 flash 掉电行为，
 也不模拟闭源库或无线传输。构建按 `AGENTS.md` 中指定的 ESP-IDF 命令执行。
+
+新增父断链回归覆盖：无指令不升级、离线指令等待、稳定窗/随机延迟/续租、短断链合并通知、
+Flash 锁占用时的事件通知、写入立即拒绝与 abort 一次、旧成功不误报、SDK 旧任务自动恢复、
+extern 失败归还、恢复边界换父、元数据期间掉线、MQTT 单独掉线、就绪保持、重启优先及失败预算。
+
+父断链实机验收：下载中分别关闭父设备、制造短断链、恢复原父和更换父；核对 CANCEL、
+库终态、RESUME_PENDING、重新 REQUEST、READY、OTACP 的顺序及最终 SHA。覆盖失去 IP、
+已完成后断链、服务端元数据变更，以及下载期间接受 CanRestart；若连续出现 WAIT_SDK，
+保留两端断开原因和 SDK 日志，不能认定自动重下验收通过。
 
 三层实机顺序：
 

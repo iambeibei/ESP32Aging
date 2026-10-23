@@ -73,18 +73,24 @@ static void mock_log(const char *tag,const char *fmt,...) {
 #define BIT0 1u
 #define BIT1 2u
 #define BIT2 4u
+#define BIT3 8u
 #define pdTRUE 1
 #define pdFALSE 0
 #define pdPASS 1
 #define portMAX_DELAY UINT32_MAX
 #define pdMS_TO_TICKS(n) ((uint32_t)(n))
 typedef uint32_t TickType_t,EventBits_t;
-typedef int portMUX_TYPE;
-#define portMUX_INITIALIZER_UNLOCKED 0
-#define portENTER_CRITICAL(p) ((void)(p))
-#define portEXIT_CRITICAL(p) ((void)(p))
+typedef pthread_mutex_t portMUX_TYPE;
+#define portMUX_INITIALIZER_UNLOCKED PTHREAD_MUTEX_INITIALIZER
+#define portENTER_CRITICAL(p) assert(pthread_mutex_lock(p)==0)
+#define portEXIT_CRITICAL(p) assert(pthread_mutex_unlock(p)==0)
 static TickType_t now;
 static TickType_t xTaskGetTickCount(void) {return now;}
+static bool restart_planned;
+static uint32_t random_value;
+static void (*random_hook)(void);
+static bool system_restart_is_planned(void) {return restart_planned;}
+static uint32_t esp_random(void) {if(random_hook)random_hook();return random_value;}
 static void vTaskDelay(TickType_t ticks) {now+=ticks;}
 typedef struct {pthread_mutex_t lock;} StaticSemaphore_t;
 typedef StaticSemaphore_t *SemaphoreHandle_t;
@@ -288,13 +294,15 @@ typedef struct {esp_http_client_config_t config;size_t offset;} *esp_http_client
 static char server_metadata[1024]="{\"version\":\"1.1.0\",\"file\":\"fw_v1.1.0.bin\"}";
 static unsigned metadata_reads,body_downloads;
 static int http_status=200;
+static void (*metadata_hook)(void);
 static bool incomplete_body,unknown_size;
 static esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t *config) {
     esp_http_client_handle_t c=calloc(1,sizeof(*c));c->config=*config;return c;
 }
 static esp_err_t esp_http_client_perform(esp_http_client_handle_t c) {
     metadata_reads++;esp_http_client_event_t e={.event_id=HTTP_EVENT_ON_DATA,.user_data=c->config.user_data,
-        .data=server_metadata,.data_len=(int)strlen(server_metadata)};return c->config.event_handler(&e);
+        .data=server_metadata,.data_len=(int)strlen(server_metadata)};
+    esp_err_t err=c->config.event_handler(&e);if(metadata_hook)metadata_hook();return err;
 }
 static int esp_http_client_get_status_code(esp_http_client_handle_t c) {(void)c;return http_status;}
 static esp_err_t esp_http_client_open(esp_http_client_handle_t c,int n) {(void)n;if(c->config.keep_alive_enable)body_downloads++;return ESP_OK;}
@@ -311,6 +319,11 @@ esp_err_t lg_url_build(const char *fmt,char *out,size_t cap) {(void)fmt;strlcpy(
 '''
 TESTS = r'''
 static void reset_case(bool root) {
+    s_sdk_inflight=false;s_child_request_active=s_child_wait_parent=s_child_resume_scheduled=false;
+    s_rx_parent_generation=0;s_parent=(OtaParentState){.online=true};
+    restart_planned=false;random_value=0;
+    random_hook=NULL;
+    metadata_hook=NULL;
     reset_receiver_locked();s_ready_file=(mesh_ready_file_t){0};s_finalization_pending=false;
     s_root_downloading=false;s_root_timeout_logged=false;s_finish_wait_logged=false;
     s_retry_count=0;s_retry_waiting=false;s_metadata_valid=false;s_firmware_size_bytes=0;
@@ -341,6 +354,8 @@ static void reset_case(bool root) {
 
 /* 模拟硬复位：Flash/NVS/启动分区保留，所有 OTA RAM 和 SDK 会话丢失。 */
 static void simulate_boot(const esp_partition_t *running) {
+    s_sdk_inflight=false;s_child_request_active=s_child_wait_parent=s_child_resume_scheduled=false;
+    s_rx_parent_generation=0;s_parent=(OtaParentState){.online=true};restart_planned=false;
     handle_live=false;s_ota_handle=0;s_update_partition=NULL;
     s_session_open=s_rx_accepting=s_rx_done=s_rx_validated=s_rx_failed=s_finish_received=false;
     s_ready_file=(mesh_ready_file_t){0};memset(s_registered_file_name,0,sizeof(s_registered_file_name));
@@ -368,6 +383,10 @@ static void terminal(esp_mesh_lite_ota_finish_reason_t reason) {
     esp_mesh_lite_event_ota_finish_t e={.reason=reason};
     mesh_ota_event_handler(NULL,ESP_MESH_LITE_EVENT,ESP_MESH_LITE_EVENT_OTA_FINISH,&e);
     mesh_ota_service_poll(CMD_EVT_FINISH);
+}
+static void drop_during_metadata(void) {mesh_ota_parent_link_changed(false);}
+static void flap_during_jitter(void) {
+    random_hook=NULL;mesh_ota_parent_link_changed(false);mesh_ota_parent_link_changed(true);
 }
 static esp_mesh_lite_lan_ota_file_transfer_param_t packet(char *data,size_t offset,size_t n) {
     return (esp_mesh_lite_lan_ota_file_transfer_param_t){.fw_version=s_metadata.file,
@@ -407,7 +426,12 @@ static void *concurrent_withdrawal(void *arg) {
     pthread_mutex_lock(&read_gate);start_finished=true;pthread_cond_broadcast(&read_condition);pthread_mutex_unlock(&read_gate);return NULL;
 }
 int main(void) {
+    IsRoot=0;now=99;mesh_ota_parent_link_changed(true);
+    assert(!s_initialized && !s_cmd_events && parent_state().online && parent_state().online_since==99);
+    IsRoot=1;
     assert(mesh_ota_init()==ESP_OK);assert(task_count==2);assert(mesh_ota_init()==ESP_OK && task_count==2);
+    assert(parent_state().online && parent_state().online_since==99);
+    puts("PASS parent notification before OTA initialization is retained without touching uninitialized event groups");
 
     reset_case(true);run_root_download();
     assert(ready_logs==1 && s_ready_file.valid && begin_count==1 && boot_count==1 && restart_count==0);
@@ -686,6 +710,130 @@ int main(void) {
     pthread_join(reader,NULL);pthread_join(writer,NULL);block_read=false;
     assert(!memcmp(thread_data,fixture,16) && s_root_downloading && !s_ready_file.valid && !body_downloads);
     puts("PASS concurrent supply read finishes before next-upgrade withdrawal can admit a writer");
+
+    reset_case(false);mesh_ota_parent_link_changed(false);mesh_ota_parent_link_changed(true);
+    now=30000;mesh_ota_service_poll(CMD_EVT_PARENT);
+    assert(!transmit_count && !metadata_reads && simple_ota_get_state()==SIMPLE_OTA_STATE_IDLE);
+    puts("PASS ordinary parent reconnect without an OTA command never initiates an upgrade");
+
+    reset_case(false);mesh_ota_parent_link_changed(false);mesh_ota_service_poll(CMD_EVT_REQUEST);
+    assert(s_child_wait_parent && !metadata_reads && !transmit_count && !s_retry_count);
+    assert(simple_ota_get_state()==SIMPLE_OTA_STATE_WAIT_PARENT);
+    mesh_ota_parent_link_changed(true);random_value=3000;
+    now=9999;mesh_ota_service_poll(0);assert(!transmit_count);
+    now=10000;mesh_ota_service_poll(0);assert(s_child_resume_scheduled && !transmit_count);
+    now=12000;mesh_ota_parent_link_changed(true);mesh_ota_service_poll(0);assert(!transmit_count);
+    now=12999;mesh_ota_service_poll(0);assert(!transmit_count);
+    now=13000;mesh_ota_service_poll(0);assert(transmit_count==1 && metadata_reads==1 && !s_retry_count);
+    puts("PASS command received offline waits for ten stable IP seconds plus jitter; renewal preserves the deadline");
+
+    reset_case(false);now=UINT32_MAX-5000;mesh_ota_parent_link_changed(false);
+    mesh_ota_service_poll(CMD_EVT_REQUEST);mesh_ota_parent_link_changed(true);random_value=3000;
+    now=4998;mesh_ota_service_poll(0);assert(!transmit_count);
+    now=4999;mesh_ota_service_poll(0);assert(!transmit_count && s_child_resume_scheduled);
+    now=7999;mesh_ota_service_poll(0);assert(transmit_count==1);
+    puts("PASS parent stability and randomized restart deadlines remain correct across tick rollover");
+
+    reset_case(false);mesh_ota_service_poll(CMD_EVT_REQUEST);
+    p=packet((char *)fixture,0,16);assert(get_file_cb(&p)==ESP_OK && handle_live);
+    unsigned saved_begin=begin_count;
+    /* 事件通知必须能在 Flash mutex 正被占用时完成，且后续回调立刻拒绝写入。 */
+    assert(xSemaphoreTake(s_ota_mutex,0));mesh_ota_parent_link_changed(false);xSemaphoreGive(s_ota_mutex);
+    p=packet((char *)fixture+16,16,16);assert(get_file_cb(&p)==ESP_ERR_INVALID_STATE);
+    assert(flash_bytes[16]==0xff && !abort_count);
+    mesh_ota_service_poll(CMD_EVT_PARENT);
+    assert(abort_count==1 && !handle_live && s_sdk_inflight && !s_session_open);
+    assert(s_child_wait_parent && !s_retry_waiting && !s_retry_count && !boot_count && !mqtt_accepted);
+    assert(get_file_cb(&p)==ESP_ERR_INVALID_STATE && get_file_done_cb()==ESP_ERR_INVALID_STATE);
+    mesh_ota_parent_link_changed(true);now=400000;mesh_ota_service_poll(0);
+    mesh_ota_service_poll(CMD_EVT_REQUEST);assert(transmit_count==1 && s_sdk_inflight && begin_count==saved_begin);
+    strcpy(server_metadata,"{\"version\":\"2.0.0\",\"file\":\"fw_v2.0.0.bin\"}");
+    terminal(ESP_MESH_LITE_EVENT_OTA_SUCCESS); /* 迟到旧成功只能解除隔离，不能报完成。 */
+    assert(transmit_count==2 && metadata_reads==1 && !ready_logs && !boot_count && !mqtt_accepted);
+    assert(!strcmp(sent_config.file_name,"fw_v1.1.0.bin") && sent_config.size==fixture_size);
+    assert(!s_retry_count && s_session_open && !s_child_wait_parent);
+    p=packet((char *)fixture,0,fixture_size);assert(get_file_cb(&p)==ESP_OK && begin_count==2);
+    assert(get_file_done_cb()==ESP_OK);terminal(ESP_MESH_LITE_EVENT_OTA_SUCCESS);
+    assert(ready_logs==1 && boot_count==1 && mqtt_accepted==1);check_hash();
+    puts("PASS link loss closes receiver immediately, aborts once and waits for old SDK terminal before restarting the frozen file");
+
+    reset_case(false);mesh_ota_service_poll(CMD_EVT_REQUEST);
+    mesh_ota_parent_link_changed(false);mesh_ota_parent_link_changed(true);
+    mesh_ota_service_poll(CMD_EVT_PARENT);assert(s_child_wait_parent && !s_session_open);
+    random_value=3000;now=10000;terminal(ESP_MESH_LITE_EVENT_OTA_FAIL);
+    assert(s_child_resume_scheduled && transmit_count==1);
+    now=12000;mesh_ota_parent_link_changed(false);mesh_ota_parent_link_changed(true);mesh_ota_service_poll(0);
+    now=21999;mesh_ota_service_poll(0);assert(transmit_count==1 && !s_child_resume_scheduled);
+    now=22000;mesh_ota_service_poll(0);assert(transmit_count==1 && s_child_resume_scheduled);
+    now=25000;mesh_ota_service_poll(0);assert(transmit_count==2 && !s_retry_count);
+    puts("PASS down/up coalesced before polling is still cancelled; link flaps restart stability/jitter without spending retry budget");
+
+    reset_case(false);mesh_ota_parent_link_changed(false);mesh_ota_service_poll(CMD_EVT_REQUEST);
+    mesh_ota_parent_link_changed(true);now=10000;random_hook=flap_during_jitter;
+    mesh_ota_service_poll(0);assert(!transmit_count && s_child_wait_parent);
+    now=19999;mesh_ota_service_poll(0);assert(!transmit_count);
+    now=20000;mesh_ota_service_poll(0);assert(transmit_count==1);
+    puts("PASS parent change at the resume boundary cannot bypass the new ten-second stability window");
+
+    reset_case(false);mesh_ota_service_poll(CMD_EVT_REQUEST);
+    mesh_ota_parent_link_changed(false);mesh_ota_service_poll(0);terminal(ESP_MESH_LITE_EVENT_OTA_FAIL);
+    mesh_ota_parent_link_changed(true);
+    mesh_ota_event_handler(NULL,ESP_MESH_LITE_EVENT,ESP_MESH_LITE_EVENT_OTA_START,NULL);
+    now=30000;mesh_ota_service_poll(0);assert(transmit_count==1 && s_sdk_inflight);
+    terminal(ESP_MESH_LITE_EVENT_OTA_FAIL);assert(transmit_count==2);
+    puts("PASS SDK automatic old-request restart is observed and drained before application submits a new transfer");
+
+    reset_case(false);mesh_ota_service_poll(CMD_EVT_REQUEST);
+    assert(mesh_ota_extern_disabled()==ESP_FAIL);mesh_ota_service_poll(CMD_EVT_FINISH);
+    assert(!s_sdk_inflight && s_retry_waiting);
+    now=s_retry_deadline;mesh_ota_service_poll(0);assert(transmit_count==2 && !s_child_wait_parent);
+    puts("PASS disabled external fallback returns LAN ownership and preserves ordinary bounded retry");
+
+    reset_case(false);metadata_hook=drop_during_metadata;mesh_ota_service_poll(CMD_EVT_REQUEST);
+    assert(metadata_reads==1 && !transmit_count && !s_sdk_inflight && s_child_wait_parent && !s_retry_count);
+    metadata_hook=NULL;mesh_ota_parent_link_changed(true);now=10000;mesh_ota_service_poll(0);
+    assert(transmit_count==1 && metadata_reads==2);
+    puts("PASS parent loss during blocking metadata IO cannot start a stale LAN request or consume failure retries");
+
+    reset_case(false);receive_body();mqtt_connected=false;mesh_ota_service_poll(0);
+    assert(s_session_open && !s_child_wait_parent && !abort_count);
+    assert(get_file_done_cb()==ESP_OK);terminal(ESP_MESH_LITE_EVENT_OTA_SUCCESS);
+    assert(ready_logs==1 && s_ready_file.valid && s_otacp_pending && !mqtt_publish_attempts);
+    mesh_ota_parent_link_changed(false);mesh_ota_service_poll(0);
+    mesh_ota_parent_link_changed(true);now+=30000;mesh_ota_service_poll(0);
+    assert(s_ready_file.valid && begin_count==1 && transmit_count==1 && !s_child_request_active);
+    mqtt_connected=true;now+=5000;mesh_ota_service_poll(0);assert(mqtt_accepted==1);
+    puts("PASS MQTT-only outage does not cancel LAN OTA; completed supply survives parent loss and reports after MQTT recovery");
+
+    reset_case(false);receive_body();assert(get_file_done_cb()==ESP_OK);
+    esp_mesh_lite_event_ota_finish_t completed={.reason=ESP_MESH_LITE_EVENT_OTA_SUCCESS};
+    mesh_ota_event_handler(NULL,ESP_MESH_LITE_EVENT,ESP_MESH_LITE_EVENT_OTA_FINISH,&completed);
+    mesh_ota_parent_link_changed(false);mesh_ota_service_poll(0);
+    assert(s_ready_file.valid && ready_logs==1 && begin_count==1 && !s_child_wait_parent);
+    puts("PASS fully validated transfer with terminal already queued is finalized despite a later parent disconnect");
+
+    reset_case(false);receive_body();mesh_ota_parent_link_changed(false);mesh_ota_service_poll(0);
+    restart_planned=true;mesh_ota_service_poll(0);
+    assert(!s_child_request_active && !s_child_wait_parent && !handle_live && abort_count==1);
+    mesh_ota_parent_link_changed(true);now+=30000;terminal(ESP_MESH_LITE_EVENT_OTA_FAIL);
+    mesh_ota_service_poll(CMD_EVT_REQUEST);assert(transmit_count==1 && !s_retry_waiting && !boot_count);
+    puts("PASS accepted restart plan cancels pending upgrade intent and suppresses parent-triggered resumption");
+
+    reset_case(false);mesh_ota_service_poll(CMD_EVT_REQUEST);
+    for(unsigned i=0;i<3;i++) {
+        terminal(ESP_MESH_LITE_EVENT_OTA_FAIL);
+        if(i<2) {now=s_retry_deadline;mesh_ota_service_poll(0);}
+    }
+    assert(transmit_count==3 && s_retry_count==2 && !s_child_request_active);
+    mesh_ota_parent_link_changed(false);mesh_ota_parent_link_changed(true);now+=30000;mesh_ota_service_poll(0);
+    assert(transmit_count==3 && !s_retry_waiting);
+    puts("PASS genuine transfer failures retain the two-retry limit; reconnect cannot revive an exhausted upgrade task");
+
+    reset_case(true);mesh_ota_service_poll(CMD_EVT_REQUEST);mesh_ota_parent_link_changed(false);
+    mesh_ota_service_poll(CMD_EVT_PARENT);assert(s_root_downloading && !s_child_wait_parent);
+    s_download_error=simple_ota_check_and_update_default();mesh_ota_service_poll(CMD_EVT_DOWNLOAD_DONE);
+    assert(s_ready_file.valid && ready_logs==1 && body_downloads==1);
+    puts("PASS root download and cached supply behavior are unaffected by child parent-link notifications");
     return 0;
 }
 '''
@@ -697,7 +845,7 @@ def main():
         (tmp / 'mock_sdk.h').write_text(MOCK)
         for name in ['esp_err.h', 'esp_partition.h', 'esp_app_format.h', 'esp_http_client.h',
                      'esp_log.h', 'esp_ota_ops.h', 'esp_system.h', 'esp_event.h', 'esp_mesh_lite.h',
-                     'ConfigData.h', 'task_config.h', 'mqtt_app.h', 'freertos/FreeRTOS.h', 'freertos/task.h',
+                     'ConfigData.h', 'task_config.h', 'mqtt_app.h', 'esp_random.h', 'system_restart.h', 'freertos/FreeRTOS.h', 'freertos/task.h',
                      'freertos/semphr.h', 'freertos/event_groups.h', 'mbedtls/sha256.h',
                      'nvs.h', 'esp_rom_crc.h', 'esp_image_format.h']:
             path = tmp / name

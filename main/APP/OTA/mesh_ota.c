@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <stdatomic.h>
 
 #include "cJSON.h"
 #include "esp_app_format.h"
@@ -32,6 +33,8 @@
 #include "ConfigData.h"
 #include "mqtt_app.h"
 #include "task_config.h"
+#include "esp_random.h"
+#include "system_restart.h"
 
 static const char *TAG = "mesh_ota";
 
@@ -51,10 +54,14 @@ static const char *TAG = "mesh_ota";
 #define LG_MESH_OTA_OTACP_RETRY_MS 5000
 #define LG_MESH_OTA_OTACP_TOPIC_BYTES 64
 #define LG_MESH_OTA_OTACP_PAYLOAD_BYTES 256
+#define LG_MESH_OTA_PARENT_STABLE_MS 10000u
+#define LG_MESH_OTA_PARENT_JITTER_MS 3000u
+#define LG_MESH_OTA_DRAIN_WARN_MS 30000u
 
 #define CMD_EVT_REQUEST BIT0
 #define CMD_EVT_FINISH BIT1
 #define CMD_EVT_DOWNLOAD_DONE BIT2
+#define CMD_EVT_PARENT BIT3
 #define DL_EVT_START BIT0
 
 typedef struct {
@@ -70,7 +77,19 @@ static StaticEventGroup_t s_cmd_events_buf, s_dl_events_buf;
 static EventGroupHandle_t s_cmd_events, s_dl_events;
 static StaticSemaphore_t s_ota_mutex_buf;
 static SemaphoreHandle_t s_ota_mutex;
-static bool s_initialized;
+static atomic_bool s_initialized;
+
+/* 网络事件不能等待 Flash/OTA mutex。代次锁仅保护定宽快照；回调写入前也核对它。 */
+typedef struct {
+    bool online;
+    uint32_t generation;
+    TickType_t online_since;
+} OtaParentState;
+static portMUX_TYPE s_parent_lock = portMUX_INITIALIZER_UNLOCKED;
+static OtaParentState s_parent;
+static uint32_t s_rx_parent_generation;
+/* 旧 SDK 终态未排空时，禁止新传输；esp_ota_abort 不能替代库取消接口。 */
+static bool s_sdk_inflight;
 
 /* s_ota_mutex 保护以下接收会话、完成事实与供数记录。 */
 static esp_ota_handle_t s_ota_handle;
@@ -97,6 +116,9 @@ static TickType_t s_retry_deadline, s_root_start_tick;
 static ota_cache_record_t s_candidate_record;
 static bool s_candidate_persisted, s_candidate_recovered;
 static bool s_recovery_pending, s_bootstrap_pending, s_request_deferred;
+/* 仅服务任务访问；是本次启动内的升级意图，不是掉电续传记录。 */
+static bool s_child_request_active, s_child_wait_parent, s_child_resume_scheduled;
+static TickType_t s_child_resume_due, s_drain_warn_tick;
 static uint8_t s_bootstrap_attempts;
 static TickType_t s_bootstrap_retry_tick;
 
@@ -110,6 +132,38 @@ static char s_report_device_id[OTA_CACHE_ID_CAPACITY];
 static char s_report_aging_number[OTA_CACHE_ID_CAPACITY];
 
 static void schedule_retry(void);
+static void start_attempt(void);
+
+static OtaParentState parent_state(void)
+{
+    portENTER_CRITICAL(&s_parent_lock);
+    OtaParentState state = s_parent;
+    portEXIT_CRITICAL(&s_parent_lock);
+    return state;
+}
+
+void mesh_ota_parent_link_changed(bool has_ip)
+{
+    if (IsRoot == 1) return;
+    TickType_t now = xTaskGetTickCount();
+    portENTER_CRITICAL(&s_parent_lock);
+    if (!has_ip) {
+        s_parent.online = false;
+        ++s_parent.generation;
+    } else if (!s_parent.online) {
+        s_parent.online = true;
+        s_parent.online_since = now;
+    }
+    portEXIT_CRITICAL(&s_parent_lock);
+    if (s_initialized) xEventGroupSetBits(s_cmd_events, CMD_EVT_PARENT);
+}
+
+/* 调用者持有 OTA mutex；SDK 回调不因网络事件延迟而继续写旧会话。 */
+static bool receiver_link_current(void)
+{
+    OtaParentState parent = parent_state();
+    return parent.online && parent.generation == s_rx_parent_generation && !system_restart_is_planned();
+}
 
 /* EventGroup SetBits 的返回值为当前事件位而非错误码；置位点均为任务上下文。
  * mutex 的 Give 返回值则必须核验，便于发现错误所有权或初始化问题。 */
@@ -162,6 +216,72 @@ static void reset_receiver_locked(void)
     s_finish_received = false;
 }
 
+/* 服务任务调用。取消的是未完成的本轮写入；SDK 仍可能在退出，故不伪造其终态。 */
+static void cancel_child_for_parent(bool keep_request)
+{
+    if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) return;
+    /* 完整接收且双重确认均已到达，后续断链不丢弃有效候选。 */
+    if (keep_request && s_rx_validated && s_finish_received &&
+        s_finish_reason == ESP_MESH_LITE_EVENT_OTA_SUCCESS) {
+        ota_unlock();
+        return;
+    }
+    reset_receiver_locked();
+    OtaParentState parent = parent_state();
+    s_rx_parent_generation = parent.generation;
+    ota_unlock();
+    s_retry_waiting = false;
+    s_child_request_active = keep_request;
+    s_child_wait_parent = keep_request;
+    s_child_resume_scheduled = false;
+    s_drain_warn_tick = xTaskGetTickCount();
+    simple_ota_set_state(keep_request ? SIMPLE_OTA_STATE_WAIT_PARENT : SIMPLE_OTA_STATE_FAILED);
+    ESP_LOGW(TAG, "OTA_PARENT_CANCEL: keep_request=%d target=%s; receiver closed, waiting for SDK terminal",
+             keep_request, s_metadata_valid ? s_metadata.file : "metadata pending");
+}
+
+/* 返回 true 时本轮服务处理不得再启动常规重试。普通 GOT_IP 不产生升级任务。 */
+static bool poll_child_parent(void)
+{
+    if (IsRoot == 1 || !s_child_request_active || s_finalization_pending) return false;
+    if (system_restart_is_planned()) {
+        cancel_child_for_parent(false);
+        return true;
+    }
+    OtaParentState parent = parent_state();
+    if ((!parent.online || parent.generation != s_rx_parent_generation) &&
+        (!s_child_wait_parent || parent.generation != s_rx_parent_generation)) {
+        cancel_child_for_parent(true);
+    }
+    if (!s_child_wait_parent) return false;
+    parent = parent_state(); /* 取消期间也可能再次断开/重连，不能沿用旧在线窗口。 */
+    if (!parent.online || xTaskGetTickCount() - parent.online_since < pdMS_TO_TICKS(LG_MESH_OTA_PARENT_STABLE_MS))
+        return true;
+    if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) return true;
+    bool draining = s_sdk_inflight;
+    ota_unlock();
+    TickType_t now = xTaskGetTickCount();
+    if (draining) {
+        if (now - s_drain_warn_tick >= pdMS_TO_TICKS(LG_MESH_OTA_DRAIN_WARN_MS)) {
+            s_drain_warn_tick = now;
+            ESP_LOGW(TAG, "OTA_PARENT_WAIT_SDK: old transfer has no terminal event; new request held safely");
+        }
+        return true;
+    }
+    if (!s_child_resume_scheduled) {
+        uint32_t jitter_ms = esp_random() % (LG_MESH_OTA_PARENT_JITTER_MS + 1u);
+        s_child_resume_due = now + pdMS_TO_TICKS(jitter_ms);
+        s_child_resume_scheduled = true;
+        ESP_LOGI(TAG, "OTA_PARENT_RESUME_PENDING: stable_ms=%u jitter_ms=%u", LG_MESH_OTA_PARENT_STABLE_MS, (unsigned)jitter_ms);
+    }
+    if ((int32_t)(now - s_child_resume_due) >= 0) {
+        s_child_resume_scheduled = false;
+        ESP_LOGI(TAG, "OTA_PARENT_RESTART: file=%s; downloading from beginning", s_metadata_valid ? s_metadata.file : "metadata pending");
+        start_attempt();
+    }
+    return true;
+}
+
 /* 库任务调用；仅提供本次校验或启动恢复校验后已登记的文件，不扫描分区头猜测完整性。 */
 static esp_err_t provide_file_cb(esp_mesh_lite_lan_ota_file_transfer_param_t *param)
 {
@@ -211,6 +331,7 @@ static esp_err_t get_file_cb(esp_mesh_lite_lan_ota_file_transfer_param_t *param)
     if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) return ESP_FAIL;
     esp_err_t err = ESP_ERR_INVALID_STATE;
     if (!s_session_open || !s_rx_accepting || s_rx_failed) goto done;
+    if (!receiver_link_current()) goto done;
     if (!binary_name_valid(param->fw_version) || strcmp(param->fw_version, s_metadata.file) != 0) {
         ESP_LOGE(TAG, "BINARY receive identifier mismatch: request=%.*s expected=%s",
                  SIMPLE_OTA_BINARY_FILENAME_CAPACITY - 1,
@@ -237,6 +358,10 @@ static esp_err_t get_file_cb(esp_mesh_lite_lan_ota_file_transfer_param_t *param)
                  param->fw_version, update->label, (unsigned)s_firmware_size_bytes);
     }
     /* 对齐尾部也会落入备用槽，且已验证其范围不超过分区。 */
+    if (!receiver_link_current()) {
+        err = ESP_ERR_INVALID_STATE;
+        goto failed;
+    }
     err = esp_ota_write_with_offset(s_ota_handle, param->data, param->data_size, param->offset);
     if (err != ESP_OK) goto failed;
     goto done;
@@ -257,6 +382,7 @@ static esp_err_t get_file_done_cb(void)
     if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) return ESP_FAIL;
     esp_err_t err = ESP_ERR_INVALID_STATE;
     if (!s_session_open || !s_rx_accepting || s_rx_failed || s_ota_handle == 0) goto done;
+    if (!receiver_link_current()) goto done;
     s_rx_accepting = false;
     esp_ota_handle_t handle = s_ota_handle;
     s_ota_handle = 0; /* esp_ota_end 无论成功失败都消耗 handle。 */
@@ -267,6 +393,10 @@ static esp_err_t get_file_done_cb(void)
     if (err != ESP_OK) goto done;
     if (strncmp(desc.version, s_metadata.version, sizeof(desc.version)) != 0) {
         err = ESP_ERR_INVALID_VERSION;
+        goto done;
+    }
+    if (!receiver_link_current()) {
+        err = ESP_ERR_INVALID_STATE;
         goto done;
     }
     s_rx_validated = true;
@@ -286,7 +416,13 @@ static void mesh_ota_event_handler(void *arg, esp_event_base_t base, int32_t eve
 {
     (void)arg;
     if (base != ESP_MESH_LITE_EVENT) return;
-    if (event_id == ESP_MESH_LITE_EVENT_OTA_PROGRESS) {
+    if (event_id == ESP_MESH_LITE_EVENT_OTA_START) {
+        /* 库可能在 GOT_IP 后自行恢复旧请求；即使应用已关闭接收，也必须等它退出。 */
+        if (IsRoot == 0 && xSemaphoreTake(s_ota_mutex, portMAX_DELAY) == pdTRUE) {
+            s_sdk_inflight = true;
+            ota_unlock();
+        }
+    } else if (event_id == ESP_MESH_LITE_EVENT_OTA_PROGRESS) {
         const esp_mesh_lite_event_ota_progress_t *progress = event_data;
         if (progress != NULL && progress->percentage % LG_MESH_OTA_PROGRESS_LOG_STEP_PCT == 0) {
             ESP_LOGI(TAG, "BINARY progress=%u%%", progress->percentage);
@@ -294,6 +430,7 @@ static void mesh_ota_event_handler(void *arg, esp_event_base_t base, int32_t eve
     } else if (event_id == ESP_MESH_LITE_EVENT_OTA_FINISH) {
         const esp_mesh_lite_event_ota_finish_t *finish = event_data;
         if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) return;
+        s_sdk_inflight = false; /* 先排空旧库传输，WAIT_PARENT 下终态不推进业务。 */
         if (s_session_open && !s_finish_received) {
             s_finish_reason = finish != NULL ? finish->reason : ESP_MESH_LITE_EVENT_OTA_FAIL;
             s_finish_tick = xTaskGetTickCount();
@@ -309,6 +446,9 @@ static esp_err_t mesh_ota_extern_disabled(void)
     ESP_LOGW(TAG, "BINARY file unavailable in mesh; external body download disabled");
     /* transmit_file_start 可能忽略 extern 回调的返回值，显式交给服务任务收尾。 */
     if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) return ESP_FAIL;
+    /* 当前库把 LAN 失败交给 extern 前已结束 LAN；禁用外网桩在此归还传输所有权。
+     * 仍唤醒正常失败处理，不把这一回调当成下载成功。 */
+    s_sdk_inflight = false;
     if (s_session_open) {
         s_finish_received = true;
         s_finish_reason = ESP_MESH_LITE_EVENT_OTA_FAIL;
@@ -336,6 +476,9 @@ static esp_err_t stage_record(const ota_cache_record_t *record, const esp_partit
     s_candidate_persisted = persisted;
     s_candidate_recovered = recovered;
     s_finalization_pending = true;
+    s_child_request_active = false;
+    s_child_wait_parent = false;
+    s_child_resume_scheduled = false;
     /* 收尾尚未完成，启动恢复时也先进入 RUNNING，再依据当前运行版本确定状态。 */
     simple_ota_set_state(SIMPLE_OTA_STATE_RUNNING);
     return ESP_OK;
@@ -483,6 +626,7 @@ static void schedule_retry(void)
 {
     if (s_retry_waiting) return;
     if (s_retry_count >= LG_MESH_OTA_RETRY_MAX) {
+        s_child_request_active = false;
         ESP_LOGE(TAG, "BINARY retry exhausted; stage=%s waiting for new command",
                  s_finalization_pending ? "register/resume" : "download");
         return;
@@ -660,15 +804,33 @@ static void handle_root_path(void)
 static void handle_child_path(void)
 {
     esp_err_t err;
+    OtaParentState parent = parent_state();
+    /* 从稳定窗口排程到实际入口之间仍可换父；保留旧代次直到此处复核。 */
+    if (s_child_wait_parent && (parent.generation != s_rx_parent_generation || !parent.online ||
+        xTaskGetTickCount() - parent.online_since < pdMS_TO_TICKS(LG_MESH_OTA_PARENT_STABLE_MS))) {
+        cancel_child_for_parent(!system_restart_is_planned());
+        return;
+    }
+    s_child_wait_parent = false;
+    s_rx_parent_generation = parent.generation;
+    if (!parent.online || system_restart_is_planned()) {
+        cancel_child_for_parent(!system_restart_is_planned());
+        return;
+    }
     if (!s_metadata_valid) {
         err = simple_ota_fetch_metadata(&s_metadata);
         if (err != ESP_OK) goto failed;
+        if (!receiver_link_current()) {
+            cancel_child_for_parent(!system_restart_is_planned());
+            return;
+        }
         if (!binary_name_valid(s_metadata.file)) {
             err = ESP_ERR_INVALID_SIZE;
             ESP_LOGE(TAG, "BINARY file name must be 1..31 bytes; refusing truncation");
             goto failed;
         }
         if (!simple_ota_version_is_newer(s_metadata.version)) {
+            s_child_request_active = false;
             simple_ota_set_state(SIMPLE_OTA_STATE_IDLE);
             ESP_LOGI(TAG, "Child has no newer firmware; checking existing supply cache");
             request_supply_recovery();
@@ -684,11 +846,20 @@ static void handle_child_path(void)
         }
         s_metadata_valid = true;
     }
+    if (!receiver_link_current()) {
+        cancel_child_for_parent(!system_restart_is_planned());
+        return;
+    }
     if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) {
         err = ESP_FAIL;
         goto failed;
     }
     reset_receiver_locked();
+    if (s_sdk_inflight) {
+        ota_unlock();
+        cancel_child_for_parent(true);
+        return;
+    }
     /* 同一互斥保护在途供数与擦写准入；持久记录失效失败时不启动库传输。 */
     s_ready_file.valid = false;
     err = ota_cache_before_write(esp_ota_get_next_update_partition(NULL));
@@ -698,6 +869,7 @@ static void handle_child_path(void)
     }
     s_session_open = true;
     s_rx_accepting = true;
+    s_sdk_inflight = true;
     s_finish_wait_logged = false;
     ota_unlock();
     esp_mesh_lite_file_transmit_config_t cfg = {
@@ -711,10 +883,15 @@ static void handle_child_path(void)
     err = esp_mesh_lite_transmit_file_start(&cfg);
     if (err == ESP_OK) return;
     if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) == pdTRUE) {
+        s_sdk_inflight = false; /* API 拒绝启动，未拥有新的库传输。 */
         reset_receiver_locked();
         ota_unlock();
     }
 failed:
+    if (!receiver_link_current()) {
+        cancel_child_for_parent(!system_restart_is_planned());
+        return;
+    }
     ESP_LOGE(TAG, "Child BINARY request failed: %s", esp_err_to_name(err));
     simple_ota_set_state(SIMPLE_OTA_STATE_FAILED);
     schedule_retry();
@@ -740,6 +917,7 @@ static void mesh_ota_service_poll(EventBits_t bits)
         request_supply_recovery();
     }
     if (bits & CMD_EVT_DOWNLOAD_DONE) process_root_finish();
+    bool parent_wait = poll_child_parent();
     process_child_finish();
     if (s_root_downloading && !s_root_timeout_logged &&
         xTaskGetTickCount() - s_root_start_tick >= pdMS_TO_TICKS(LG_MESH_OTA_ROOT_DL_TIMEOUT_MS)) {
@@ -748,7 +926,9 @@ static void mesh_ota_service_poll(EventBits_t bits)
     }
     if (bits & CMD_EVT_REQUEST) {
         simple_ota_state_t state = simple_ota_get_state();
-        if (s_otacp_pending) {
+        if (IsRoot == 0 && (s_child_request_active || system_restart_is_planned())) {
+            ESP_LOGI(TAG, "BINARY command coalesced: child task active or restart planned");
+        } else if (s_otacp_pending) {
             /* 单条通知持久记录不能被下一次下载覆盖；保留一个合并请求到入队成功。 */
             s_request_deferred = true;
         } else if (s_finalization_pending) {
@@ -763,10 +943,11 @@ static void mesh_ota_service_poll(EventBits_t bits)
         } else {
             s_retry_count = 0;
             s_metadata_valid = false;
+            s_child_request_active = IsRoot == 0;
             start_attempt();
         }
     }
-    if (s_retry_waiting && (int32_t)(xTaskGetTickCount() - s_retry_deadline) >= 0) {
+    if (!parent_wait && s_retry_waiting && (int32_t)(xTaskGetTickCount() - s_retry_deadline) >= 0) {
         s_retry_waiting = false;
         if (s_finalization_pending) finish_candidate();
         else if (!s_root_downloading) start_attempt();
@@ -796,7 +977,7 @@ static void mesh_ota_cmd_task(void *arg)
     mesh_ota_service_poll(0); /* 先本地恢复，再消费后续 OTA 命令。 */
     for (;;) {
         EventBits_t bits = xEventGroupWaitBits(s_cmd_events,
-            CMD_EVT_REQUEST | CMD_EVT_FINISH | CMD_EVT_DOWNLOAD_DONE,
+            CMD_EVT_REQUEST | CMD_EVT_FINISH | CMD_EVT_DOWNLOAD_DONE | CMD_EVT_PARENT,
             pdTRUE, pdFALSE, pdMS_TO_TICKS(LG_MESH_OTA_SERVICE_POLL_MS));
         mesh_ota_service_poll(bits);
     }
@@ -816,6 +997,13 @@ static void mesh_ota_dl_task(void *arg)
     }
 }
 #endif /* CONFIG_ESP_MESH_LITE_OTA_ENABLE */
+
+#ifndef CONFIG_ESP_MESH_LITE_OTA_ENABLE
+void mesh_ota_parent_link_changed(bool has_ip)
+{
+    (void)has_ip;
+}
+#endif
 
 esp_err_t mesh_ota_init(void)
 {
