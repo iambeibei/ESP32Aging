@@ -9,6 +9,7 @@ extern "C" {
 
 #define OTA_CACHE_ORIGIN_DOWNLOAD 1u
 #define OTA_CACHE_ORIGIN_BOOTSTRAP 2u
+#define OTA_CACHE_ORIGIN_CURRENT 3u  /**< 同版本命令候选，供数收尾成功后才上报。 */
 #define OTA_CACHE_ID_CAPACITY 32
 #define OTA_CACHE_SHA256_CAPACITY 65
 

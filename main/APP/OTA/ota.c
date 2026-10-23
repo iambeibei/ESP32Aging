@@ -29,6 +29,9 @@ static portMUX_TYPE s_ota_state_lock = portMUX_INITIALIZER_UNLOCKED;
 static simple_ota_state_t s_ota_state = SIMPLE_OTA_STATE_IDLE;
 static simple_ota_download_result_t s_download_result;
 static bool s_download_result_valid;
+static bool s_version_comparison_valid;
+static int s_version_comparison;
+static simple_ota_metadata_t s_checked_metadata;
 
 simple_ota_state_t simple_ota_get_state(void)
 {
@@ -51,6 +54,26 @@ esp_err_t simple_ota_get_download_result(simple_ota_download_result_t *out_resul
     portENTER_CRITICAL(&s_ota_state_lock);
     bool valid = s_download_result_valid;
     *out_result = valid ? s_download_result : (simple_ota_download_result_t){0};
+    portEXIT_CRITICAL(&s_ota_state_lock);
+    return valid ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t simple_ota_get_version_comparison(int *comparison)
+{
+    if (comparison == NULL) return ESP_ERR_INVALID_ARG;
+    portENTER_CRITICAL(&s_ota_state_lock);
+    bool valid = s_version_comparison_valid;
+    *comparison = valid ? s_version_comparison : 0;
+    portEXIT_CRITICAL(&s_ota_state_lock);
+    return valid ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t simple_ota_get_checked_metadata(simple_ota_metadata_t *metadata)
+{
+    if (metadata == NULL) return ESP_ERR_INVALID_ARG;
+    portENTER_CRITICAL(&s_ota_state_lock);
+    bool valid = s_version_comparison_valid;
+    *metadata = valid ? s_checked_metadata : (simple_ota_metadata_t){0};
     portEXIT_CRITICAL(&s_ota_state_lock);
     return valid ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
@@ -753,6 +776,11 @@ static esp_err_t ota_check_and_update_impl(const simple_ota_config_t *config)
     ESP_LOGI(TAG, "Server firmware file: %s", metadata.file);
 
     int cmp = compare_semver(&server_semver, &current_semver);
+    portENTER_CRITICAL(&s_ota_state_lock);
+    s_version_comparison = cmp;
+    s_checked_metadata = metadata;
+    s_version_comparison_valid = true;
+    portEXIT_CRITICAL(&s_ota_state_lock);
     if (cmp <= 0) {
         if (cmp == 0) {
             ESP_LOGI(TAG, "Firmware is already up to date");
@@ -800,6 +828,7 @@ esp_err_t simple_ota_check_and_update(const simple_ota_config_t *config)
 
     portENTER_CRITICAL(&s_ota_state_lock);
     s_download_result_valid = false;
+    s_version_comparison_valid = false;
     s_ota_state = SIMPLE_OTA_STATE_RUNNING;
     portEXIT_CRITICAL(&s_ota_state_lock);
     esp_err_t err = ota_check_and_update_impl(config);

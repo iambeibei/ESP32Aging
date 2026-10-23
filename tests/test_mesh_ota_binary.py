@@ -327,10 +327,11 @@ static void reset_case(bool root) {
     reset_receiver_locked();s_ready_file=(mesh_ready_file_t){0};s_finalization_pending=false;
     s_root_downloading=false;s_root_timeout_logged=false;s_finish_wait_logged=false;
     s_retry_count=0;s_retry_waiting=false;s_metadata_valid=false;s_firmware_size_bytes=0;
-    s_candidate_record=(ota_cache_record_t){0};s_candidate_persisted=s_candidate_recovered=false;
+    s_candidate_record=(ota_cache_record_t){0};s_candidate_persisted=s_candidate_recovered=s_candidate_report_completion=false;
     s_recovery_pending=s_bootstrap_pending=s_request_deferred=false;s_bootstrap_attempts=0;s_bootstrap_retry_tick=0;
     s_report_device_id[0]=s_report_aging_number[0]=0;
     nvs_exists=nvs_deleting=false;nvs_blob_size=nvs_staged_size=0;nvs_writes=nvs_commits=nvs_erases=0;
+    s_current_supply_pending=false;
     fail_nvs_open=fail_nvs_set=fail_nvs_commit=fail_nvs_erase=false;
     current_part=boot_part=&running_part;writing_part=NULL;override_image_size=0;fail_image_verify=false;
     block_read=read_entered=release_read=start_entered=start_finished=false;
@@ -338,7 +339,7 @@ static void reset_case(bool root) {
     s_otacp_pending=false;s_otacp_payload_ready=false;s_otacp_retry_tick=0;s_otacp_seq=0;
     mqtt_connected=true;mqtt_publish_result=42;mqtt_publish_attempts=mqtt_accepted=0;
     reported_topic[0]=reported_payload[0]=0;wall_time=1782373476;DEVICE_ID="100000010";AgingNumber="2";
-    s_metadata=(simple_ota_metadata_t){0};s_download_result_valid=false;
+    s_metadata=(simple_ota_metadata_t){0};s_download_result_valid=s_version_comparison_valid=false;
     simple_ota_set_state(SIMPLE_OTA_STATE_IDLE);s_download_error=ESP_OK;
     IsRoot=root;level=root?1:2;now=0;s_cmd_events->bits=0;s_dl_events->bits=0;
     fail_end=fail_read=fail_boot=fail_register=fail_resume=fail_transmit=false;
@@ -359,10 +360,11 @@ static void simulate_boot(const esp_partition_t *running) {
     handle_live=false;s_ota_handle=0;s_update_partition=NULL;
     s_session_open=s_rx_accepting=s_rx_done=s_rx_validated=s_rx_failed=s_finish_received=false;
     s_ready_file=(mesh_ready_file_t){0};memset(s_registered_file_name,0,sizeof(s_registered_file_name));
-    s_candidate_record=(ota_cache_record_t){0};s_candidate_persisted=s_candidate_recovered=false;
+    s_candidate_record=(ota_cache_record_t){0};s_candidate_persisted=s_candidate_recovered=s_candidate_report_completion=false;
     s_retry_count=0;s_retry_waiting=s_finalization_pending=s_root_downloading=false;
     s_root_timeout_logged=s_finish_wait_logged=false;s_metadata_valid=false;s_firmware_size_bytes=0;
-    s_metadata=(simple_ota_metadata_t){0};s_download_result_valid=false;
+    s_metadata=(simple_ota_metadata_t){0};s_download_result_valid=s_version_comparison_valid=false;
+    s_current_supply_pending=false;
     s_otacp_pending=s_otacp_payload_ready=false;s_otacp_seq=0;s_otacp_retry_tick=0;
     s_report_device_id[0]=s_report_aging_number[0]=0;s_otacp_topic[0]=s_otacp_payload[0]=0;
     s_recovery_pending=true;s_bootstrap_pending=s_request_deferred=false;s_bootstrap_attempts=0;
@@ -405,15 +407,24 @@ static void check_hash(void) {
     for(size_t i=0;i<32;i++)snprintf(hex+2*i,3,"%02x",hash[i]);
     assert(strcmp(s_ready_file.sha256_hex,hex)==0 && strstr(last_ready,hex));
 }
-static void check_report(const char *device_id,const char *aging_number) {
+static void check_report_at(const char *device_id,const char *aging_number,int64_t completed_seq) {
     char topic[64];snprintf(topic,sizeof(topic),"device/%s/event/OTACP",device_id);
     assert(mqtt_accepted==1 && !strcmp(reported_topic,topic));
     cJSON *root=cJSON_Parse(reported_payload);assert(root && cJSON_GetArraySize(root)==2);
     cJSON *seq=cJSON_GetObjectItem(root,"Seq"),*data=cJSON_GetObjectItem(root,"Data");
-    assert(cJSON_IsNumber(seq) && seq->valuedouble==1782373476 && cJSON_IsObject(data));
+    assert(cJSON_IsNumber(seq) && seq->valuedouble==(double)completed_seq && cJSON_IsObject(data));
     assert(cJSON_GetArraySize(data)==2 && cJSON_GetObjectItem(data,"IsComplete")->valueint==1);
     cJSON *aging=cJSON_GetObjectItem(data,"AgingNumber");assert(cJSON_IsString(aging) && !strcmp(aging->valuestring,aging_number));
     cJSON_Delete(root);
+}
+static void check_report(const char *device_id,const char *aging_number) {
+    check_report_at(device_id,aging_number,1782373476);
+}
+
+static void check_no_boot_report(void) {
+    assert(!s_otacp_pending && !mqtt_publish_attempts);
+    mqtt_connected=true;now+=10000;mesh_ota_service_poll(0);
+    assert(!s_otacp_pending && !mqtt_publish_attempts);
 }
 
 static void *concurrent_provider(void *arg) {
@@ -456,12 +467,181 @@ int main(void) {
     p.offset=0;p.data_size=7;p.filesize=4103;assert(provide_file_cb(&p)==ESP_ERR_INVALID_SIZE);
     puts("PASS provide exact filename, padded range bounds and FF tail instead of stale flash");
 
-    reset_case(true);strlcpy(server_metadata,"{\"version\":\"1.0.0\",\"file\":\"fw_v1.0.0.bin\"}",sizeof(server_metadata));
-    run_root_download();assert(simple_ota_get_state()==SIMPLE_OTA_STATE_IDLE && ready_logs==1 && registration_count==1);
-    assert(s_ready_file.partition==current_part && !begin_count && !body_downloads && !boot_count);
-    assert(!mqtt_publish_attempts && !s_otacp_pending);
-    memset(&r,0xA5,sizeof(r));assert(simple_ota_get_download_result(&r)==ESP_ERR_NOT_FOUND && r.partition==NULL);
-    puts("PASS no-new-version bootstraps only verified running image without download or fake OTACP");
+    for(unsigned root=0;root<2;root++) {
+        reset_case(root);strcpy(server_metadata,"{\"version\":\"1.0.0\",\"file\":\"fw_v1.0.0.bin\"}");
+        if(root)run_root_download();else mesh_ota_service_poll(CMD_EVT_REQUEST);
+        assert(simple_ota_get_state()==SIMPLE_OTA_STATE_IDLE && ready_logs==1 && s_ready_file.valid);
+        assert(!begin_count && !body_downloads && !boot_count && !transmit_count && metadata_reads==1);
+        assert(s_ready_file.partition==current_part && !strcmp(registered_name,"fw_v1.0.0.bin"));
+        ota_cache_record_t current;assert(ota_cache_load(&current)==ESP_OK && current.origin==OTA_CACHE_ORIGIN_CURRENT);
+        check_report("100000010","2");
+        p=(esp_mesh_lite_lan_ota_file_transfer_param_t){.fw_version=registered_name,.filesize=65536,
+            .offset=0,.data=out,.data_size=sizeof(out)};
+        assert(provide_file_cb(&p)==ESP_OK && !memcmp(out,fixture,sizeof(out)));
+        assert(simple_ota_get_download_result(&r)==ESP_ERR_NOT_FOUND && r.partition==NULL);
+    }
+    puts("PASS root and child equal-version completion follows verified, committed, registered and resumed supply; ACK immediately permits reads");
+
+    for(unsigned root=0;root<2;root++) {
+        for(unsigned failure=0;failure<9;failure++) {
+            reset_case(root);strcpy(server_metadata,"{\"version\":\"1.0.0\",\"file\":\"fw_v1.0.0.bin\"}");
+            switch(failure) {
+                case 0: unknown_size=true;break;
+                case 1: override_image_size=fixture_size-1;break;
+                case 2: fail_image_verify=true;break;
+                case 3: fail_read=true;break;
+                case 4: fail_nvs_set=true;break;
+                case 5: fail_nvs_commit=true;break;
+                case 6: fail_register=true;break;
+                case 7: fail_resume=true;break;
+                case 8: DEVICE_ID="";break;
+            }
+            if(root)run_root_download();else mesh_ota_service_poll(CMD_EVT_REQUEST);
+            assert(!ready_logs && !s_ready_file.valid && !mqtt_publish_attempts && !s_otacp_pending);
+            assert(!body_downloads && !transmit_count && !begin_count && !boot_count && s_retry_waiting);
+            unknown_size=false;override_image_size=0;fail_image_verify=fail_read=fail_nvs_set=fail_nvs_commit=false;
+            fail_register=fail_resume=false;DEVICE_ID="100000010";
+            strcpy(server_metadata,"{\"version\":\"9.0.0\",\"file\":\"wrong_v9.0.0.bin\"}");
+            now=s_retry_deadline;mesh_ota_service_poll(0);
+            assert(s_ready_file.valid && ready_logs==1 && !strcmp(registered_name,"fw_v1.0.0.bin"));
+            assert(metadata_reads==1 && !body_downloads && !begin_count && !transmit_count && !boot_count);
+            check_report("100000010","2");
+        }
+    }
+    puts("PASS failed size/image/SHA/NVS/registration/resume/identity gates never publish early; retry preserves original target without BIN download");
+
+    for(unsigned root=0;root<2;root++) {
+        reset_case(root);strcpy(server_metadata,"{\"version\":\"1.0.0\",\"file\":\"fw_v1.0.0.bin\"}");
+        mqtt_connected=false;
+        if(root)run_root_download();else mesh_ota_service_poll(CMD_EVT_REQUEST);
+        assert(s_ready_file.valid && s_otacp_pending && !mqtt_publish_attempts);
+        char original_payload[256];strcpy(original_payload,s_otacp_payload);
+        wall_time+=100;DEVICE_ID="changed";AgingNumber="7";mqtt_connected=true;mqtt_publish_result=-2;
+        now=s_otacp_retry_tick;mesh_ota_service_poll(0);assert(s_otacp_pending && mqtt_publish_attempts==1);
+        mqtt_publish_result=42;now=s_otacp_retry_tick-1;mesh_ota_service_poll(0);assert(mqtt_publish_attempts==1);
+        now++;mesh_ota_service_poll(0);check_report("100000010","2");assert(!strcmp(original_payload,reported_payload));
+        simulate_boot(current_part);http_status=503;mqtt_connected=false;mesh_ota_service_poll(0);
+        assert(s_ready_file.valid && !metadata_reads);check_no_boot_report();
+        http_status=200;DEVICE_ID="100000010";AgingNumber="2";wall_time=1782374000;
+        if(root)run_root_download();else mesh_ota_service_poll(CMD_EVT_REQUEST);
+        check_report_at("100000010","2",1782374000);
+        assert(s_ready_file.valid && !body_downloads && !begin_count && !transmit_count);
+    }
+    puts("PASS equal-version MQTT outage retries in the same boot; reboot is silent and a fresh same-version command still reports");
+
+    for(unsigned root=0;root<2;root++) {
+        reset_case(root);strcpy(server_metadata,"{\"version\":\"1.0.0\",\"file\":\"fw_v1.0.0.bin\"}");
+        fail_register=true;
+        if(root)run_root_download();else mesh_ota_service_poll(CMD_EVT_REQUEST);
+        assert(nvs_exists && !ready_logs && !mqtt_publish_attempts && s_finalization_pending);
+        simulate_boot(current_part);http_status=503;DEVICE_ID="changed";AgingNumber="7";mesh_ota_service_poll(0);
+        assert(s_ready_file.valid && !metadata_reads && !body_downloads);check_no_boot_report();
+
+        simulate_boot(current_part);http_status=503;running_flash_bytes[100]^=1;mesh_ota_service_poll(0);
+        assert(!s_ready_file.valid && !ready_logs && !mqtt_publish_attempts && !s_otacp_pending);
+    }
+    puts("PASS reboot restores committed equal-version supply without OTACP, including power cut before READY");
+
+    for(unsigned root=0;root<2;root++) {
+        for(unsigned current=0;current<2;current++) {
+            reset_case(root);
+            if(current)strcpy(server_metadata,"{\"version\":\"1.0.0\",\"file\":\"fw_v1.0.0.bin\"}");
+            mqtt_connected=false;
+            if(current){if(root)run_root_download();else mesh_ota_service_poll(CMD_EVT_REQUEST);}
+            else if(root)run_root_download();
+            else {receive_body();assert(get_file_done_cb()==ESP_OK);terminal(ESP_MESH_LITE_EVENT_OTA_SUCCESS);}
+            assert(s_ready_file.valid && s_otacp_pending && !mqtt_publish_attempts);
+            simulate_boot(current?current_part:boot_part);http_status=503;fail_register=true;mesh_ota_service_poll(0);
+            assert(s_finalization_pending && s_retry_waiting && !s_otacp_pending && !mqtt_publish_attempts);
+            fail_register=false;now=s_retry_deadline;mesh_ota_service_poll(0);
+            assert(s_ready_file.valid && !s_finalization_pending && !metadata_reads && !body_downloads);
+            check_no_boot_report();
+        }
+    }
+    puts("PASS unsent download/current completion is discarded on reboot; supply recovery retries remain silent for root and child");
+
+    for(unsigned root=0;root<2;root++) {
+        reset_case(root);strcpy(server_metadata,"{\"version\":\"1.0.0\",\"file\":\"fw_v1.0.0.bin\"}");
+        if(root)run_root_download();else mesh_ota_service_poll(CMD_EVT_REQUEST);
+        simulate_boot(current_part);fail_register=true;mesh_ota_service_poll(0);
+        for(unsigned retry=0;retry<2;retry++){now=s_retry_deadline;mesh_ota_service_poll(0);}
+        assert(s_finalization_pending && !s_retry_waiting && !mqtt_publish_attempts);
+        fail_register=false;mesh_ota_service_poll(CMD_EVT_REQUEST);
+        assert(s_ready_file.valid && !mqtt_publish_attempts && (s_cmd_events->bits&CMD_EVT_REQUEST));
+        wall_time=1782374000;
+        if(root)run_root_download();else mesh_ota_service_poll(CMD_EVT_REQUEST);
+        check_report_at("100000010","2",1782374000);
+        assert(!body_downloads && !begin_count && !transmit_count);
+    }
+    puts("PASS an explicit OTA command after exhausted boot recovery is retained and reports its own current-version completion");
+
+    reset_case(true);strcpy(server_metadata,"{\"version\":\"1.0.0\",\"file\":\"fw_v1.0.0.bin\"}");
+    s_recovery_pending=true;mesh_ota_service_poll(0);assert(s_ready_file.valid && !mqtt_publish_attempts);
+    unknown_size=true;run_root_download();check_report("100000010","2");
+    assert(s_ready_file.valid && !body_downloads && !begin_count);
+    puts("PASS valid matching cache permits same-version completion without HTTP BIN header availability");
+
+    reset_case(true);strcpy(server_metadata,"{\"version\":\"1.0.0\",\"file\":\"fw_v1.0.0.bin\"}");
+    s_recovery_pending=true;mesh_ota_service_poll(0);assert(!mqtt_publish_attempts);
+    strcpy(server_metadata,"{\"version\":\"1.0.0\",\"file\":\"other_v1.0.0.bin\"}");
+    unknown_size=true;run_root_download();assert(!s_ready_file.valid && !mqtt_publish_attempts && s_retry_waiting);
+    ota_cache_record_t previous;assert(ota_cache_load(&previous)==ESP_OK && !strcmp(previous.file_name,"fw_v1.0.0.bin"));
+    unknown_size=false;now=s_retry_deadline;mesh_ota_service_poll(0);
+    assert(s_ready_file.valid && !strcmp(registered_name,"other_v1.0.0.bin"));check_report("100000010","2");
+    puts("PASS same version with another filename cannot reuse a mismatching cache or report before exact target binding");
+
+    reset_case(true);run_root_download();simulate_boot(boot_part);mesh_ota_service_poll(0);
+    mqtt_publish_attempts=mqtt_accepted=0;DEVICE_ID="100000011";AgingNumber="3";wall_time=1782373600;
+    strcpy(server_metadata,"{\"version\":\"1.1.0\",\"file\":\"fw_v1.1.0.bin\"}");
+    mqtt_connected=false;fail_register=true;run_root_download();
+    assert(s_finalization_pending && !s_otacp_pending && !mqtt_publish_attempts && !begin_count);
+    fail_register=false;now=s_retry_deadline;mesh_ota_service_poll(0);assert(s_ready_file.valid && s_otacp_pending);
+    mqtt_connected=true;now=s_otacp_retry_tick;mesh_ota_service_poll(0);check_report_at("100000011","3",1782373600);
+    simulate_boot(current_part);http_status=503;DEVICE_ID="changed";mesh_ota_service_poll(0);
+    assert(s_ready_file.valid);check_no_boot_report();
+    puts("PASS equal-version command replaces historical download event only through verified supply finalization");
+
+    reset_case(true);strcpy(server_metadata,"{\"version\":\"1.0.0\",\"file\":\"fw_v1.0.0.bin\"}");
+    mesh_ota_service_poll(CMD_EVT_REQUEST);s_download_error=simple_ota_check_and_update_default();
+    strcpy(server_metadata,"{\"version\":\"9.0.0\",\"file\":\"fw_v9.0.0.bin\"}");
+    mesh_ota_service_poll(CMD_EVT_DOWNLOAD_DONE);check_report("100000010","2");
+    assert(metadata_reads==1 && !strcmp(registered_name,"fw_v1.0.0.bin") && !body_downloads);
+    http_status=503;run_root_download();assert(mqtt_publish_attempts==1 && s_retry_waiting);
+    int comparison=42;assert(simple_ota_get_version_comparison(&comparison)==ESP_ERR_NOT_FOUND && comparison==0);
+    simple_ota_metadata_t checked;assert(simple_ota_get_checked_metadata(&checked)==ESP_ERR_NOT_FOUND && !checked.file[0]);
+    puts("PASS root uses immutable comparison/file snapshot and clears stale results before another check");
+
+    for(unsigned root=0;root<2;root++) {
+        reset_case(root);strcpy(server_metadata,"{\"version\":\"0.9.0\",\"file\":\"fw_v0.9.0.bin\"}");
+        if(root)run_root_download();else mesh_ota_service_poll(CMD_EVT_REQUEST);
+        assert(!mqtt_publish_attempts && !s_otacp_pending && !nvs_exists && !body_downloads && !transmit_count);
+        reset_case(root);strcpy(running_image_version,"invalid");
+        if(root)run_root_download();else mesh_ota_service_poll(CMD_EVT_REQUEST);
+        assert(!mqtt_publish_attempts && !nvs_exists && simple_ota_get_state()==SIMPLE_OTA_STATE_FAILED);
+    }
+    puts("PASS older/invalid versions never generate a new completion");
+
+    for(unsigned root=0;root<2;root++) {
+        reset_case(root);strcpy(server_metadata,"{\"version\":\"1.0.0\",\"file\":\"fw_v1.0.0.bin\"}");
+        unknown_size=true;
+        if(root)run_root_download();else mesh_ota_service_poll(CMD_EVT_REQUEST);
+        for(unsigned retry=0;retry<2;retry++) {now=s_retry_deadline;mesh_ota_service_poll(0);}
+        assert(!s_retry_waiting && s_retry_count==2 && !s_ready_file.valid && !mqtt_publish_attempts);
+        now+=180000;mesh_ota_service_poll(0);assert(metadata_reads==1 && !mqtt_publish_attempts);
+        unknown_size=false;
+        if(root)run_root_download();else mesh_ota_service_poll(CMD_EVT_REQUEST);
+        check_report("100000010","2");assert(s_ready_file.valid && !body_downloads && !transmit_count);
+    }
+    puts("PASS equal-version supply preparation has bounded retries and a fresh command can recover after exhaustion");
+
+    reset_case(true);strcpy(server_metadata,"{\"version\":\"1.0.0\",\"file\":\"fw_v1.0.0.bin\"}");
+    run_root_download();mqtt_publish_attempts=mqtt_accepted=0;
+    strcpy(server_metadata,"{\"version\":\"1.1.0\",\"file\":\"fw_v1.1.0.bin\"}");run_root_download();
+    assert(begin_count==1 && body_downloads==1 && simple_ota_get_state()==SIMPLE_OTA_STATE_PENDING_RESTART);
+    ota_cache_record_t next;assert(ota_cache_load(&next)==ESP_OK && next.origin==OTA_CACHE_ORIGIN_DOWNLOAD);
+    check_report("100000010","2");simulate_boot(boot_part);http_status=503;mesh_ota_service_poll(0);
+    assert(s_ready_file.valid && !metadata_reads);check_no_boot_report();
+    puts("PASS current-version supply record can be replaced by a new download; its supply recovers silently after reboot");
 
     reset_case(true);incomplete_body=true;run_root_download();
     assert(!ready_logs && !registration_count && abort_count==1 && !handle_live && s_retry_waiting);
@@ -604,17 +784,17 @@ int main(void) {
     simulate_boot(&running_part);mesh_ota_service_poll(0);
     assert(ready_logs==1 && s_ready_file.partition==&update_part && boot_part==&update_part && boot_count==1);
     assert(simple_ota_get_state()==SIMPLE_OTA_STATE_PENDING_RESTART && !body_downloads && !metadata_reads && !nvs_writes);
-    check_report("100000010","2");
-    puts("PASS committed cache survives cut before boot selection, resumes staged supply and original OTACP");
+    check_no_boot_report();
+    puts("PASS committed cache survives cut before boot selection and resumes staged supply without OTACP");
 
     reset_case(true);fail_register=true;run_root_download();assert(nvs_exists && boot_part==&update_part && !ready_logs);
     simulate_boot(boot_part);mqtt_connected=false;DEVICE_ID="changed";AgingNumber="7";mesh_ota_service_poll(0);
     assert(ready_logs==1 && s_ready_file.partition==current_part && simple_ota_get_state()==SIMPLE_OTA_STATE_IDLE);
-    assert(!boot_count && !nvs_writes && !metadata_reads && !body_downloads && s_otacp_pending);
+    assert(!boot_count && !nvs_writes && !metadata_reads && !body_downloads && !s_otacp_pending);
     p=(esp_mesh_lite_lan_ota_file_transfer_param_t){.fw_version="fw_v1.1.0.bin",.filesize=65536,.offset=0,.data=out,.data_size=sizeof(out)};
     assert(provide_file_cb(&p)==ESP_OK && !memcmp(out,fixture,sizeof(out)));
-    mqtt_connected=true;now=s_otacp_retry_tick;mesh_ota_service_poll(0);check_report("100000010","2");
-    puts("PASS rebooted new firmware serves running partition offline and replays original device/Seq notification");
+    check_no_boot_report();
+    puts("PASS rebooted new firmware serves running partition offline and remains silent after MQTT reconnect");
 
     /* 已运行 B 的缓存恢复不得把状态误留为 pending，后续 C 写回 ota_0。 */
     strcpy(server_metadata,"{\"version\":\"1.2.0\",\"file\":\"fw_v1.2.0.bin\"}");
@@ -666,18 +846,18 @@ int main(void) {
     puts("PASS overlapping cache must be invalidated and committed before overwrite admission");
 
     reset_case(true);run_root_download();simulate_boot(&running_part);mqtt_connected=false;mesh_ota_service_poll(CMD_EVT_REQUEST);
-    assert(ready_logs==1 && s_request_deferred && !s_root_downloading && !body_downloads && s_otacp_pending);
-    mqtt_connected=true;now=s_otacp_retry_tick;mesh_ota_service_poll(0);assert(!s_otacp_pending && !s_request_deferred);
-    check_report("100000010","2");
-
-    puts("PASS startup recovery and original completion report precede a deferred upgrade command");
+    assert(ready_logs==1 && !s_request_deferred && !s_root_downloading && !body_downloads && !s_otacp_pending);
+    check_no_boot_report();
+    assert(simple_ota_get_state()==SIMPLE_OTA_STATE_PENDING_RESTART);
+    puts("PASS staged supply recovery ignores duplicate download commands without waiting for a boot notification");
 
     reset_case(false);receive_body();assert(get_file_done_cb()==ESP_OK);terminal(ESP_MESH_LITE_EVENT_OTA_SUCCESS);
     simulate_boot(boot_part);mqtt_connected=false;mesh_ota_service_poll(0);
     assert(IsRoot==0 && ready_logs==1 && s_ready_file.partition==current_part && !s_root_downloading);
     p=(esp_mesh_lite_lan_ota_file_transfer_param_t){.fw_version="fw_v1.1.0.bin",.filesize=65536,.offset=0,.data=out,.data_size=sizeof(out)};
     assert(provide_file_cb(&p)==ESP_OK && !memcmp(out,fixture,sizeof(out)) && !metadata_reads && !body_downloads);
-    puts("PASS intermediate child recovers current-slot supply without taking the root download path");
+    check_no_boot_report();
+    puts("PASS intermediate child recovers current-slot supply silently without taking the root download path");
 
     reset_case(false);fail_nvs_open=true;mesh_ota_service_poll(CMD_EVT_REQUEST);
     assert(!transmit_count && !begin_count && !boot_count && !ready_logs);

@@ -44,6 +44,12 @@ CONFIG_OTA_AUTO_CANCEL_ROLLBACK=y
 CONFIG_OTA_DATA_LEN=1376
 CONFIG_OTA_WND_DEFAULT=8256
 
+# 按键诊断：用 ESP Timer 和两核 Idle 任务增量估算 CPU 占用率。
+# 64 位计数避免微秒时钟/任务累计值在约 71 分钟后溢出。
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER=y
+CONFIG_FREERTOS_RUN_TIME_COUNTER_TYPE_U64=y
+
 # --- 以下为 2026-10-19 从 build/mesh-lite/sdkconfig 手工设置补入 defaults ---
 # 背景：删除 sdkconfig 重新生成时这些项全部回落到 Kconfig 默认值
 # （Flash 2MB / 单 app 分区表 / BT 关闭 / PSRAM 关闭），导致编译失败。

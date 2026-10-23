@@ -38,7 +38,8 @@ static bool record_valid(const ota_cache_record_t *record)
 {
     if (record == NULL || record->magic != OTA_CACHE_MAGIC ||
         record->format_version != OTA_CACHE_FORMAT_VERSION || record->record_bytes != sizeof(*record) ||
-        (record->origin != OTA_CACHE_ORIGIN_DOWNLOAD && record->origin != OTA_CACHE_ORIGIN_BOOTSTRAP) ||
+        (record->origin != OTA_CACHE_ORIGIN_DOWNLOAD && record->origin != OTA_CACHE_ORIGIN_BOOTSTRAP &&
+         record->origin != OTA_CACHE_ORIGIN_CURRENT) ||
         (record->partition_subtype != ESP_PARTITION_SUBTYPE_APP_OTA_0 &&
          record->partition_subtype != ESP_PARTITION_SUBTYPE_APP_OTA_1) ||
         record->image_size_bytes == 0 || record->image_size_bytes > record->partition_size ||
@@ -50,7 +51,7 @@ static bool record_valid(const ota_cache_record_t *record)
         !terminated(record->device_id, sizeof(record->device_id)) ||
         !terminated(record->aging_number, sizeof(record->aging_number)) ||
         !terminated(record->sha256_hex, sizeof(record->sha256_hex)) || strlen(record->sha256_hex) != 64) return false;
-    if (record->origin == OTA_CACHE_ORIGIN_DOWNLOAD &&
+    if (record->origin != OTA_CACHE_ORIGIN_BOOTSTRAP &&
         (record->completed_seq < 0 || record->device_id[0] == '\0' || record->aging_number[0] == '\0')) return false;
     if (record->origin == OTA_CACHE_ORIGIN_BOOTSTRAP && record->completed_seq != 0) return false;
     for (size_t i = 0; i < 64; ++i) {

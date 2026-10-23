@@ -116,6 +116,7 @@ bool simple_ota_is_pending_restart(void);
  * - 服务器版本 > 本地版本：下载并校验非运行槽，生成下载结果并返回 ESP_OK。
  *   仍保持 RUNNING，供 Mesh OTA 服务先持久化、再设置启动分区及完成通知。
  * - 服务器版本 <= 本地版本：不升级，返回 ESP_OK，状态回 IDLE。
+ *   Mesh OTA 服务读取比较/元数据快照；相等时确认供数就绪后上报完成，更旧版本不生成新回执。
  * - 状态为 PENDING_RESTART 时收到新的 OTA 命令：忽略，保留已暂存的新固件，
  *   返回 ESP_OK。
  * - 网络、JSON、版本格式或 OTA 出错：返回对应错误码，状态置 FAILED。
@@ -154,6 +155,15 @@ typedef struct {
  * （包括版本无需更新）；失败时清零输出。重复 pending 命令保留原快照。
  */
 esp_err_t simple_ota_get_download_result(simple_ota_download_result_t *out_result);
+
+/** 最近一次 HTTP 检查的目标版本相对运行版本的 -1/0/1 比较快照。
+ * 检查开始时清除；未完成合法版本比较返回 ESP_ERR_NOT_FOUND，输出置零。
+ * 任务上下文可调用，非 ISR，短临界区复制、无阻塞；不重新请求元数据。 */
+esp_err_t simple_ota_get_version_comparison(int *comparison);
+
+/** 复制上述同一次版本检查的元数据，不重新访问服务器；调用约束同比较快照。
+ * 未完成合法版本比较返回 ESP_ERR_NOT_FOUND 并清零输出。 */
+esp_err_t simple_ota_get_checked_metadata(simple_ota_metadata_t *metadata);
 
 /** 严格三段版本比较，成功时 comparison 为 -1/0/1。任务上下文，无网络和阻塞。 */
 esp_err_t simple_ota_compare_versions(const char *left, const char *right, int *comparison);

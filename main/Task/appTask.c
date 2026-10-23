@@ -39,6 +39,7 @@
 #include "modbus_cmd.h"
 #include "esp_heap_caps.h"
 #include "app_mem.h"
+#include "app_cpu.h"
 #include "SelfRecovery.h"
 #include "task_config.h"
 #include "ota.h"
@@ -101,6 +102,7 @@ uint64_t SafeCode = 0;     // 安全码
 
 static void show_free_heap(const char *tag)
 {
+    app_cpu_usage_log(tag);
     size_t free_internal_heap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     size_t min_internal_heap = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     size_t largest_internal_block = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -3655,7 +3657,7 @@ static void button_task(void *arg)
 
     while (1)
     {
-
+        app_cpu_usage_poll();
         if (gpio_get_level(BUTTON_PIN) == 0)
         {
             if (click_count == 0)
@@ -3684,6 +3686,7 @@ static void button_task(void *arg)
             //  等待按钮释放
             while (gpio_get_level(BUTTON_PIN) == 0)
             {
+                app_cpu_usage_poll();
                 vTaskDelay(pdMS_TO_TICKS(50));
             }
             vTaskDelay(pdMS_TO_TICKS(50));
