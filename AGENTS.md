@@ -74,6 +74,8 @@ NVS `SelfRecovery` 保存掉电恢复状态（`aging_valid`、`current_step`、`
 
 **网络**：Mesh-Lite 组网，每个取得 STA IP 的节点独立连接 MQTT（broker IP 与 `SERVER_IP` 同源）。
 根节点额外运行 dual_net 有线优先（仅根节点，接管 iot_bridge 的 ETH_WAN netif）。
+每次 MQTT 重连均恢复订阅和发送上线通知；完整配置自动上报每次启动成功入队一次，RAM
+标志只随设备重启清零，客户端重建/出口切换不清零。上位机显式 `get_config` 请求照常响应。
 服务器地址集中在 [service_urls.h](main/Task/service_urls.h)：`_FMT` 模板的 IP 在运行时经
 `lg_url_build()` 用 `SERVER_IP`（baseconfig.json）填充——**换 IP 只改 baseconfig.json 并完整 flash，
 无需重编译**；端口/路径是编译期常量，改它们才需重新编译。

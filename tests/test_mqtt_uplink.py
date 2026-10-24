@@ -65,9 +65,17 @@ static const MockAppDesc *esp_app_get_description(void) { static MockAppDesc des
 static void Config_Report(int type) { (void)type; config_report_count++; }
 /* 应用层 SQLite 结算和补传入口由各自任务处理，此处只模拟模块边界。 */
 static void app_mqtt_publish_settled(int msg_id, bool acked) { (void)msg_id; (void)acked; }
-static void app_mqtt_backfill_wake(void) {}
+static unsigned backfill_wake_count;
+static bool fail_config_json, fail_config_enqueue;
+static size_t config_payload_bytes;
+static void app_mqtt_backfill_wake(void) { backfill_wake_count++; }
 static char *CreateReadConfigJsonFromFiles_MQTT(int seq, int cmd_seq, int code, const char *msg) {
-    (void)seq; (void)cmd_seq; (void)code; (void)msg; config_report_count++; return strdup("{\"config\":true}");
+    (void)seq; (void)cmd_seq; (void)code; (void)msg; config_report_count++;
+    if (fail_config_json) return NULL;
+    if (config_payload_bytes) {
+        char *p=malloc(config_payload_bytes+1);assert(p);memset(p,'x',config_payload_bytes);p[config_payload_bytes]=0;return p;
+    }
+    return strdup("{\"config\":true}");
 }
 static void *app_calloc_prefer_psram(size_t count, size_t bytes) { return calloc(count, bytes); }
 static uint32_t random_value;
@@ -205,6 +213,7 @@ static int esp_mqtt_client_publish(esp_mqtt_client_handle_t client, const char *
 }
 static int esp_mqtt_client_enqueue(esp_mqtt_client_handle_t client, const char *topic,
     const char *data, int len, int qos, int retain, bool store) {
+    if (fail_config_enqueue && strstr(topic,"/cmd/reply/config")) return -1;
     assert(store && qos == 1 && !in_sdk_callback); enqueue_count++;
     esp_mqtt_client_publish(client, topic, data, len, qos, retain);
     if (track_outbox_bytes) outbox_bytes += strlen(data) + strlen(topic) + 16;
@@ -222,6 +231,8 @@ static void reset(void) {
     memset(&s_mqtt_control, 0, sizeof(s_mqtt_control));
     atomic_store(&s_mqtt_connected, false);
     s_client_started = false; s_client_start_count = s_mqtt_connect_count = 0;
+    s_boot_config_enqueued=false;backfill_wake_count=0;
+    fail_config_json=fail_config_enqueue=false;config_payload_bytes=0;
     if (s_service_work.online_json) free(s_service_work.online_json);
     memset(&s_service_work, 0, sizeof(s_service_work));
     memset(&s_service_ack, 0, sizeof(s_service_ack));
@@ -263,6 +274,18 @@ static void *budget_publish_thread(void *arg) {
     (void)arg; char payload[1025]; memset(payload, 'x',1024); payload[1024]=0;
     for (int i=0; i<80; ++i) {int rc=app_mqtt_publish("budget",payload,NULL); assert(rc>0 || rc==-2);}
     return NULL;
+}
+static void finish_setup(void) { for (unsigned i=0;i<6;i++)mqtt_service_poll(); }
+static void start_role(bool child) {
+    if (!child) {start_wifi();return;}
+    IsRoot=0;assert(mqtt_app_start()==ESP_OK);
+    mqtt_service_poll();mqtt_service_poll();assert(s_client_started);
+    sdk_emit(s_client,MQTT_EVENT_CONNECTED);
+}
+static void reconnect_role(void) {
+    sdk_emit(s_client,MQTT_EVENT_DISCONNECTED);mqtt_service_poll();
+    now_us+=2000000;mqtt_service_poll();
+    sdk_emit(s_client,MQTT_EVENT_BEFORE_CONNECT);sdk_emit(s_client,MQTT_EVENT_CONNECTED);
 }
 int main(void) {
     reset(); start_wifi();
@@ -497,6 +520,60 @@ int main(void) {
     unsigned task_creates = service_task_creates;
     assert(mqtt_init() == ESP_OK && mqtt_app_start() == ESP_OK && service_task_creates == task_creates && init_count == 1);
     puts("PASS service creation failure prevents client startup; repeated init never duplicates worker");
+
+    for (unsigned child=0;child<2;child++) {
+        reset();early_suback=early_puback=true;start_role(child);finish_setup();
+        assert(s_boot_config_enqueued && config_report_count==1 && enqueue_count==2 && backfill_wake_count==1);
+        unsigned subscriptions=subscribe_count;
+        for(unsigned i=0;i<3;i++) {
+            reconnect_role();finish_setup();
+            assert(s_service_work.phase==MQTT_SETUP_DONE && config_report_count==1 && s_boot_config_enqueued);
+            assert(enqueue_count==(int)(3+i) && backfill_wake_count==2+i);
+            assert(subscribe_count==(int)(subscriptions*(2+i)));
+        }
+    }
+    puts("PASS root and child report config once per boot; every reconnect still subscribes, announces online and wakes backfill");
+
+    reset();early_suback=early_puback=true;start_wifi();finish_setup();mqtt_app_stop();
+    assert(s_boot_config_enqueued);start_wifi();finish_setup();
+    assert(config_report_count==1 && enqueue_count==3 && backfill_wake_count==2);
+    puts("PASS stopping and recreating an MQTT client does not reset the boot config flag");
+
+    reset();early_suback=early_puback=true;start_wifi();finish_setup();
+    set_route(DUAL_NET_UPLINK_ETH);sdk_emit(s_client,MQTT_EVENT_DISCONNECTED);
+    sdk_emit(s_client,MQTT_EVENT_BEFORE_CONNECT);sdk_emit(s_client,MQTT_EVENT_CONNECTED);finish_setup();
+    assert(s_boot_config_enqueued && config_report_count==1 && enqueue_count==3 && backfill_wake_count==2);
+    puts("PASS root Ethernet/WiFi handover retains the config flag and restores online without a second config");
+
+    reset();early_suback=early_puback=true;start_wifi();finish_setup();
+    assert(config_report_count==1 && s_boot_config_enqueued);
+    reset();assert(!s_boot_config_enqueued);early_suback=early_puback=true;start_wifi();finish_setup();
+    assert(config_report_count==1 && enqueue_count==2 && s_boot_config_enqueued);
+    puts("PASS a simulated device reboot clears the RAM-only flag and uploads config again");
+
+    reset();early_suback=early_puback=true;start_wifi();
+    for(unsigned i=0;i<4;i++)mqtt_service_poll();
+    assert(s_service_work.phase==MQTT_SETUP_CONFIG_WAIT && !s_boot_config_enqueued);
+    reconnect_role();finish_setup();
+    assert(s_boot_config_enqueued && config_report_count==1 && enqueue_count==3);
+    puts("PASS disconnect before first config does not mark it sent; next connection performs the boot report");
+
+    for(unsigned failure=0;failure<2;failure++) {
+        reset();early_suback=early_puback=true;start_wifi();
+        fail_config_json=failure==0;fail_config_enqueue=failure==1;finish_setup();
+        assert(!s_boot_config_enqueued && s_service_work.phase==MQTT_SETUP_CONFIG && config_report_count==1);
+        fail_config_json=fail_config_enqueue=false;
+        now_us=(int64_t)s_service_work.due*1000;mqtt_service_poll();
+        assert(s_boot_config_enqueued && config_report_count==2 && s_service_work.phase==MQTT_SETUP_DONE);
+        reconnect_role();finish_setup();assert(config_report_count==2);
+    }
+    puts("PASS config JSON or enqueue failure retries until SDK acceptance and only then suppresses reconnect reports");
+
+    reset();early_suback=early_puback=true;start_wifi();config_payload_bytes=MQTT_OUTBOX_NORMAL_BYTES;finish_setup();
+    assert(!s_boot_config_enqueued && config_report_count==1 && s_service_work.phase==MQTT_SETUP_DONE);
+    config_payload_bytes=0;reconnect_role();finish_setup();
+    assert(s_boot_config_enqueued && config_report_count==2);
+    puts("PASS an oversized rejected config is not marked sent and can be retried on a later connection");
 
     mqtt_app_stop();
     free(s_service_work.online_json); free(s_ack_map);

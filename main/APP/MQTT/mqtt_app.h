@@ -12,7 +12,9 @@ esp_err_t mqtt_app_start(void);
 /* start/init/stop 为任务上下文，可能阻塞；stop/restart 不可在 SDK事件回调或ISR调用。 */
 void mqtt_app_stop(void);
 void mqtt_app_restart(void);
-/** 唯一 CPU1 服务任务入口，由应用建任务封装创建；不可作为普通函数调用。 */
+/** 唯一 CPU1 服务任务入口，由应用建任务封装创建；不可作为普通函数调用。
+ * 每次连接恢复订阅及上线通知；完整配置自动上报每次启动成功入队一次，客户端重建不清零。
+ * 上位机主动 get_config 的回应不受此限制，SDK 接受入队不表示上位机落库。 */
 void mqtt_app_service_task(void *arg);
 /** 返回 >=0 表示接受（QoS0 为0）；-2容量不足，-1其他失败，不表示服务器落库。 */
 int app_mqtt_publish(char *topic_name, char *publish_string, char *UDP_ID);

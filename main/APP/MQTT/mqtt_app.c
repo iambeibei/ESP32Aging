@@ -136,6 +136,9 @@ static uint8_t s_node_retry_step;
 static bool s_node_retry_scheduled;
 static TickType_t s_node_retry_due;
 static bool s_node_first_start;
+/* 仅 MQTT 服务任务访问，整个启动周期保留；断线、stop/init 和出口切换均不清零。
+ * 成功指 SDK 接受完整配置（由 QoS1 负责重传），不是上位机业务确认。不写入 NVS。 */
+static bool s_boot_config_enqueued;
 
 typedef struct {
     uint32_t epoch;
@@ -1167,8 +1170,14 @@ static void mqtt_service_poll(void)
     }
     if (work->phase == MQTT_SETUP_ONLINE_ACK) {
         if (flags & MQTT_ACK_PUBLISHED) {
-            work->phase = MQTT_SETUP_CONFIG_WAIT;
-            work->due = now + pdMS_TO_TICKS(esp_random() % (MQTT_CONFIG_JITTER_MS + 1U));
+            if (s_boot_config_enqueued) {
+                work->phase = MQTT_SETUP_DONE;
+                app_mqtt_backfill_wake(); /* 重连同样需要唤醒补传，不能依赖配置再次发布。 */
+                ESP_LOGI(TAG, "本次启动已上报配置，MQTT 重连跳过自动配置上报");
+            } else {
+                work->phase = MQTT_SETUP_CONFIG_WAIT;
+                work->due = now + pdMS_TO_TICKS(esp_random() % (MQTT_CONFIG_JITTER_MS + 1U));
+            }
             work->retry_step = 0;
             ESP_LOGI(TAG, "MQTT online confirmed: epoch=%lu", (unsigned long)epoch);
         } else if (flags & MQTT_ACK_DELETED) {
@@ -1212,6 +1221,8 @@ static void mqtt_service_poll(void)
                 work->phase = MQTT_SETUP_DONE;
                 app_mqtt_backfill_wake(); /* 上线完成：触发断线补传扫描 */
             } else if (mqtt_enqueue_for_session(topic, json, epoch, false) > 0) {
+                s_boot_config_enqueued = true;
+                ESP_LOGI(TAG, "本次启动完整配置已入队，后续重连不重复自动上报");
                 work->phase = MQTT_SETUP_DONE;
                 app_mqtt_backfill_wake(); /* 上线完成：触发断线补传扫描 */
             } else mqtt_setup_retry(work, now);
