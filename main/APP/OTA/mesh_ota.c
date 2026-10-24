@@ -57,11 +57,20 @@ static const char *TAG = "mesh_ota";
 #define LG_MESH_OTA_PARENT_STABLE_MS 10000u
 #define LG_MESH_OTA_PARENT_JITTER_MS 3000u
 #define LG_MESH_OTA_DRAIN_WARN_MS 30000u
+/* 首块等待与恢复控制独立于 SDK 的 Pending 定时器，不开启第二次传输。 */
+#define LG_MESH_OTA_FIRST_DATA_WAIT_MS 10000u
+#define LG_MESH_OTA_RESUME_INTERVAL_MS 5000u
+#define LG_MESH_OTA_RESUME_JITTER_MS 1000u
+#define LG_MESH_OTA_RESUME_REQUEST_MAX 3u
+#define LG_MESH_OTA_RESUME_MAILBOX_SIZE 8u
+#define LG_MESH_OTA_RESUME_REQUEST_TTL_MS 30000u
+#define LG_MESH_OTA_RESUME_MSG "lg_ota_resume_request_v1"
 
 #define CMD_EVT_REQUEST BIT0
 #define CMD_EVT_FINISH BIT1
 #define CMD_EVT_DOWNLOAD_DONE BIT2
 #define CMD_EVT_PARENT BIT3
+#define CMD_EVT_RESUME BIT4
 #define DL_EVT_START BIT0
 
 typedef struct {
@@ -78,6 +87,10 @@ static EventGroupHandle_t s_cmd_events, s_dl_events;
 static StaticSemaphore_t s_ota_mutex_buf;
 static SemaphoreHandle_t s_ota_mutex;
 static atomic_bool s_initialized;
+/* 1=可受理，0=命令已排队或正在执行。MQTT 入口用原子交换避免连续命令重复入队。 */
+static atomic_bool s_command_available = true;
+/* 仅服务任务访问；区分“入口已置 0、尚未来得及置事件位”和实际消费过的命令。 */
+static bool s_command_observed;
 
 /* 网络事件不能等待 Flash/OTA mutex。代次锁仅保护定宽快照；回调写入前也核对它。 */
 typedef struct {
@@ -90,6 +103,23 @@ static OtaParentState s_parent;
 static uint32_t s_rx_parent_generation;
 /* 旧 SDK 终态未排空时，禁止新传输；esp_ota_abort 不能替代库取消接口。 */
 static bool s_sdk_inflight;
+/* 接收回调只登记首块事实；服务任务据此停止恢复请求。 */
+static bool s_rx_first_data;
+static TickType_t s_rx_start_tick;
+
+typedef struct {
+    char file_name[SIMPLE_OTA_BINARY_FILENAME_CAPACITY];
+    char version[SIMPLE_OTA_VERSION_MAX_LEN];
+    char device_id[OTA_CACHE_ID_CAPACITY];
+    uint32_t size_bytes;
+    uint32_t request_id;
+    TickType_t received_tick;
+} OtaResumeRequest;
+/* SDK 消息回调不能等 OTA/Flash 锁；固定邮箱仅在短临界区内复制值。 */
+static portMUX_TYPE s_resume_lock = portMUX_INITIALIZER_UNLOCKED;
+static OtaResumeRequest s_resume_mailbox[LG_MESH_OTA_RESUME_MAILBOX_SIZE];
+static unsigned s_resume_head, s_resume_count;
+static uint32_t s_resume_dropped;
 
 /* s_ota_mutex 保护以下接收会话、完成事实与供数记录。 */
 static esp_ota_handle_t s_ota_handle;
@@ -134,6 +164,11 @@ static char s_report_device_id[OTA_CACHE_ID_CAPACITY];
 static char s_report_aging_number[OTA_CACHE_ID_CAPACITY];
 /* 同版本命令正在准备供数；普通失败重试复用 s_metadata 中的原目标。 */
 static bool s_current_supply_pending;
+/* 以下控制调度仅由服务任务访问，首块事实仍经 s_ota_mutex 读取。 */
+static unsigned s_resume_request_count;
+static uint32_t s_resume_request_id;
+static TickType_t s_resume_request_due, s_last_resume_tick;
+static bool s_resume_exhausted_logged, s_last_resume_valid;
 
 static void schedule_retry(void);
 static void start_attempt(void);
@@ -184,6 +219,165 @@ static bool binary_name_valid(const char *name)
            strnlen(name, SIMPLE_OTA_BINARY_FILENAME_CAPACITY) < SIMPLE_OTA_BINARY_FILENAME_CAPACITY;
 }
 
+static bool resume_u32(const cJSON *item, uint32_t *value)
+{
+    if (!cJSON_IsNumber(item) || !(item->valuedouble >= 1 && item->valuedouble <= UINT32_MAX)) return false;
+    *value = (uint32_t)item->valuedouble;
+    return item->valuedouble == (double)*value;
+}
+
+/* SDK 通信任务调用：不保存 cJSON 指针、不操作 Flash、不等待 OTA mutex。无回复消息；
+ * “收到有效固件首块”才是恢复生效的确认，SDK send 返回成功不能替代它。 */
+static cJSON *resume_request_cb(cJSON *payload, uint32_t seq)
+{
+    (void)seq;
+    if (!s_initialized || !cJSON_IsObject(payload)) return NULL;
+    const cJSON *file = cJSON_GetObjectItemCaseSensitive(payload, "File");
+    const cJSON *version = cJSON_GetObjectItemCaseSensitive(payload, "Version");
+    const cJSON *device = cJSON_GetObjectItemCaseSensitive(payload, "DeviceId");
+    OtaResumeRequest request = {0};
+    if (!cJSON_IsString(file) || !binary_name_valid(file->valuestring) ||
+        !cJSON_IsString(version) || version->valuestring == NULL || version->valuestring[0] == '\0' ||
+        strnlen(version->valuestring, sizeof(request.version)) >= sizeof(request.version) ||
+        !cJSON_IsString(device) || device->valuestring == NULL || device->valuestring[0] == '\0' ||
+        strnlen(device->valuestring, sizeof(request.device_id)) >= sizeof(request.device_id) ||
+        !resume_u32(cJSON_GetObjectItemCaseSensitive(payload, "Size"), &request.size_bytes) ||
+        !resume_u32(cJSON_GetObjectItemCaseSensitive(payload, "RequestId"), &request.request_id)) return NULL;
+    strlcpy(request.file_name, file->valuestring, sizeof(request.file_name));
+    strlcpy(request.version, version->valuestring, sizeof(request.version));
+    strlcpy(request.device_id, device->valuestring, sizeof(request.device_id));
+    request.received_tick = xTaskGetTickCount();
+    portENTER_CRITICAL(&s_resume_lock);
+    if (s_resume_count < LG_MESH_OTA_RESUME_MAILBOX_SIZE) {
+        unsigned tail = (s_resume_head + s_resume_count) % LG_MESH_OTA_RESUME_MAILBOX_SIZE;
+        s_resume_mailbox[tail] = request;
+        ++s_resume_count;
+    } else if (s_resume_dropped < UINT32_MAX) {
+        ++s_resume_dropped;
+    }
+    portEXIT_CRITICAL(&s_resume_lock);
+    xEventGroupSetBits(s_cmd_events, CMD_EVT_RESUME);
+    return NULL;
+}
+
+static const esp_mesh_lite_msg_action_t s_resume_actions[] = {
+    {LG_MESH_OTA_RESUME_MSG, NULL, resume_request_cb},
+    {NULL, NULL, NULL},
+};
+
+/* 服务任务调用；与下级请求合并，限频时间包含初次就绪通知和通知提交失败。 */
+static esp_err_t notify_ready_children(const char *source)
+{
+    if (system_restart_is_planned()) {
+        ESP_LOGI(TAG, "OTA_RESUME_NOTIFY: source=%s suppressed by planned restart", source);
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_last_resume_tick = xTaskGetTickCount();
+    s_last_resume_valid = true;
+    esp_err_t err = esp_mesh_lite_ota_notify_child_node_restart();
+    ESP_LOGI(TAG, "OTA_RESUME_NOTIFY: level=%u file=%s source=%s result=%s",
+             (unsigned)esp_mesh_lite_get_level(), s_registered_file_name, source, esp_err_to_name(err));
+    return err;
+}
+
+static void poll_resume_requests(void)
+{
+    bool matched = false;
+    unsigned count;
+    uint32_t dropped;
+    portENTER_CRITICAL(&s_resume_lock);
+    count = s_resume_count; /* 每轮只消费进入时已有的请求，避免回调持续补充造成忙循环。 */
+    dropped = s_resume_dropped;
+    s_resume_dropped = 0;
+    portEXIT_CRITICAL(&s_resume_lock);
+    if (dropped != 0) ESP_LOGW(TAG, "OTA_RESUME_DROP: mailbox full count=%u", (unsigned)dropped);
+    for (unsigned i = 0; i < count; ++i) {
+        OtaResumeRequest request;
+        portENTER_CRITICAL(&s_resume_lock);
+        request = s_resume_mailbox[s_resume_head];
+        s_resume_head = (s_resume_head + 1) % LG_MESH_OTA_RESUME_MAILBOX_SIZE;
+        --s_resume_count;
+        portEXIT_CRITICAL(&s_resume_lock);
+        const char *reason = NULL;
+        if (xTaskGetTickCount() - request.received_tick >= pdMS_TO_TICKS(LG_MESH_OTA_RESUME_REQUEST_TTL_MS)) {
+            reason = "stale";
+        } else if (system_restart_is_planned()) {
+            reason = "restart_planned";
+        } else if (s_root_downloading || s_finalization_pending || s_child_request_active || s_current_supply_pending) {
+            reason = "busy";
+        } else if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) == pdTRUE) {
+            if (s_sdk_inflight || s_session_open || !s_ready_file.valid) reason = "not_ready";
+            else if (strcmp(request.file_name, s_ready_file.file_name) != 0 ||
+                     strcmp(request.version, s_ready_file.version) != 0 ||
+                     request.size_bytes != s_ready_file.size_bytes) reason = "target_mismatch";
+            ota_unlock();
+        } else reason = "lock_failed";
+        if (reason == NULL) matched = true;
+        ESP_LOGI(TAG, "OTA_RESUME_CHECK: device=%s request=%u file=%s result=%s",
+                 request.device_id, (unsigned)request.request_id, request.file_name, reason ? reason : "ready");
+    }
+    if (!matched) return;
+    /* 限频的请求本轮消费；子节点有独立的有界补发，不保留可能过期的恢复许可。 */
+    if (s_last_resume_valid && xTaskGetTickCount() - s_last_resume_tick < pdMS_TO_TICKS(LG_MESH_OTA_RESUME_INTERVAL_MS)) {
+        ESP_LOGI(TAG, "OTA_RESUME_COALESCED: notification rate limited");
+        return;
+    }
+    if (system_restart_is_planned()) return;
+    /* helper 已记录结果；提交失败仍依靠子节点下一次有限请求，不在本轮忙重试。 */
+    (void)notify_ready_children("child_request");
+}
+
+static esp_err_t send_resume_request(void)
+{
+    if (DEVICE_ID == NULL || DEVICE_ID[0] == '\0' ||
+        strnlen(DEVICE_ID, OTA_CACHE_ID_CAPACITY) >= OTA_CACHE_ID_CAPACITY) return ESP_ERR_INVALID_ARG;
+    cJSON *payload = cJSON_CreateObject();
+    if (payload == NULL) return ESP_ERR_NO_MEM;
+    esp_err_t err = ESP_ERR_NO_MEM;
+    if (cJSON_AddStringToObject(payload, "File", s_metadata.file) &&
+        cJSON_AddStringToObject(payload, "Version", s_metadata.version) &&
+        cJSON_AddStringToObject(payload, "DeviceId", DEVICE_ID) &&
+        cJSON_AddNumberToObject(payload, "Size", s_firmware_size_bytes) &&
+        cJSON_AddNumberToObject(payload, "RequestId", s_resume_request_id)) {
+        esp_mesh_lite_msg_config_t config = {.json_msg = {
+            .send_msg = LG_MESH_OTA_RESUME_MSG, .expect_msg = NULL,
+            /* 0 表示不追加 SDK 重传；次数由本服务任务控制，首块到达后无后台补发。 */
+            .max_retry = 0, .req_payload = payload, .resend = esp_mesh_lite_send_msg_to_parent,
+        }};
+        err = esp_mesh_lite_send_msg(ESP_MESH_LITE_JSON_MSG, &config);
+    }
+    /* 当前 SDK send_msg 在返回前复制/序列化 payload，所有权仍归本任务。 */
+    cJSON_Delete(payload);
+    return err;
+}
+
+static void poll_first_data(void)
+{
+    if (IsRoot == 1 || !s_child_request_active || s_child_wait_parent ||
+        s_retry_waiting || s_finalization_pending || system_restart_is_planned()) return;
+    if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) return;
+    bool waiting = s_session_open && s_rx_accepting && !s_rx_first_data &&
+                   !s_rx_done && !s_rx_failed && !s_finish_received && receiver_link_current();
+    TickType_t started = s_rx_start_tick;
+    ota_unlock();
+    if (!waiting || (int32_t)(xTaskGetTickCount() - s_resume_request_due) < 0) return;
+    if (s_resume_request_count >= LG_MESH_OTA_RESUME_REQUEST_MAX) {
+        if (!s_resume_exhausted_logged) {
+            ESP_LOGW(TAG, "OTA_FIRST_DATA_WAIT: resume requests exhausted; waiting for SDK terminal, no new transfer");
+            s_resume_exhausted_logged = true;
+        }
+        return;
+    }
+    ++s_resume_request_count; /* 内存/发送失败也消耗次数，避免异常环境无限补发。 */
+    esp_err_t err = send_resume_request();
+    s_resume_request_due = xTaskGetTickCount() + pdMS_TO_TICKS(LG_MESH_OTA_RESUME_INTERVAL_MS +
+        esp_random() % (LG_MESH_OTA_RESUME_JITTER_MS + 1u));
+    ESP_LOGW(TAG, "OTA_FIRST_DATA_WAIT: elapsed_ms=%u request=%u attempt=%u/%u file=%s send=%s",
+             (unsigned)((xTaskGetTickCount() - started) * portTICK_PERIOD_MS),
+             (unsigned)s_resume_request_id, s_resume_request_count, LG_MESH_OTA_RESUME_REQUEST_MAX,
+             s_metadata.file, esp_err_to_name(err));
+}
+
 static size_t aligned_file_size(size_t size_bytes)
 {
     if (size_bytes == 0 || size_bytes > SIZE_MAX - (LG_MESH_OTA_FILE_ALIGNMENT_BYTES - 1)) {
@@ -208,6 +402,7 @@ static void reset_receiver_locked(void)
 {
     s_rx_accepting = false;
     s_session_open = false;
+    s_rx_first_data = false;
     if (s_ota_handle != 0) {
         esp_err_t err = esp_ota_abort(s_ota_handle);
         if (err != ESP_OK) ESP_LOGW(TAG, "OTA receive abort failed: %s", esp_err_to_name(err));
@@ -368,6 +563,12 @@ static esp_err_t get_file_cb(esp_mesh_lite_lan_ota_file_transfer_param_t *param)
     }
     err = esp_ota_write_with_offset(s_ota_handle, param->data, param->data_size, param->offset);
     if (err != ESP_OK) goto failed;
+    if (!s_rx_first_data) {
+        s_rx_first_data = true;
+        ESP_LOGI(TAG, "OTA_FIRST_DATA: elapsed_ms=%u file=%s offset=%u bytes=%u",
+                 (unsigned)((xTaskGetTickCount() - s_rx_start_tick) * portTICK_PERIOD_MS),
+                 s_metadata.file, (unsigned)param->offset, (unsigned)param->data_size);
+    }
     goto done;
 failed:
     s_rx_failed = true;
@@ -433,6 +634,9 @@ static void mesh_ota_event_handler(void *arg, esp_event_base_t base, int32_t eve
         }
     } else if (event_id == ESP_MESH_LITE_EVENT_OTA_FINISH) {
         const esp_mesh_lite_event_ota_finish_t *finish = event_data;
+        ESP_LOGI(TAG, "OTA_SDK_FINISH: reason=%d pending_timeout=%d",
+                 finish ? (int)finish->reason : (int)ESP_MESH_LITE_EVENT_OTA_FAIL,
+                 finish != NULL && finish->reason == ESP_MESH_LITE_EVENT_OTA_PENDING_TIMEOUT);
         if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) return;
         s_sdk_inflight = false; /* 先排空旧库传输，WAIT_PARENT 下终态不推进业务。 */
         if (s_session_open && !s_finish_received) {
@@ -618,13 +822,14 @@ static esp_err_t finalize_candidate(void)
     memcpy(s_registered_file_name, file.file_name, strlen(file.file_name));
     err = esp_mesh_lite_lan_ota_set_file_name(s_registered_file_name);
     if (err != ESP_OK) return err;
-    /* 此 restart 仅恢复下级 OTA 请求，绝不是 esp_restart。根不重启也须解除 pause。 */
-    err = esp_mesh_lite_ota_notify_child_node_restart();
-    if (err != ESP_OK) return err;
+    /* 先允许读取完整镜像，再通知下级。通知失败仍保留供数，不提前输出 READY/OTACP。 */
     file.valid = true;
     if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) return ESP_FAIL;
     s_ready_file = file;
     ota_unlock();
+    /* 此 restart 仅恢复下级 OTA 请求，绝不是 esp_restart。 */
+    err = notify_ready_children("supply_ready");
+    if (err != ESP_OK) return err;
     s_finalization_pending = false;
     s_retry_waiting = false;
     ESP_LOGI(TAG, "OTA_BINARY_READY level=%u running=%s target=%s file=%s partition=%s bytes=%u sha256=%s",
@@ -942,6 +1147,11 @@ static void handle_child_path(void)
     s_session_open = true;
     s_rx_accepting = true;
     s_sdk_inflight = true;
+    s_rx_start_tick = xTaskGetTickCount();
+    s_resume_request_due = s_rx_start_tick + pdMS_TO_TICKS(LG_MESH_OTA_FIRST_DATA_WAIT_MS);
+    s_resume_request_count = 0;
+    s_resume_exhausted_logged = false;
+    if (++s_resume_request_id == 0) ++s_resume_request_id;
     s_finish_wait_logged = false;
     ota_unlock();
     esp_mesh_lite_file_transmit_config_t cfg = {
@@ -982,6 +1192,53 @@ static void start_attempt(void)
     else handle_child_path();
 }
 
+/* 已暂存但未重启时仅确认目标身份，不进入 begin/write 或替换供数记录。
+ * MQTT 命令本身不含版本/文件名，故须查询 update.json 才能区分原文件与新版本。 */
+static void confirm_staged_command(void)
+{
+    simple_ota_metadata_t target;
+    esp_err_t err = simple_ota_fetch_metadata(&target);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "OTA 目标查询失败，保留待重启固件，本次不确认完成: %s", esp_err_to_name(err));
+        return;
+    }
+    if (system_restart_is_planned()) return;
+    if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) return;
+    bool same = s_ready_file.valid && s_candidate_persisted &&
+                strcmp(target.version, s_ready_file.version) == 0 &&
+                strcmp(target.file, s_ready_file.file_name) == 0;
+    ota_unlock();
+    if (!same) {
+        ESP_LOGW(TAG, "OTA 目标与暂存固件不同，请先重启再升级: requested=%s file=%s staged=%s",
+                 target.version, target.file, s_candidate_record.version);
+        return;
+    }
+    ESP_LOGI(TAG, "OTA 同一固件已完成，重新确认 OTACP，保留待重启镜像");
+    /* 明确命令触发的再次确认，复用原完成事实；启动恢复本身仍不自动补报。 */
+    queue_completion_report(s_candidate_record.completed_seq, s_candidate_record.device_id,
+                            s_candidate_record.aging_number);
+}
+
+/* 服务任务调用。完成/无需升级/失败耗尽都释放接收标志；重试、WAIT_PARENT 和旧 SDK
+ * 会话未结束时保持 0。不以 MQTT 是否在线作为本地下载是否完成的条件。 */
+static void finish_command_if_idle(void)
+{
+    if (!s_command_observed || s_root_downloading || s_retry_waiting ||
+        s_child_request_active || s_child_wait_parent || s_request_deferred) return;
+    bool exhausted = s_finalization_pending && s_retry_count >= LG_MESH_OTA_RETRY_MAX;
+    if (s_finalization_pending && !exhausted) return;
+    simple_ota_state_t state = simple_ota_get_state();
+    if (!exhausted && state != SIMPLE_OTA_STATE_IDLE && state != SIMPLE_OTA_STATE_PENDING_RESTART &&
+        state != SIMPLE_OTA_STATE_FAILED) return;
+    if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) != pdTRUE) return;
+    bool active = s_sdk_inflight || s_session_open;
+    ota_unlock();
+    if (active) return;
+    s_command_observed = false;
+    atomic_store(&s_command_available, true);
+    ESP_LOGI(TAG, "OTA 命令处理结束，接收标志恢复为 1");
+}
+
 /* 单轮服务处理，所有重试调度均不阻塞，保证迟到完成事件能及时收尾。 */
 static void mesh_ota_service_poll(EventBits_t bits)
 {
@@ -998,6 +1255,8 @@ static void mesh_ota_service_poll(EventBits_t bits)
         ESP_LOGE(TAG, "Root download exceeded timeout; waiting for worker exit, concurrent retry prohibited");
     }
     if (bits & CMD_EVT_REQUEST) {
+        s_command_observed = true;
+        atomic_store(&s_command_available, false);
         simple_ota_state_t state = simple_ota_get_state();
         if (IsRoot == 0 && (s_child_request_active || system_restart_is_planned())) {
             ESP_LOGI(TAG, "BINARY command coalesced: child task active or restart planned");
@@ -1014,7 +1273,7 @@ static void mesh_ota_service_poll(EventBits_t bits)
         } else if (s_root_downloading || state == SIMPLE_OTA_STATE_RUNNING || s_retry_waiting) {
             ESP_LOGW(TAG, "BINARY command ignored: current attempt/retry still active");
         } else if (state == SIMPLE_OTA_STATE_PENDING_RESTART) {
-            ESP_LOGI(TAG, "BINARY already staged; duplicate command will not erase firmware");
+            confirm_staged_command();
         } else {
             s_retry_count = 0;
             s_metadata_valid = false;
@@ -1040,11 +1299,15 @@ static void mesh_ota_service_poll(EventBits_t bits)
         }
         if (err != ESP_OK) ESP_LOGW(TAG, "OTA cache bootstrap unavailable: %s", esp_err_to_name(err));
     }
+    poll_resume_requests();
+    poll_first_data();
     poll_otacp_report();
     if (s_request_deferred && !s_otacp_pending && !s_finalization_pending && !s_root_downloading && !s_retry_waiting) {
         s_request_deferred = false;
         xEventGroupSetBits(s_cmd_events, CMD_EVT_REQUEST);
+        return; /* 合并命令仍已排队，消费前不能提前把接收标志恢复为 1。 */
     }
+    finish_command_if_idle();
 }
 
 static void mesh_ota_cmd_task(void *arg)
@@ -1053,7 +1316,7 @@ static void mesh_ota_cmd_task(void *arg)
     mesh_ota_service_poll(0); /* 先本地恢复，再消费后续 OTA 命令。 */
     for (;;) {
         EventBits_t bits = xEventGroupWaitBits(s_cmd_events,
-            CMD_EVT_REQUEST | CMD_EVT_FINISH | CMD_EVT_DOWNLOAD_DONE | CMD_EVT_PARENT,
+            CMD_EVT_REQUEST | CMD_EVT_FINISH | CMD_EVT_DOWNLOAD_DONE | CMD_EVT_PARENT | CMD_EVT_RESUME,
             pdTRUE, pdFALSE, pdMS_TO_TICKS(LG_MESH_OTA_SERVICE_POLL_MS));
         mesh_ota_service_poll(bits);
     }
@@ -1092,13 +1355,19 @@ esp_err_t mesh_ota_init(void)
     s_dl_events = xEventGroupCreateStatic(&s_dl_events_buf);
     s_ota_mutex = xSemaphoreCreateMutexStatic(&s_ota_mutex_buf);
     if (s_cmd_events == NULL || s_dl_events == NULL || s_ota_mutex == NULL) return ESP_ERR_NO_MEM;
+    esp_err_t err = esp_mesh_lite_msg_action_list_register(s_resume_actions);
+    if (err != ESP_OK) return err;
     static esp_mesh_lite_lan_ota_file_transfer_cb_t callbacks = {
         .provide_file_cb = provide_file_cb, .get_file_cb = get_file_cb, .get_file_done = get_file_done_cb,
     };
     esp_mesh_lite_ota_register_file_transfer_cb(&callbacks);
-    esp_err_t err = esp_event_handler_register(ESP_MESH_LITE_EVENT, ESP_EVENT_ANY_ID,
+    err = esp_event_handler_register(ESP_MESH_LITE_EVENT, ESP_EVENT_ANY_ID,
                                                mesh_ota_event_handler, NULL);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        esp_err_t unregister_err = esp_mesh_lite_msg_action_list_unregister(s_resume_actions);
+        if (unregister_err != ESP_OK) ESP_LOGW(TAG, "OTA resume action cleanup failed: %s", esp_err_to_name(unregister_err));
+        return err;
+    }
     s_recovery_pending = true;
     /* 沿用既有任务，固定 CPU1 与 task_config.h 中的栈/优先级。 */
     if (xTaskCreatePinnedToCore(mesh_ota_cmd_task, "mesh_ota_cmd", LG_STACK_MESH_OTA,
@@ -1118,6 +1387,14 @@ void mesh_ota_handle_mqtt_command(void)
 #else
     if (!s_initialized) {
         ESP_LOGE(TAG, "BINARY not initialized; ignoring command");
+        return;
+    }
+    if (system_restart_is_planned()) {
+        ESP_LOGI(TAG, "设备已进入计划重启，忽略 OTA 命令");
+        return;
+    }
+    if (!atomic_exchange(&s_command_available, false)) {
+        ESP_LOGI(TAG, "OTA 命令已触发，当前任务尚未结束，请勿重复发送");
         return;
     }
     xEventGroupSetBits(s_cmd_events, CMD_EVT_REQUEST);
