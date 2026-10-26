@@ -72,8 +72,10 @@
  * 2026-10-20 由 6 次（FailCount > 5）上调为 15 次（用户决策）：
  * 现场 DUT 上电晚/被占用时连接建立失败需多轮重试，且每轮失败后有
  * 3s 退避（appTask.c AgingDeviceCheck 蓝牙分支）。
+ * 2026-10-26 由 15 上调为 25：现场 BLE 设备密集，目标设备广播被碰撞
+ * 淹没（实测 15 轮中 13 轮扫不到），单轮约 13s，25 轮约 5.4 分钟窗口。
  */
-#define AGING_DEVICE_CHECK_MAX_ATTEMPTS 15
+#define AGING_DEVICE_CHECK_MAX_ATTEMPTS 25
 
 /*
  * PN 门拒绝（reject_start_aging_missing_pn）同因上报的最小间隔。
@@ -311,8 +313,20 @@ static volatile bool AgingLogActive = false;
  */
 static atomic_bool s_ble_abnormal_disconnect;
 
-/* BLE 扫描完成回调丢失时的等待上限，超时按本次尝试失败走 FailCount 路径。 */
-#define BLE_SCAN_WAIT_TIMEOUT_MS 30000
+/*
+ * 蓝牙老化设备发现节奏（2026-10-26）：
+ * 单轮扫描 20s（原 10s）——密集现场广播碰撞严重，单轮捕获概率随监听时长
+ * 近似线性提升；25 轮 × 约 22s ≈ 9 分钟（用户已确认接受更慢的失败判定）。
+ * 扫描期间每 500ms 检查目标名，命中即停扫并立即建链，把"发现→建链"延迟
+ * 从最多一个扫描周期压到 0.5s 内，避免目标可连窗口在等待扫描结束时错过。
+ */
+#define BLE_AGING_SCAN_SECONDS 20
+#define BLE_TARGET_POLL_INTERVAL_MS 500
+
+/* 扫描完成回调丢失时的等待上限：由扫描时长派生，保证"超时 > 扫描时长"
+ * 这一不变量在编译期自动成立（以后调扫描时长不会忘记同步超时）。
+ * 超时按本次尝试失败走 FailCount 路径。 */
+#define BLE_SCAN_WAIT_TIMEOUT_MS ((BLE_AGING_SCAN_SECONDS + 10) * 1000)
 
 /*
  * BLE 连接结果等待上限：ble_connect_by_name() 返回 true 仅代表 enh_open 被接受，
@@ -1712,19 +1726,26 @@ static volatile bool BleConnectSuccess = false;
 // BLE扫描完成回调
 void ble_scan_complete_cb(ble_device_info_t *devices, int device_count)
 {
+    /* 回调运行在 GAP/Bluedroid 上下文：密集现场逐条 printf 会长时间占住
+     * 蓝牙回调任务，只打印前 10 条 + 总数摘要（完整列表仍保留在扫描列表）。 */
+    const int print_limit = 10;
+
     ESP_LOGI(TAG, "BLE scan completed, found %d devices", device_count);
 
     ScanComplete = true;
     // 打印扫描结果到控制台
-    printf("\n=== BLE Scan Results ===\n");
-    for (int i = 0; i < device_count; i++)
+    printf("\n=== BLE Scan Results (%d) ===\n", device_count);
+    for (int i = 0; i < device_count && i < print_limit; i++)
     {
-
         printf("[%d] %s (RSSI: %d dBm) %s\n",
                i + 1,
                devices[i].name,
                devices[i].rssi,
                devices[i].is_connected ? "[Connected]" : "");
+    }
+    if (device_count > print_limit)
+    {
+        printf("... %d more devices not printed\n", device_count - print_limit);
     }
 }
 // BLE连接结果回调
@@ -4555,6 +4576,9 @@ static void Aging_Task_Abort_Cleanup(void)
     agingState = AgingIdle;
     agingDataAMode = IdleState;
 
+    /* 老化中止：结束任何遗留的扫描/建链蓝牙优先，避免长期压缩 Wi-Fi 上行。 */
+    ble_restore_coex_balance();
+
     if (AgingData_task_handle != NULL)
     {
         vTaskDelete(AgingData_task_handle);
@@ -4690,6 +4714,10 @@ void Aging_Test_Task(void *arg)
         }
         case AgingDeviceCheck:
         {
+            /* 每轮检查前兜底复位：上一轮失败若遗留扫描/建链蓝牙优先，在此
+             * 恢复 Wi-Fi/BLE 平衡（幂等，正常流程下为无操作）。 */
+            ble_restore_coex_balance();
+
             if (Aging_device == NULL)
             {
                 aging_error_log("Aging device runtime object is NULL during device check");
@@ -4719,11 +4747,14 @@ void Aging_Test_Task(void *arg)
                 if (!ble_is_connected())
                 {
                     aging_runtime_log("Connecting Bluetooth aging device, attempt=%u", (unsigned)FailCount);
-                    if (!ble_start_scan(10))
+                    /* 复位上一轮可能残留的扫描完成标志：提前停扫后 GAP 完成事件
+                     * 仍可能迟到置位，不清零会让下一轮误判"扫描已完成"而空跑。 */
+                    ScanComplete = false;
+                    if (!ble_start_scan(BLE_AGING_SCAN_SECONDS))
                     {
                         /*
                          * 上一轮扫描未结束或仍处于连接态时 ble_start_scan 返回 false 且不会启动扫描，
-                         * 必须立即按本次尝试失败处理，否则后续超时等待必然空转满 30s。
+                         * 必须立即按本次尝试失败处理，否则后续超时等待必然空转满整个超时。
                          */
                         aging_error_log("Bluetooth scan not started, attempt=%u", (unsigned)FailCount);
                         break;
@@ -4733,18 +4764,33 @@ void Aging_Test_Task(void *arg)
                      * 扫描完成回调丢失时不得永久自旋（旧行为为无超时等待，
                      * 会饿死同级任务）：超过 BLE_SCAN_WAIT_TIMEOUT_MS 未完成，
                      * 停止扫描并按本次尝试失败处理，交由 FailCount 路径重试或 agingError 中止。
+                     * 扫描期间每 BLE_TARGET_POLL_INTERVAL_MS 检查目标名：命中即停扫，
+                     * 不再等满一个扫描周期（密集现场目标可连窗口稍纵即逝）。
                      */
                     TickType_t scan_start_tick = xTaskGetTickCount();
+                    bool target_found_early = false;
                     while (!ScanComplete)
                     {
+                        if (ble_scanned_has_name(PN_Code))
+                        {
+                            target_found_early = true;
+                            break;
+                        }
                         if ((xTaskGetTickCount() - scan_start_tick) >= pdMS_TO_TICKS(BLE_SCAN_WAIT_TIMEOUT_MS))
                         {
                             break;
                         }
-                        vTaskDelay(pdMS_TO_TICKS(1000));
+                        vTaskDelay(pdMS_TO_TICKS(BLE_TARGET_POLL_INTERVAL_MS));
                     }
 
-                    bool scan_completed = ScanComplete;
+                    if (target_found_early)
+                    {
+                        aging_runtime_log("Bluetooth target seen during scan, stop scanning early, attempt=%u",
+                                          (unsigned)FailCount);
+                        ble_stop_scan();
+                    }
+
+                    bool scan_completed = ScanComplete || target_found_early;
                     ScanComplete = false;
 
                     if (!scan_completed)

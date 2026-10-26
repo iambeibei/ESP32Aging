@@ -82,6 +82,8 @@ static uint32_t random_value;
 static uint32_t esp_random(void) { return random_value; }
 static int service_task_creates, service_task_error;
 static uint8_t mesh_get_current_level(void) { return IsRoot ? 1 : 2; }
+static int mesh_level_persist_calls;
+static void mesh_level_persist_if_changed(void) { mesh_level_persist_calls++; }
 static int app_create_mqtt_service_task(void (*fn)(void *), TaskHandle_t *handle) {
     (void)fn; if (service_task_error) return 0; if (*handle == NULL) { *handle = (void *)7; service_task_creates++; } return pdPASS;
 }

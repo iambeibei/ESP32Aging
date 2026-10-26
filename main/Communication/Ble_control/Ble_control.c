@@ -18,11 +18,18 @@
 #include "app_enc.h"
 #include "app_mem.h"
 #include "esp_attr.h"
+#include "esp_coexist.h"
 
 static const char *TAG = "BLE_CTRL";
 
 // 配置参数
-#define MAX_SCAN_DEVICES 50
+/*
+ * 扫描结果列表容量（2026-10-26 由 50 上调为 128）：
+ * 密集现场带完整名称的设备可能超过 50 台，达到上限后新设备被静默丢弃，
+ * 目标设备若出现较晚就永远进不了列表（表现为 not found in scan results）。
+ * 数组位于 EXT_RAM_BSS（PSRAM），128 项约 10KB，内部 RAM 不增加。
+ */
+#define MAX_SCAN_DEVICES 128
 #define DEFAULT_SCAN_TIME 10
 #define REMOTE_SERVICE_UUID 0xFF00
 #define REMOTE_NOTIFY_CHAR_UUID 0xFF01
@@ -84,6 +91,42 @@ static volatile bool s_connect_result_pending = false;
  */
 static volatile bool s_gatt_setup_done = false;
 
+/*
+ * Wi-Fi/BLE 射频共存偏好（2026-10-26）：
+ * 扫描与建链阶段临时提升蓝牙优先级（ESP_COEX_PREFER_BT），降低密集 BLE
+ * 环境下「Wi-Fi 抢占射频 → 广播漏收 / CONNECT_IND 丢失（HCI rsn 0x3E）」；
+ * GATT 设置结论、建链失败、断开、停止扫描或老化中止时恢复 BALANCE，
+ * 避免长期压缩 Wi-Fi 上行。s_coex_bt_boost 保证重复调用幂等。
+ */
+static bool s_coex_bt_boost = false;
+
+static void ble_coex_prefer_bt(bool enable)
+{
+    if (s_coex_bt_boost == enable)
+    {
+        return;
+    }
+
+    esp_err_t err = esp_coex_preference_set(enable ? ESP_COEX_PREFER_BT : ESP_COEX_PREFER_BALANCE);
+    if (err != ESP_OK)
+    {
+        /* 共存模块未就绪等情形：保留旧状态，下次调用重试。 */
+        ESP_LOGW(TAG, "Coex preference %s failed: %s",
+                 enable ? "PREFER_BT" : "BALANCE", esp_err_to_name(err));
+        return;
+    }
+
+    s_coex_bt_boost = enable;
+    ESP_LOGI(TAG, "Coex preference: %s", enable ? "PREFER_BT" : "BALANCE");
+}
+
+/* GATT 设置阶段得出结论：交付老化任务轮询，同时结束扫描/建链期间的蓝牙优先。 */
+static void ble_gatt_setup_conclude(void)
+{
+    s_gatt_setup_done = true;
+    ble_coex_prefer_bt(false);
+}
+
 // GATT profile结构
 typedef struct
 {
@@ -133,13 +176,23 @@ static esp_bt_uuid_t s_notify_descr_uuid = {
     .uuid.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG,
 };
 
-// 扫描参数
+/*
+ * 扫描参数（2026-10-26）：scan_window 由 0x30 提升到与 scan_interval 相等，
+ * 占空比 48/80(60%) → 80/80(100%)。现场 BLE 设备密集，广播信道（37/38/39）
+ * 碰撞会让目标设备在多数扫描轮次完全扫不到；连续监听可显著降低漏包。
+ * 代价：单轮 20s 扫描期间 BLE 持续占用射频，Wi-Fi/Mesh 吞吐略降（可接受）。
+ *
+ * 约束：scan_type 必须保持 ACTIVE、scan_duplicate 必须保持 DISABLE。
+ * 20 字符的 PN 名称放不进 31 字节广播包，只能从扫描响应（SCAN_RSP）取得，
+ * 被动扫描永远拿不到名称；关闭重复过滤才能让同一设备的每次广播都触发
+ * SCAN_REQ，在密集环境下反复重试获取名称。
+ */
 static esp_ble_scan_params_t s_ble_scan_params = {
     .scan_type = BLE_SCAN_TYPE_ACTIVE,
     .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
     .scan_filter_policy = BLE_SCAN_FILTER_ALLOW_ALL,
     .scan_interval = 0x50,
-    .scan_window = 0x30,
+    .scan_window = 0x50,
     .scan_duplicate = BLE_SCAN_DUPLICATE_DISABLE};
 
 // 函数声明
@@ -399,6 +452,8 @@ bool ble_start_scan(uint8_t scan_time)
     {
         s_is_scanning = true;
         ble_Scan_complate = false;
+        /* 扫描期间优先蓝牙：连续监听需要射频窗口，Wi-Fi 抢占会放大漏包。 */
+        ble_coex_prefer_bt(true);
         ESP_LOGI(TAG, "BLE scanning started for %d seconds", scan_time);
         return true;
     }
@@ -411,12 +466,21 @@ bool ble_start_scan(uint8_t scan_time)
 
 void ble_stop_scan(void)
 {
+    /* 停止扫描即结束蓝牙优先（幂等）；自然扫完的兜底复位由老化任务兜住。 */
+    ble_coex_prefer_bt(false);
+
     if (s_is_scanning)
     {
         esp_ble_gap_stop_scanning();
         s_is_scanning = false;
         ESP_LOGI(TAG, "Scanning stopped");
     }
+}
+
+/* 供上层在老化中止/检查轮次边界兜底恢复 Wi-Fi/BLE 平衡，避免长期压缩 Wi-Fi。 */
+void ble_restore_coex_balance(void)
+{
+    ble_coex_prefer_bt(false);
 }
 
 bool ble_is_scanning(void)
@@ -450,6 +514,37 @@ int ble_get_scanned_devices(ble_device_info_t *devices, int max_count)
     }
 
     return count;
+}
+
+bool ble_scanned_has_name(const char *name)
+{
+    if (name == NULL || name[0] == '\0')
+    {
+        return false;
+    }
+
+    bool found = false;
+
+    if (s_device_list_mutex != NULL)
+    {
+        xSemaphoreTake(s_device_list_mutex, portMAX_DELAY);
+    }
+
+    for (int i = 0; i < s_scanned_count; i++)
+    {
+        if (strcmp(s_scanned_devices[i].name, name) == 0)
+        {
+            found = true;
+            break;
+        }
+    }
+
+    if (s_device_list_mutex != NULL)
+    {
+        xSemaphoreGive(s_device_list_mutex);
+    }
+
+    return found;
 }
 
 void ble_clear_scan_results(void)
@@ -603,6 +698,10 @@ bool ble_connect_by_name(const char *device_name)
         .phy_mask = 0};
     memcpy(conn_params.remote_bda, target->bda, ESP_BD_ADDR_LEN);
 
+    /* 建链窗口同样需要蓝牙优先：Wi-Fi 抢占射频会让 CONNECT_IND 丢失，
+     * 对端不回应即以 HCI rsn 0x3E 建链失败。 */
+    ble_coex_prefer_bt(true);
+
     // 发起连接
     esp_err_t ret = esp_ble_gattc_enh_open(s_gattc_profile.gattc_if, &conn_params);
 
@@ -619,6 +718,8 @@ bool ble_connect_by_name(const char *device_name)
     else
     {
         ESP_LOGE(TAG, "Failed to connect: 0x%x", ret);
+        /* 请求未被受理：立即恢复平衡，不留蓝牙优先。 */
+        ble_coex_prefer_bt(false);
         return false;
     }
 }
@@ -657,6 +758,9 @@ bool ble_connect_by_address(uint8_t *bda, uint8_t addr_type)
         .phy_mask = 0};
     memcpy(conn_params.remote_bda, bda, ESP_BD_ADDR_LEN);
 
+    /* 与按名称连接一致：建链窗口提升蓝牙优先，失败/断开时由状态机恢复。 */
+    ble_coex_prefer_bt(true);
+
     esp_err_t ret = esp_ble_gattc_enh_open(s_gattc_profile.gattc_if, &conn_params);
 
     if (ret == ESP_OK)
@@ -672,6 +776,8 @@ bool ble_connect_by_address(uint8_t *bda, uint8_t addr_type)
     else
     {
         ESP_LOGE(TAG, "Failed to connect: 0x%x", ret);
+        /* 请求未被受理：立即恢复平衡，不留蓝牙优先。 */
+        ble_coex_prefer_bt(false);
         return false;
     }
 }
@@ -940,7 +1046,8 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         if (param->open.status != ESP_GATT_OK)
         {
             ESP_LOGE(TAG, "Open failed: %d", param->open.status);
-            /* 建立失败：经 connect 回调上报供老化任务重试，不触发断开回调 */
+            /* 建立失败：结束蓝牙优先，再经 connect 回调上报供老化任务重试 */
+            ble_coex_prefer_bt(false);
             notify_connect_result(false);
         }
         break;
@@ -1033,7 +1140,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
             /* 无通知特征：notify 注册不会发生，GATT 设置阶段以此降级结论收尾，
              * 避免老化任务的设置等待空转到超时。 */
             ESP_LOGE(TAG, "Notify characteristic 0xFF01 not found");
-            s_gatt_setup_done = true;
+            ble_gatt_setup_conclude();
         }
 
         // 查找写特征
@@ -1082,7 +1189,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         if (status != ESP_GATT_OK || descr_count == 0)
         {
             ESP_LOGE(TAG, "No descriptors found");
-            s_gatt_setup_done = true; /* 降级结论：不会再有 CCCD 写结果 */
+            ble_gatt_setup_conclude(); /* 降级结论：不会再有 CCCD 写结果 */
             break;
         }
 
@@ -1090,7 +1197,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         if (descr_result == NULL)
         {
             ESP_LOGE(TAG, "Memory allocation failed");
-            s_gatt_setup_done = true; /* 降级结论：不会再有 CCCD 写结果 */
+            ble_gatt_setup_conclude(); /* 降级结论：不会再有 CCCD 写结果 */
             break;
         }
 
@@ -1113,7 +1220,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         {
             /* 描述符查找失败：不会再有 CCCD 写结果，交付降级结论 */
             ESP_LOGE(TAG, "CCCD descriptor 0x2902 not found");
-            s_gatt_setup_done = true;
+            ble_gatt_setup_conclude();
         }
 
         free(descr_result);
@@ -1158,7 +1265,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         }
         /* CCCD 写结果到达：GATT 设置阶段得出结论（成败均交付，由老化任务
          * 后续通信检查判定 notify 通道是否真正可用）。 */
-        s_gatt_setup_done = true;
+        ble_gatt_setup_conclude();
         break;
 
     case ESP_GATTC_WRITE_CHAR_EVT:
@@ -1175,6 +1282,8 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
     case ESP_GATTC_DISCONNECT_EVT:
     {
         ESP_LOGI(TAG, "Disconnected, reason: 0x%02x", param->disconnect.reason);
+        /* 建链中断或已建立连接掉线：恢复 Wi-Fi/BLE 平衡（幂等）。 */
+        ble_coex_prefer_bt(false);
         /* 断开前的连接态判定：区分「建立失败」与「已建立连接后掉线」 */
         bool was_established = s_is_connected;
         bool establishing = s_connect_attempting;

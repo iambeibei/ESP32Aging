@@ -77,6 +77,15 @@ bool ble_start_scan(uint8_t scan_time);
 void ble_stop_scan(void);
 
 /**
+ * @brief 恢复 Wi-Fi/BLE 共存偏好为 BALANCE（幂等，任意任务上下文）
+ *
+ * 扫描/建链阶段会临时把共存偏好提升为蓝牙优先；GATT 设置结论、建链失败、
+ * 断开、停扫会自动恢复。本接口供上层在老化中止/检查轮次边界兜底调用，
+ * 避免异常路径遗留蓝牙优先长期压缩 Wi-Fi 上行。
+ */
+void ble_restore_coex_balance(void);
+
+/**
  * @brief 连接BLE设备（通过名称）
  * @param device_name 设备名称
  * @return true: 连接请求已发送, false: 失败
@@ -148,6 +157,18 @@ bool ble_is_scanning(void);
  * @return 实际设备数量
  */
 int ble_get_scanned_devices(ble_device_info_t *devices, int max_count);
+
+/**
+ * @brief 目标名称是否已出现在本轮扫描结果中（精确匹配，不打印日志）
+ *
+ * 调用上下文：任务上下文可用；内部持设备列表互斥锁，可能短暂阻塞（持锁
+ * 仅做一次线性比较），**不可在 ISR 调用**。GAP 回调负责写列表、调用方读。
+ * 仅供扫描期间提前命中判断（命中后由调用方停扫并调用 ble_connect_by_name），
+ * 本接口不发起连接、不打日志，可安全地周期性轮询。
+ * @param name 目标设备名称（PN 全名），可为 NULL（直接返回 false）
+ * @return true: 已出现在列表中, false: 尚未出现或 name 非法
+ */
+bool ble_scanned_has_name(const char *name);
 
 /**
  * @brief 清除扫描结果

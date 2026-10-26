@@ -31,9 +31,21 @@
 #include "system_restart.h"
 #include "app_mem.h"
 #include "mesh_ota.h"
+#include "SelfRecovery.h"
 
 
 #define MESH_MAX_LEVEL 6
+
+/*
+ * 启动网络初始化错峰（2026-10-26）：
+ * 全站一起断电重启时，按上次运行保存的 Mesh 层级延迟拉起 Mesh——根(1) 0s、
+ * L2 +5s、L3 +10s …（每层 5s，L6 上限 25s），让父链逐层就绪，避免所有节点
+ * 同时抢父/抢 IP 造成的重扫与建链失败。
+ * 层级保存在 NVS（SelfRecovery 命名空间，key=mesh_level）：启动时读取，
+ * 读不到按首次创建为 1（不延时）；每次 MQTT 上线成功只有与已存值不一致才更新。
+ */
+#define NVS_KEY_MESH_LEVEL "mesh_level"
+#define MESH_BOOT_STAGGER_MS_PER_LEVEL 5000u
 /*
  * 每节点 SoftAP 最大接入子节点数：2026-10-16 曾由 5 调到 8（缓解「中间父
  * 断开+根已满」时无替代父的重连循环），同日应现场要求回退为 5。
@@ -235,6 +247,65 @@ uint8_t mesh_get_restart_level(void)
     if (level >= 2 && level <= MESH_MAX_LEVEL) return level;
     level = __atomic_load_n(&s_last_valid_level, __ATOMIC_ACQUIRE);
     return level >= 2 && level <= MESH_MAX_LEVEL ? level : MESH_MAX_LEVEL;
+}
+
+/* 读取上次运行的 Mesh 层级；首次（无记录）按根语义写默认 1，不延时。 */
+static uint8_t mesh_boot_level_read_or_create(void)
+{
+    uint16_t level = 0;
+    esp_err_t err = SelfRecovery_Read_uint16(NVS_KEY_MESH_LEVEL, &level);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        if (SelfRecovery_Write_uint16(NVS_KEY_MESH_LEVEL, 1) == ESP_OK) {
+            ESP_LOGI(TAG, "Mesh boot level created with default 1");
+        } else {
+            ESP_LOGW(TAG, "Mesh boot level default write failed");
+        }
+        return 1;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Mesh boot level read failed (%s), using 1", esp_err_to_name(err));
+        return 1;
+    }
+    if (level < 1 || level > MESH_MAX_LEVEL) {
+        ESP_LOGW(TAG, "Mesh boot level %u out of range, using 1", (unsigned)level);
+        return 1;
+    }
+    return (uint8_t)level;
+}
+
+/* 按上次层级延迟拉起 Mesh：根 0s、每层 +5s。必须在 esp_mesh_lite_init() 之前。 */
+static void mesh_boot_stagger_delay(void)
+{
+    uint8_t level = mesh_boot_level_read_or_create();
+    uint32_t delay_ms = (uint32_t)(level - 1) * MESH_BOOT_STAGGER_MS_PER_LEVEL;
+
+    ESP_LOGI(TAG, "Mesh boot stagger: stored_level=%u, delay_ms=%u",
+             (unsigned)level, (unsigned)delay_ms);
+    if (delay_ms > 0) {
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    }
+}
+
+void mesh_level_persist_if_changed(void)
+{
+    uint8_t level = mesh_get_current_level();
+    if (level < 1 || level > MESH_MAX_LEVEL) {
+        ESP_LOGW(TAG, "Mesh level persist skipped: invalid level=%u", (unsigned)level);
+        return;
+    }
+
+    uint16_t stored = 0;
+    esp_err_t err = SelfRecovery_Read_uint16(NVS_KEY_MESH_LEVEL, &stored);
+    if (err == ESP_OK && stored == level) {
+        return; /* 只有不一致才写：避免每次 MQTT 重连都磨损 flash。 */
+    }
+
+    if (SelfRecovery_Write_uint16(NVS_KEY_MESH_LEVEL, level) == ESP_OK) {
+        ESP_LOGI(TAG, "Mesh level persisted: level=%u, previous=%u",
+                 (unsigned)level, (unsigned)stored);
+    } else {
+        ESP_LOGW(TAG, "Mesh level persist failed: level=%u", (unsigned)level);
+    }
 }
 
 esp_err_t mesh_pause_for_restart(void)
@@ -1135,6 +1206,10 @@ esp_err_t mesh_init_Custom(void)
     config.join_mesh_without_configured_wifi = !IsRoot;
     config.softap_ssid = s_softap_prefix;
     config.softap_password = Mesh_PS;
+
+    /* 启动错峰：按上次运行保存的层级延迟拉起 Mesh，避免全站同时抢父/抢 IP。 */
+    mesh_boot_stagger_delay();
+
     esp_mesh_lite_init(&config);
     if (esp_mesh_lite_get_mesh_id() != mesh_id) {
         /* A previous Mesh-Lite run may have persisted another ID in NVS. */

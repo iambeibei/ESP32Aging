@@ -140,6 +140,10 @@ static bool s_node_first_start;
  * 成功指 SDK 接受完整配置（由 QoS1 负责重传），不是上位机业务确认。不写入 NVS。 */
 static bool s_boot_config_enqueued;
 
+/* Mesh 层级落盘请求：MQTT_EVENT_CONNECTED 只置位（回调不做重活），
+ * 由 CPU1 服务任务比较 NVS 后仅在变化时写入。 */
+static atomic_bool s_mesh_level_persist_pending;
+
 typedef struct {
     uint32_t epoch;
     char topic[MQTT_TOPIC_ITEM_CAPACITY];
@@ -508,6 +512,10 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
         ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED client=%p, connection_count=%u, uplink=%s",
                  (void *)event->client, ++s_mqtt_connect_count,
                  IsRoot == 1 ? dual_net_get_active_interface() : "MESH_STA");
+
+        /* 每次连接成功请求刷新 Mesh 层级（下次启动的网络初始化错峰依据）；
+         * 服务任务内比较 NVS，仅在不一致时写入。 */
+        atomic_store(&s_mesh_level_persist_pending, true);
 
         /* 订阅、上线与配置上报由 CPU1 服务任务按确认事件推进。 */
         mqtt_service_wake();
@@ -1256,6 +1264,12 @@ void mqtt_app_service_task(void *arg)
     for (;;) {
         mqtt_service_poll();
         mqtt_runtime_poll();
+
+        /* 连接成功后的层数落盘：比较 NVS 后只有不一致才写，失败不阻断服务。 */
+        if (atomic_exchange(&s_mesh_level_persist_pending, false)) {
+            mesh_level_persist_if_changed();
+        }
+
         TickType_t now = xTaskGetTickCount();
         if (now - last_diagnostic >= pdMS_TO_TICKS(10000)) {
             unsigned rejected = atomic_load(&s_rejected_count), deleted = atomic_load(&s_deleted_count);
