@@ -30,11 +30,13 @@ Data 对象校验(2519) → ProgramId 校验(2529) → 存 RecordId(2541-2554)
 ```text
 Data 对象校验
   → ProgramId 校验（仅校验类型/非空，不发布任何状态消息）
-  → RUNNING 拒绝（"Aging already started, ignoring new command"）
+  → mesh 层级错峰延时（level × 2s，最多 12s；批量下发时打散上行峰值）
+  → RUNNING 拒绝（Code=1，"指令重复，老化已启动"）
   → 【新增】PN 门：未设置 → reject_start_aging_missing_pn(seq) 后结束本条命令
+  → 【新增】有效指令回执：device_response_publish_point(seq, 1, "已收到指令")
   → aging_state_publish_ProgramId()（仅启动路径发布，拒绝路径不产生“已受理”信号）
   → 存 RecordId（仅通过 PN 门后写入，避免拒绝路径产生 NVS 副作用）
-  → start_aging_with_ready_pn() 启动
+  → start_aging_with_ready_pn() 启动（成功不再另发 point 回复）
 ```
 
 ### 3.1 PN 门判定
@@ -120,9 +122,9 @@ static bool aging_pn_is_ready(void)
   │ ─────────────────────────────────> │  PN_Code_Ready 就绪并持久化
   │ <───────────────────────────────── │  cmd/reply/pn {Code:1, CmdData:{GetPN}}
   │  start_aging {Seq:N}（重发）       │
-  │ ─────────────────────────────────> │  start_aging_with_ready_pn()
-  │ <───────────────────────────────── │  cmd/reply/point {CmdSeq:N, Code:1}
-  │ <───────────────────────────────── │  event/state {AgingState:"agingStart"}
+  │ ─────────────────────────────────> │  错峰延时（≤12s）→ 回执 + start_aging_with_ready_pn()
+  │ <───────────────────────────────── │  cmd/reply/point {CmdSeq:N, Code:1, Msg:"已收到指令"}
+  │ <───────────────────────────────── │  event/state {AgingState:"agingStart"}（成功时不再发第二条 point）
 ```
 
 补偿机制要点：
@@ -138,6 +140,10 @@ static bool aging_pn_is_ready(void)
 4. **平台侧契约**：`cmd/reply/point` 的 `Code=0` + `Msg` 含 "PN is not set"
    即表示「未启动、需先 set_pn」；配合 `event/state=agingError` 双通道可区分
    「缺 PN 拒绝」与「老化运行中异常中止」。
+5. **回执时序（2026-10-27）**：有效 start_aging 在 mesh 层级错峰延时（level×2s，
+   最多 12s）之后立即回 `Code=1`「已收到指令」；启动成功不再另发 point 回复
+   （结果看 `agingStart` 与后续数据），启动失败追加一条 `Code=0` 原因；
+   老化运行中重复下发回 `Code=1`「指令重复，老化已启动」。
 
 ## 5. 状态机影响
 
@@ -166,8 +172,8 @@ static bool aging_pn_is_ready(void)
 |---|---|---|
 | 1 | 空闲发 start_aging（无 set_pn） | cmd/reply/point Code=0 Msg 缺 PN；event/state agingError；本地错误日志；状态 IDLE；无 Aging.json |
 | 2 | 用例 1 后直接重发 start_aging | 同样拒绝（幂等），无第二条挂起 |
-| 3 | 用例 1 后发 set_pn 再 start_aging | set_pn 回复 Code=1 GetPN；start_aging 正常启动，Code=1 + agingStart |
-| 4 | RUNNING 中发 start_aging | 仍为 "Aging already started"（RUNNING 检查在 PN 门之前，顺序正确） |
+| 3 | 用例 1 后发 set_pn 再 start_aging | set_pn 回复 Code=1 GetPN；start_aging 错峰后回 Code=1「已收到指令」，启动成功再发 agingStart（无第二条 point） |
+| 4 | RUNNING 中发 start_aging | Code=1 Msg「指令重复，老化已启动」（RUNNING 检查在 PN 门之前，顺序正确） |
 | 5 | start_aging 缺 Data / ProgramId | 维持现有参数校验回复（先于 PN 门） |
 | 6 | 旧固件遗留 WAIT_PN（NVS start_pending=1）+ 新 start_aging | 清理挂起 + 拒绝回复；日志记录被丢弃 Seq |
 | 7 | 拒绝路径后 ReadId/配置 | RecordId 未被污染（PN 门后才写） |
