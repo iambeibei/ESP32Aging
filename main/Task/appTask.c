@@ -653,13 +653,15 @@ static void app_handle_restart_command(const cJSON *root, int cmd_seq)
 {
     const cJSON *data = cJSON_GetObjectItemCaseSensitive(root, "Data");
     const cJSON *restart = cJSON_IsObject(data) ? cJSON_GetObjectItemCaseSensitive(data, "Restart") : NULL;
-    if (!cJSON_IsNumber(restart) || restart->valuedouble != 1.0) {
+    if (!cJSON_IsNumber(restart) || restart->valuedouble != 1.0)
+    {
         device_response_publish_point(cmd_seq, 0, "Restart requires Data.Restart=1");
         return;
     }
     system_restart_plan_t plan;
     esp_err_t err = system_restart_schedule(cmd_seq, &plan);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         device_response_publish_point(cmd_seq, 0, "Restart service unavailable or network recovery already committed");
         ESP_LOGE(TAG, "Restart schedule rejected: %s", esp_err_to_name(err));
         return;
@@ -1948,7 +1950,8 @@ static uint32_t *protocol_generation_slot(const HttpProtocolTarget *target)
 
 static void protocol_generation_advance(uint32_t *generation)
 {
-    if (++*generation == 0) ++*generation;
+    if (++*generation == 0)
+        ++*generation;
 }
 
 static void protocol_lifecycle_unlock(void)
@@ -1964,9 +1967,9 @@ static esp_err_t request_device_protocol(HttpProtocolTargetKind kind, uint8_t in
         return ESP_ERR_INVALID_STATE;
     HttpProtocolTarget target = {.kind = kind, .device_index = index};
     uint32_t *generation = protocol_generation_slot(&target);
-    Externaldevice *device = kind == HTTP_PROTOCOL_AGING ? Aging_device :
-        (read_devices != NULL && index < read_device_count ? &read_devices[index] : NULL);
-    if (generation == NULL || device == NULL || device->ProtoID == 0) {
+    Externaldevice *device = kind == HTTP_PROTOCOL_AGING ? Aging_device : (read_devices != NULL && index < read_device_count ? &read_devices[index] : NULL);
+    if (generation == NULL || device == NULL || device->ProtoID == 0)
+    {
         protocol_lifecycle_unlock();
         return ESP_ERR_INVALID_ARG;
     }
@@ -2086,53 +2089,71 @@ static esp_err_t import_can_protocol_to_device(Externaldevice *device, const cha
 static void parse_http_protocol_response(const HttpProtocolResponse *response)
 {
     cJSON *root = cJSON_Parse(response->data);
-    if (root == NULL) {
+    if (root == NULL)
+    {
         ESP_LOGW(TAG, "Invalid HTTP protocol JSON");
         return;
     }
     cJSON *data = cJSON_GetObjectItem(root, "data");
     cJSON *type = cJSON_GetObjectItem(data, "protocolTypeStr");
     char *json = cJSON_IsObject(data) && cJSON_IsString(type) ? cJSON_PrintUnformatted(data) : NULL;
-    if (json == NULL) {
+    if (json == NULL)
+    {
         ESP_LOGW(TAG, "HTTP protocol response has no valid data/type");
         cJSON_Delete(root);
         return;
     }
-    if (xSemaphoreTake(s_protocol_lifecycle_mutex, portMAX_DELAY) == pdTRUE) {
+    if (xSemaphoreTake(s_protocol_lifecycle_mutex, portMAX_DELAY) == pdTRUE)
+    {
         const HttpProtocolTarget *target = &response->target;
         uint32_t *generation = protocol_generation_slot(target);
         Externaldevice *device = NULL;
         /* 先判断代次，再读取可能已释放并重新分配的 Aging_device。 */
-        if (generation != NULL && *generation == target->generation) {
-            if (target->kind == HTTP_PROTOCOL_AGING) device = Aging_device;
+        if (generation != NULL && *generation == target->generation)
+        {
+            if (target->kind == HTTP_PROTOCOL_AGING)
+                device = Aging_device;
             else if (read_devices != NULL && target->device_index < read_device_count)
                 device = &read_devices[target->device_index];
         }
-        if (device == NULL || device->ProtoID != target->proto_id) {
+        if (device == NULL || device->ProtoID != target->proto_id)
+        {
             ESP_LOGW(TAG, "Discard stale HTTP protocol: target=%d index=%u generation=%lu",
                      target->kind, target->device_index, (unsigned long)target->generation);
-        } else {
+        }
+        else
+        {
             esp_err_t err = ESP_ERR_NOT_SUPPORTED;
-            if (strcmp(type->valuestring, "SCPI") == 0) err = import_scpi_protocol_to_device(device, json);
-            else if (strcmp(type->valuestring, "MODBUS") == 0) err = import_modbus_protocol_to_device(device, json);
-            else if (strcmp(type->valuestring, "BLUETTICAN") == 0) err = import_can_protocol_to_device(device, json);
-            if (err != ESP_OK) ESP_LOGW(TAG, "Protocol import failed: %s", esp_err_to_name(err));
+            if (strcmp(type->valuestring, "SCPI") == 0)
+                err = import_scpi_protocol_to_device(device, json);
+            else if (strcmp(type->valuestring, "MODBUS") == 0)
+                err = import_modbus_protocol_to_device(device, json);
+            else if (strcmp(type->valuestring, "BLUETTICAN") == 0)
+                err = import_can_protocol_to_device(device, json);
+            if (err != ESP_OK)
+                ESP_LOGW(TAG, "Protocol import failed: %s", esp_err_to_name(err));
         }
         protocol_lifecycle_unlock();
-    } else ESP_LOGE(TAG, "Protocol lifecycle lock failed");
+    }
+    else
+        ESP_LOGE(TAG, "Protocol lifecycle lock failed");
     cJSON_free(json);
     cJSON_Delete(root);
 }
 
 static void app_HTTP_Rdata_handle(void *arg)
 {
-    for (;;) {
+    for (;;)
+    {
         HttpProtocolResponse response = {0};
         esp_err_t err = http_receive_protocol(&response, pdMS_TO_TICKS(5000));
-        if (err == ESP_OK) {
+        if (err == ESP_OK)
+        {
             parse_http_protocol_response(&response);
             http_protocol_response_release(&response);
-        } else if (err != ESP_ERR_TIMEOUT) {
+        }
+        else if (err != ESP_ERR_TIMEOUT)
+        {
             ESP_LOGW(TAG, "HTTP response queue unavailable: %s", esp_err_to_name(err));
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
@@ -2475,9 +2496,9 @@ static bool start_aging_with_ready_pn(const char *aging_json, int start_seq)
  * 无需同步原语。
  */
 #define MQTT_SEQ_DEDUP_CAPACITY 32
-#define MQTT_SEQ_REPLY_MAX      512
+#define MQTT_SEQ_REPLY_MAX 512
 /* 去重/重放有效期：覆盖服务端重试窗口（约 30 秒量级），留 10 分钟余量。 */
-#define MQTT_SEQ_WINDOW_MS      (10 * 60 * 1000)
+#define MQTT_SEQ_WINDOW_MS (10 * 60 * 1000)
 /* 重放表不可用时的退化防重容量（旧行为）。 */
 #define MQTT_SEQ_FALLBACK_CAPACITY 16
 
@@ -2679,7 +2700,7 @@ enum
 };
 
 #define MQTT_PUBLISH_TRACK_CAPACITY 64
-#define MQTT_PUSH_SETTLE_QUEUE_LEN  64
+#define MQTT_PUSH_SETTLE_QUEUE_LEN 64
 
 typedef struct
 {
@@ -3715,7 +3736,6 @@ static void button_task(void *arg)
         //.pull_down_en = GPIO_PULLUP_ENABLE,
         .intr_type = GPIO_INTR_DISABLE};
     gpio_config(&io_conf);
-    int click_count = 0;
 
     while (1)
     {
@@ -3724,28 +3744,11 @@ static void button_task(void *arg)
             /* 灯测试：每按一次反转 IO17/IO18 电平，用于实机确认灯与接线。 */
             status_led_toggle_both();
 
-            if (click_count == 0)
-            {
-                show_free_heap("内存");
-                print_application_task_stacks();
+            show_free_heap("内存");
+            print_application_task_stacks();
 
-                // send_control_command(Sensor1, 0xFF, 50);
-                click_count = 1;
-            }
-            else if (click_count == 1)
-            {
-
-                click_count = 2;
-            }
-            else if (click_count == 2)
-            {
-                show_free_heap("内存");
-                click_count = 3;
-            }
-            else if (click_count == 3)
-            {
-                show_free_heap("内存");
-            }
+            // send_control_command(Sensor1, 0xFF, 50);
+            // click_count = 1;
 
             //  等待按钮释放
             while (gpio_get_level(BUTTON_PIN) == 0)
@@ -4242,14 +4245,16 @@ static bool WaitAgingDeviceProtocolReady(uint32_t timeout_ms)
 
     while ((xTaskGetTickCount() - start_tick) < timeout_tick)
     {
-        if (xSemaphoreTake(s_protocol_lifecycle_mutex, portMAX_DELAY) != pdTRUE) return false;
+        if (xSemaphoreTake(s_protocol_lifecycle_mutex, portMAX_DELAY) != pdTRUE)
+            return false;
         bool ready = Aging_device != NULL &&
-            Aging_device[0].HaveProtocol == true &&
-            (Aging_device[0].scpi_protocol != NULL ||
-             Aging_device[0].modbusprotocol.item_count > 0 ||
-             Aging_device[0].canprotocol.item_count > 0);
+                     Aging_device[0].HaveProtocol == true &&
+                     (Aging_device[0].scpi_protocol != NULL ||
+                      Aging_device[0].modbusprotocol.item_count > 0 ||
+                      Aging_device[0].canprotocol.item_count > 0);
         protocol_lifecycle_unlock();
-        if (ready) return true;
+        if (ready)
+            return true;
 
         vTaskDelay(pdMS_TO_TICKS(100));
     }
@@ -4259,12 +4264,14 @@ static bool WaitAgingDeviceProtocolReady(uint32_t timeout_ms)
 
 static void AgingDevice_RuntimeFree(void)
 {
-    if (xSemaphoreTake(s_protocol_lifecycle_mutex, portMAX_DELAY) != pdTRUE) {
+    if (xSemaphoreTake(s_protocol_lifecycle_mutex, portMAX_DELAY) != pdTRUE)
+    {
         ESP_LOGE(TAG, "Protocol lifecycle lock failed on free");
         return;
     }
     protocol_generation_advance(&s_aging_protocol_generation);
-    if (Aging_device == NULL) {
+    if (Aging_device == NULL)
+    {
         protocol_lifecycle_unlock();
         return;
     }
@@ -4371,7 +4378,8 @@ static bool aging_command_json_parse(const char *packet_copy)
                       agingcfg.devices[0].ProtoID,
                       agingcfg.devices[0].Communication);
 
-    if (xSemaphoreTake(s_protocol_lifecycle_mutex, portMAX_DELAY) != pdTRUE) {
+    if (xSemaphoreTake(s_protocol_lifecycle_mutex, portMAX_DELAY) != pdTRUE)
+    {
         aging_error_log("Protocol lifecycle lock failed during device creation");
         goto start_failed;
     }
@@ -5952,11 +5960,11 @@ void app_AgingData_Upload_handle(void *arg)
  * （inflight 掉电/重启即按 pending 重传），需要服务端按
  * PN+RecordId+IDNUM 去重兜底。
  */
-#define MQTT_BACKFILL_BATCH        4
-#define MQTT_BACKFILL_BATCH_MS     100   /* 批间隔：防打满 outbox 56KB 准入预算 */
-#define MQTT_BACKFILL_POLL_MS      1000  /* 无通知时的轮询周期 */
-#define MQTT_BACKFILL_SCAN_MS      60000 /* 通知丢失的兜底扫描周期 */
-#define MQTT_BACKFILL_BACKOFF_MS   5000  /* outbox 预算不足退避 */
+#define MQTT_BACKFILL_BATCH 4
+#define MQTT_BACKFILL_BATCH_MS 100    /* 批间隔：防打满 outbox 56KB 准入预算 */
+#define MQTT_BACKFILL_POLL_MS 1000    /* 无通知时的轮询周期 */
+#define MQTT_BACKFILL_SCAN_MS 60000   /* 通知丢失的兜底扫描周期 */
+#define MQTT_BACKFILL_BACKOFF_MS 5000 /* outbox 预算不足退避 */
 
 static TaskHandle_t s_mqtt_backfill_task = NULL;
 
@@ -6095,7 +6103,8 @@ void app_mqtt_backfill_wake(void)
 void app_task_init(void)
 {
     s_protocol_lifecycle_mutex = xSemaphoreCreateMutexStatic(&s_protocol_lifecycle_storage);
-    if (s_protocol_lifecycle_mutex == NULL) {
+    if (s_protocol_lifecycle_mutex == NULL)
+    {
         ESP_LOGE(TAG, "Failed to create protocol lifecycle mutex");
         return;
     }
@@ -6166,7 +6175,8 @@ void app_task_init(void)
     {
         /* 早于 Mesh 自愈及 MQTT 命令；创建失败时命令明确拒绝，不同步重启。 */
         esp_err_t restart_err = system_restart_init();
-        if (restart_err != ESP_OK) {
+        if (restart_err != ESP_OK)
+        {
             ESP_LOGE(TAG, "Restart service init failed: %s", esp_err_to_name(restart_err));
         }
         esp_err_t mesh_err = mesh_init_Custom();
