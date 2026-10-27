@@ -18,7 +18,8 @@ GPIO17/18 与现有 UART（43/44）、RS485/CAN（1/2）、以太网 SPI（6/15/
 - 驱动模块：`main/APP/Status/status_led.c` / `.h`
 - 接口 5 个：`status_led_init()`、`status_led_pn_ready()`、`status_led_aging_start()`、
   `status_led_all_off()`、`status_led_toggle_both()`（按键诊断：两灯电平各自取反）
-- 无任务、无临界区、无动态内存；`gpio_set_level()` 本身线程安全，事件接口幂等、无阻塞、非 ISR
+- 无任务、无动态内存；翻转与写镜像使用极短临界区（只保护两灯电平镜像，不调用 SDK/日志），
+  `gpio_set_level()` 本身线程安全，事件接口幂等、无阻塞、非 ISR
 - 初始化：`app_task_init()` 在 `app_uart_init()` 之前调用 `status_led_init()`，失败只写日志不阻断启动
 - 编译：`main/CMakeLists.txt` 的 `SRCS`/`INCLUDE_DIRS` 已包含 `APP/Status`
 
@@ -73,7 +74,7 @@ GPIO17/18 与现有 UART（43/44）、RS485/CAN（1/2）、以太网 SPI（6/15/
 | 4 | 重复/非法 `set_pn` 与缺 PN 拒绝**不改变**灯态（不再有闪烁提示） |
 | 5 | 老化运行期间不清 IO18；只有老化结束才双灭 |
 | 6 | 灯态只存 RAM，不新增 NVS 字段 |
-| 7 | `status_led_toggle_both()`（`button_task` 每次按键调用）仅作灯/接线诊断，不持久化；后续业务事件会覆盖其结果 |
+| 7 | `status_led_toggle_both()`（`button_task` 每次按键调用）基于模块内电平镜像取反，不依赖 `gpio_get_level()` 回读；仅作灯/接线诊断，不持久化，后续业务事件会覆盖其结果 |
 
 ## 7. 测试与验收
 

@@ -36,9 +36,17 @@ typedef struct {
 #define GPIO_PULLDOWN_DISABLE 0
 #define GPIO_INTR_DISABLE 0
 
+typedef struct {
+    uint32_t spinlock;
+} portMUX_TYPE;
+#define portMUX_INITIALIZER_UNLOCKED {0}
+void mock_enter_critical(portMUX_TYPE *lock);
+void mock_exit_critical(portMUX_TYPE *lock);
+#define portENTER_CRITICAL(lock) mock_enter_critical(lock)
+#define portEXIT_CRITICAL(lock) mock_exit_critical(lock)
+
 int gpio_config(const gpio_config_t *cfg);
 int gpio_set_level(int gpio_num, int level);
-int gpio_get_level(int gpio_num);
 
 void mock_log(const char *tag, const char *format, ...) __attribute__((format(printf, 2, 3)));
 #define ESP_LOGI mock_log
@@ -98,10 +106,14 @@ int gpio_set_level(int gpio_num, int level)
     return ESP_OK;
 }
 
-int gpio_get_level(int gpio_num)
+void mock_enter_critical(portMUX_TYPE *lock)
 {
-    assert(gpio_num >= 0 && gpio_num < PIN_SPAN);
-    return g_level[gpio_num];
+    assert(lock != NULL);
+}
+
+void mock_exit_critical(portMUX_TYPE *lock)
+{
+    assert(lock != NULL);
 }
 
 void mock_log(const char *tag, const char *format, ...)
@@ -186,8 +198,9 @@ int main(void)
 with tempfile.TemporaryDirectory(prefix="status-led-test-") as directory:
     tmp = Path(directory)
     (tmp / "driver").mkdir()
+    (tmp / "freertos").mkdir()
     (tmp / "mock.h").write_text(MOCK)
-    for name in ("driver/gpio.h", "esp_log.h", "esp_err.h"):
+    for name in ("driver/gpio.h", "freertos/FreeRTOS.h", "esp_log.h", "esp_err.h"):
         (tmp / name).write_text('#include "mock.h"\n')
     (tmp / "harness.c").write_text(HARNESS)
 

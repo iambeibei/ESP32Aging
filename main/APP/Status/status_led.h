@@ -34,8 +34,8 @@ void status_led_aging_start(void);
 /** 两灯恢复高电平熄灭（老化结束）。任意任务上下文、无阻塞、幂等，非 ISR。 */
 void status_led_all_off(void);
 
-/** 两灯电平各自取反（按键诊断测试用）。任意任务上下文、无阻塞、非 ISR。
- * 仅用于确认灯与接线，不持久化；后续 set_pn / start_aging / 老化结束事件会覆盖其结果。 */
+/** 两灯电平各自取反（按键诊断测试用）。基于模块内电平镜像，不依赖 GPIO 回读。
+ * 任意任务上下文、无阻塞、非 ISR；不持久化，后续业务事件会覆盖其结果。 */
 void status_led_toggle_both(void);
 
 #ifdef __cplusplus

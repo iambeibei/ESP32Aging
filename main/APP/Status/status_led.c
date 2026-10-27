@@ -7,6 +7,10 @@
  * - start_aging 成功 / 掉电恢复运行中老化 -> status_led_aging_start()
  * - 老化正常完成 / 异常中止 / 人工 stop_aging -> status_led_all_off()
  * 重复或非法 set_pn、start_aging 缺 PN 被拒，均不改变灯态。
+ *
+ * 两灯电平在模块内维护镜像：GPIO_MODE_OUTPUT 下 gpio_get_level() 读不到输出电平
+ * （输入使能已关闭，恒返回 0），因此翻转一律基于镜像，不依赖 GPIO 回读，也不受
+ * LED 接法（灌电流/拉电流、是否经三极管）影响。
  */
 #include "status_led.h"
 
@@ -15,6 +19,7 @@
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
 
 #define TAG "status_led"
 
@@ -28,13 +33,36 @@
  */
 static bool s_led_initialized;
 
-static void status_led_output(int gpio_num, bool on)
+/* 两灯当前输出电平镜像（true = 点亮/输出低）。锁内只做赋值，不调用 SDK/日志。 */
+static portMUX_TYPE s_led_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_aging_on;
+static bool s_pn_on;
+
+/* 仅写 GPIO 并检查返回值，不更新镜像（镜像由调用方在临界区内维护）。 */
+static void status_led_gpio_write(int gpio_num, bool on)
 {
     esp_err_t err = gpio_set_level(gpio_num, on ? STATUS_LED_LEVEL_ON : STATUS_LED_LEVEL_OFF);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "gpio_set_level(%d) failed: %s", gpio_num, esp_err_to_name(err));
     }
+}
+
+/* 写 GPIO + 更新镜像：init 与业务事件的统一入口。 */
+static void status_led_output(int gpio_num, bool on)
+{
+    status_led_gpio_write(gpio_num, on);
+
+    portENTER_CRITICAL(&s_led_lock);
+    if (gpio_num == STATUS_LED_AGING_GPIO)
+    {
+        s_aging_on = on;
+    }
+    else if (gpio_num == STATUS_LED_PN_GPIO)
+    {
+        s_pn_on = on;
+    }
+    portEXIT_CRITICAL(&s_led_lock);
 }
 
 esp_err_t status_led_init(void)
@@ -75,7 +103,7 @@ esp_err_t status_led_init(void)
         return err;
     }
 
-    /* 配置完成后再锁存一次高电平，兼容驱动内部的方向/电平切换顺序差异。 */
+    /* 配置完成后再锁存一次高电平，并把镜像初始化为“双灭”。 */
     status_led_output(STATUS_LED_AGING_GPIO, false);
     status_led_output(STATUS_LED_PN_GPIO, false);
 
@@ -103,10 +131,17 @@ void status_led_all_off(void)
 
 void status_led_toggle_both(void)
 {
-    /*
-     * 低电平点亮：读输出锁存器后取反——当前高（灭）→ 点亮，
-     * 当前低（亮）→ 熄灭。GPIO 输出模式下 gpio_get_level 读取输出寄存器。
-     */
-    status_led_output(STATUS_LED_AGING_GPIO, gpio_get_level(STATUS_LED_AGING_GPIO) != 0);
-    status_led_output(STATUS_LED_PN_GPIO, gpio_get_level(STATUS_LED_PN_GPIO) != 0);
+    bool aging_on;
+    bool pn_on;
+
+    /* 临界区内只翻转镜像；GPIO 写入与日志留在临界区外。 */
+    portENTER_CRITICAL(&s_led_lock);
+    s_aging_on = !s_aging_on;
+    s_pn_on = !s_pn_on;
+    aging_on = s_aging_on;
+    pn_on = s_pn_on;
+    portEXIT_CRITICAL(&s_led_lock);
+
+    status_led_gpio_write(STATUS_LED_AGING_GPIO, aging_on);
+    status_led_gpio_write(STATUS_LED_PN_GPIO, pn_on);
 }
