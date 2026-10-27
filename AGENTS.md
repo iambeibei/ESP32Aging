@@ -21,6 +21,8 @@
   迁移到查询串下载接口的过程。
 - [MESH_LITE_OTA_INTEGRATION.md](MESH_LITE_OTA_INTEGRATION.md) —— Mesh BINARY 分发集成、ota_cache
   边界行为与实机验收记录。
+- [STATUS_LED_DESIGN.md](STATUS_LED_DESIGN.md) —— IO18 PN 状态灯（常亮/快闪/慢闪）与 IO17
+  老化运行灯的状态规则、时序参数、代码注入点与验收表。
 - [MODIFICATION_NOTES.md](MODIFICATION_NOTES.md) —— 上传队列与采样时刻固化 Value 格式的设计依据。
 - `SQLITE_FIRST_BOOT_FIX.md` / `SQLITE_FIX_NOTES.md` / `SQLITE_SCHEMA_FIX_V3.md` /
   `SQLITE_SCHEMA_PROBE_FIX_V4.md` —— SQLite 首启动与 schema 探测/迁移的排障记录。
@@ -36,7 +38,7 @@ CMake 工程名 `Light_Gateway_UDP` 是历史遗留，当前上行主链路是 M
 `app_task_init()`（[appTask.c](main/Task/appTask.c)，约 5.5k 行，编排中枢：UART/RS485/BLE 接收处理、
 MQTT/HTTP JSON 命令解析、老化状态机）。初始化顺序：
 `nvs_flash_init → spiffs_init → SqLite_Init → log_storage_mount → SelfRecovery_Init →
-app_uart_init → readconfig() → Device_Init()`，再按角色建 mesh/MQTT/老化任务。
+status_led_init → app_uart_init → readconfig() → Device_Init()`，再按角色建 mesh/MQTT/老化任务。
 业务任务全部经 `create_cpu1_task()` 固定在 **CPU1**（CPU0 留给 Wi-Fi/Bluedroid），栈/优先级取
 [task_config.h](main/Task/task_config.h) 的 `LG_*` 常量；单核配置（`CONFIG_FREERTOS_UNICORE`）会编译报错。
 

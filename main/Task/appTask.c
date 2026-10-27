@@ -45,6 +45,7 @@
 #include "ota.h"
 #include "mesh_ota.h"
 #include "system_restart.h"
+#include "status_led.h"
 
 #pragma region 全局状态与任务辅助
 
@@ -2353,7 +2354,8 @@ static bool start_aging_with_ready_pn(const char *aging_json, int start_seq)
 
     if (s_aging_cmd_state == AGING_CMD_RUNNING)
     {
-        device_response_publish_point(start_seq, 0, "Aging already started, ignoring new command");
+        /* 防御性分支：正常流程已由命令入口在错峰后拒绝并回执，此处语义与之一致。 */
+        device_response_publish_point(start_seq, 1, "指令重复，老化已启动");
         aging_error_log("Duplicate start aging command rejected: aging is already running");
         return false;
     }
@@ -2441,8 +2443,17 @@ static bool start_aging_with_ready_pn(const char *aging_json, int start_seq)
     s_pending_start_seq = 0;
     persist_pending_start_state(false, 0);
 
-    device_response_publish_point(start_seq, 1, "Aging started, command received and processed");
+    /*
+     * 成功路径不再另发 cmd/reply/point：命令入口已在错峰延时后回过
+     * "已收到指令"，同一条命令只保留一条 point 回执（2026-10-27 用户决策）。
+     * 启动结果由 event/state 的 agingStart 与后续采样数据体现。
+     */
     aging_state_publish("agingStart");
+    /*
+     * IO17 低电平点亮：老化已真正启动（任务已创建、PN 已消费），
+     * 与 agingStart 上报同一代码点；结束路径（agingIdle/agingError/agingStop）熄灭。
+     */
+    status_led_aging_start();
     aging_runtime_log("Aging task started successfully, state=%s", aging_cmd_state_name(s_aging_cmd_state));
     return true;
 }
@@ -2970,7 +2981,10 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                  */
                 if (s_aging_cmd_state == AGING_CMD_RUNNING)
                 {
-                    device_response_publish_point(start_seq, 0, "Aging already started, ignoring new command");
+                    /* 重复启动按"已受理"回执（Code=1）：服务器/点位无需再重试；
+                     * 文案与"已收到指令"同属中文回执链路。位置仍在错峰延时之后，
+                     * 批量下发时不会让多节点同刻上行。 */
+                    device_response_publish_point(start_seq, 1, "指令重复，老化已启动");
                     ESP_LOGW(TAG, "Duplicate start_aging rejected while RUNNING, seq=%d", start_seq);
                     aging_error_log("Duplicate start aging command rejected: aging is already running");
                 }
@@ -2985,6 +2999,14 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                 }
                 else
                 {
+                    /*
+                     * 错峰延时之后再回执"已收到指令"（2026-10-27 用户决策）：
+                     * 延时先打散批量下发的上行峰值，再让点位拿到"已收到"的确认。
+                     * 回执只表示「已受理并开始启动」，启动结果由 event/state 的
+                     * agingStart 与后续数据体现；本路径不再另发成功 point 回复。
+                     */
+                    device_response_publish_point(start_seq, 1, "已收到指令");
+
                     /*
                      * 正常顺序：set_pn先到，start_aging后到。
                      * ProgramId 状态与 RecordId 均只在通过 PN 门后生效，
@@ -3047,6 +3069,9 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                 spiffs_file_delete("Aging.json");
 
                 aging_state_publish("agingStop");
+                /* 人工停止属于老化结束：IO17 熄灭，IO18 回到无 PN 熄灭。 */
+                status_led_aging_stop();
+                status_led_pn_off();
                 aging_runtime_log("Aging stopped and resources released");
 
                 AgingLogActive = false;
@@ -3066,6 +3091,8 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                     publish_pn_reply(Seq->valueint, 0, PN_Code);
                     ESP_LOGW(TAG, "set_pn rejected while aging is RUNNING");
                     aging_error_log("Set PN command rejected while aging is running");
+                    /* IO18：重复设置提示，快闪后回到“PN 就绪常亮”。 */
+                    status_led_pn_reject();
                 }
                 else if (s_new_pn_ready == 1)
                 {
@@ -3073,6 +3100,8 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                     publish_pn_reply(Seq->valueint, 0, PN_Code_Ready);
                     ESP_LOGW(TAG, "set_pn rejected: a new PN is already ready, PN=%s", PN_Code_Ready);
                     local_error_log("Set PN rejected: previous ready PN has not been consumed");
+                    /* IO18：重复设置提示，快闪后回到“PN 就绪常亮”。 */
+                    status_led_pn_reject();
                 }
                 else
                 {
@@ -3084,11 +3113,14 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                     {
                         publish_pn_reply(Seq->valueint, 0, "");
                         local_error_log("Invalid or empty PN code was rejected");
+                        /* IO18：非法 PN 同样按“设置未成功”快闪提示，稳态不变。 */
+                        status_led_pn_reject();
                     }
                     else if (!copy_string_checked(new_pn, sizeof(new_pn), pn_obj->valuestring))
                     {
                         publish_pn_reply(Seq->valueint, 0, "");
                         local_error_log("PN code is too long and was rejected");
+                        status_led_pn_reject();
                     }
                     else
                     {
@@ -3100,6 +3132,11 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
 
                         publish_pn_reply(Seq->valueint, 1, PN_Code_Ready);
                         ESP_LOGI(TAG, "New PN ready for next aging: %s", PN_Code_Ready);
+                        /*
+                         * IO18 常亮：PN 就绪，并在老化运行期间保持（PN 仍在使用），
+                         * 直到正常结束/人工停止熄灭，或老化失败转慢闪。
+                         */
+                        status_led_pn_ready();
 
                         if (s_aging_cmd_state == AGING_CMD_WAIT_PN)
                         {
@@ -3541,10 +3578,14 @@ void Init_ByNetwork_Flag(void *arg)
                 {
                     s_new_pn_ready = 1;
                     ESP_LOGI(TAG, "Recovered ready PN: %s", PN_Code_Ready);
+                    /* 掉电恢复的 Ready PN 仍然有效：IO18 上电即常亮。 */
+                    status_led_pn_ready();
                 }
                 else
                 {
                     clear_ready_pn_runtime();
+                    /* 无有效 Ready PN：确认 IO18 熄灭（上电默认态，幂等）。 */
+                    status_led_pn_off();
                 }
 
                 uint16_t start_pending = 0;
@@ -3588,6 +3629,12 @@ void Init_ByNetwork_Flag(void *arg)
                         {
                             s_aging_cmd_state = AGING_CMD_RUNNING;
                             ESP_LOGI(TAG, "Aging recovery succeeded, state=RUNNING, PN=%s", PN_Code);
+                            /*
+                             * 掉电恢复到运行中的老化：IO17 上电即点亮；当前 PN 仍在
+                             * 使用，IO18 保持常亮，与在线运行期间灯态一致。
+                             */
+                            status_led_aging_start();
+                            status_led_pn_ready();
                         }
                         else
                         {
@@ -3596,6 +3643,9 @@ void Init_ByNetwork_Flag(void *arg)
                             memset(PN_Code, 0, sizeof(PN_Code));
                             SelfRecovery_Write_uint16(NVS_KEY_AGING_VALID, 0);
                             SelfRecovery_Write_str(NVS_KEY_CURRENT_PN, "");
+                            /* 恢复失败：没有运行中的老化，双灯回到熄灭。 */
+                            status_led_aging_stop();
+                            status_led_pn_off();
                         }
                     }
                     else
@@ -3605,6 +3655,9 @@ void Init_ByNetwork_Flag(void *arg)
                         memset(PN_Code, 0, sizeof(PN_Code));
                         SelfRecovery_Write_uint16(NVS_KEY_AGING_VALID, 0);
                         SelfRecovery_Write_str(NVS_KEY_CURRENT_PN, "");
+                        /* 恢复数据无效：双灯回到熄灭。 */
+                        status_led_aging_stop();
+                        status_led_pn_off();
                     }
                 }
                 else
@@ -4622,6 +4675,14 @@ static void Aging_Task_Abort_Cleanup(void)
 static void Aging_Task_Abort_And_Delete(void)
 {
     Aging_Task_Abort_Cleanup();
+
+    /*
+     * 所有老化会话异常终止（agingError）都收口到本函数：
+     * IO17 熄灭；IO18 转 1Hz 慢闪并保持到下次 set_pn 成功（RAM 状态，重启清零）。
+     */
+    status_led_aging_stop();
+    status_led_pn_fail();
+
     AgingLogActive = false;
     s_consecutive_data_read_failures = 0;
     s_last_data_read_error_report_tick = 0;
@@ -5417,6 +5478,9 @@ void Aging_Test_Task(void *arg)
 
             aging_runtime_log("Aging completed successfully");
             aging_state_publish("agingIdle");
+            /* 正常老化结束：IO17 熄灭；PN 已消费，IO18 熄灭。 */
+            status_led_aging_stop();
+            status_led_pn_off();
 
             AgingLogActive = false;
             s_consecutive_data_read_failures = 0;
@@ -6077,6 +6141,17 @@ void app_task_init(void)
 
     SelfRecovery_Read_uint64(NVS_KEY_DEVICE_NUMBER, &DeviceNumber);
     SelfRecovery_Read_uint64(NVS_KEY_SAFE_CODE, &SafeCode);
+
+    /*
+     * 状态指示灯：早于 UART/老化/PN 事件初始化，保证上电默认熄灭；
+     * 失败只记录日志，不阻断启动（灯属于辅助指示）。
+     */
+    esp_err_t led_err = status_led_init();
+    if (led_err != ESP_OK)
+    {
+        storage_write_record_cyclic(current_log_pn(), "status_led_init failed");
+    }
+
     // 初始化UART0
     app_uart_init();
 

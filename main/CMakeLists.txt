@@ -40,6 +40,7 @@ idf_component_register(SRCS "main.c"
                             "APP/OTA/ota_cache.c"
                             "APP/OTA/mesh_ota.c"
                             "APP/Restart/system_restart.c"
+                            "APP/Status/status_led.c"
 
                             INCLUDE_DIRS 
                             "Communication/Uart"
@@ -61,4 +62,5 @@ idf_component_register(SRCS "main.c"
                             "APP/HTTP"
                             "APP/OTA"
                             "APP/Restart"
+                            "APP/Status"
                     )
