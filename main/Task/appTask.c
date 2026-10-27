@@ -39,7 +39,6 @@
 #include "modbus_cmd.h"
 #include "esp_heap_caps.h"
 #include "app_mem.h"
-#include "app_cpu.h"
 #include "SelfRecovery.h"
 #include "task_config.h"
 #include "ota.h"
@@ -105,7 +104,6 @@ uint64_t SafeCode = 0;     // 安全码
 
 static void show_free_heap(const char *tag)
 {
-    app_cpu_usage_log(tag);
     size_t free_internal_heap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     size_t min_internal_heap = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     size_t largest_internal_block = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -3069,9 +3067,8 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                 spiffs_file_delete("Aging.json");
 
                 aging_state_publish("agingStop");
-                /* 人工停止属于老化结束：IO17 熄灭，IO18 回到无 PN 熄灭。 */
-                status_led_aging_stop();
-                status_led_pn_off();
+                /* 人工停止属于老化结束：两灯一起熄灭。 */
+                status_led_all_off();
                 aging_runtime_log("Aging stopped and resources released");
 
                 AgingLogActive = false;
@@ -3091,8 +3088,6 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                     publish_pn_reply(Seq->valueint, 0, PN_Code);
                     ESP_LOGW(TAG, "set_pn rejected while aging is RUNNING");
                     aging_error_log("Set PN command rejected while aging is running");
-                    /* IO18：重复设置提示，快闪后回到“PN 就绪常亮”。 */
-                    status_led_pn_reject();
                 }
                 else if (s_new_pn_ready == 1)
                 {
@@ -3100,8 +3095,6 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                     publish_pn_reply(Seq->valueint, 0, PN_Code_Ready);
                     ESP_LOGW(TAG, "set_pn rejected: a new PN is already ready, PN=%s", PN_Code_Ready);
                     local_error_log("Set PN rejected: previous ready PN has not been consumed");
-                    /* IO18：重复设置提示，快闪后回到“PN 就绪常亮”。 */
-                    status_led_pn_reject();
                 }
                 else
                 {
@@ -3113,14 +3106,11 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                     {
                         publish_pn_reply(Seq->valueint, 0, "");
                         local_error_log("Invalid or empty PN code was rejected");
-                        /* IO18：非法 PN 同样按“设置未成功”快闪提示，稳态不变。 */
-                        status_led_pn_reject();
                     }
                     else if (!copy_string_checked(new_pn, sizeof(new_pn), pn_obj->valuestring))
                     {
                         publish_pn_reply(Seq->valueint, 0, "");
                         local_error_log("PN code is too long and was rejected");
-                        status_led_pn_reject();
                     }
                     else
                     {
@@ -3133,8 +3123,8 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                         publish_pn_reply(Seq->valueint, 1, PN_Code_Ready);
                         ESP_LOGI(TAG, "New PN ready for next aging: %s", PN_Code_Ready);
                         /*
-                         * IO18 常亮：PN 就绪，并在老化运行期间保持（PN 仍在使用），
-                         * 直到正常结束/人工停止熄灭，或老化失败转慢闪。
+                         * IO18 点亮：PN 就绪，并在老化运行期间保持（PN 仍在使用），
+                         * 老化结束（正常/异常/人工停止）时与 IO17 一起熄灭。
                          */
                         status_led_pn_ready();
 
@@ -3584,8 +3574,8 @@ void Init_ByNetwork_Flag(void *arg)
                 else
                 {
                     clear_ready_pn_runtime();
-                    /* 无有效 Ready PN：确认 IO18 熄灭（上电默认态，幂等）。 */
-                    status_led_pn_off();
+                    /* 无有效 Ready PN：确认两灯熄灭（上电默认态，幂等）。 */
+                    status_led_all_off();
                 }
 
                 uint16_t start_pending = 0;
@@ -3644,8 +3634,7 @@ void Init_ByNetwork_Flag(void *arg)
                             SelfRecovery_Write_uint16(NVS_KEY_AGING_VALID, 0);
                             SelfRecovery_Write_str(NVS_KEY_CURRENT_PN, "");
                             /* 恢复失败：没有运行中的老化，双灯回到熄灭。 */
-                            status_led_aging_stop();
-                            status_led_pn_off();
+                            status_led_all_off();
                         }
                     }
                     else
@@ -3656,8 +3645,7 @@ void Init_ByNetwork_Flag(void *arg)
                         SelfRecovery_Write_uint16(NVS_KEY_AGING_VALID, 0);
                         SelfRecovery_Write_str(NVS_KEY_CURRENT_PN, "");
                         /* 恢复数据无效：双灯回到熄灭。 */
-                        status_led_aging_stop();
-                        status_led_pn_off();
+                        status_led_all_off();
                     }
                 }
                 else
@@ -3731,9 +3719,11 @@ static void button_task(void *arg)
 
     while (1)
     {
-        app_cpu_usage_poll();
         if (gpio_get_level(BUTTON_PIN) == 0)
         {
+            /* 灯测试：每按一次反转 IO17/IO18 电平，用于实机确认灯与接线。 */
+            status_led_toggle_both();
+
             if (click_count == 0)
             {
                 show_free_heap("内存");
@@ -3760,7 +3750,6 @@ static void button_task(void *arg)
             //  等待按钮释放
             while (gpio_get_level(BUTTON_PIN) == 0)
             {
-                app_cpu_usage_poll();
                 vTaskDelay(pdMS_TO_TICKS(50));
             }
             vTaskDelay(pdMS_TO_TICKS(50));
@@ -4676,12 +4665,8 @@ static void Aging_Task_Abort_And_Delete(void)
 {
     Aging_Task_Abort_Cleanup();
 
-    /*
-     * 所有老化会话异常终止（agingError）都收口到本函数：
-     * IO17 熄灭；IO18 转 1Hz 慢闪并保持到下次 set_pn 成功（RAM 状态，重启清零）。
-     */
-    status_led_aging_stop();
-    status_led_pn_fail();
+    /* 所有老化会话异常终止（agingError）都收口到本函数：两灯一起熄灭。 */
+    status_led_all_off();
 
     AgingLogActive = false;
     s_consecutive_data_read_failures = 0;
@@ -5478,9 +5463,8 @@ void Aging_Test_Task(void *arg)
 
             aging_runtime_log("Aging completed successfully");
             aging_state_publish("agingIdle");
-            /* 正常老化结束：IO17 熄灭；PN 已消费，IO18 熄灭。 */
-            status_led_aging_stop();
-            status_led_pn_off();
+            /* 正常老化结束：两灯一起熄灭（PN 已消费，老化任务已退出）。 */
+            status_led_all_off();
 
             AgingLogActive = false;
             s_consecutive_data_read_failures = 0;

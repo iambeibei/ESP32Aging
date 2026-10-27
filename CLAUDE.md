@@ -79,10 +79,10 @@ cd /home/wbb/espidfProject/ESP32Aging
 [task_config.h](main/Task/task_config.h)。**不要把新任务绑到 core 0** ——
 `task_config.h` 里有一个编译期 `#error`，一旦 `CONFIG_FREERTOS_UNICORE` 被设置就会报错。
 
-按键诊断会同时打印 CPU0、CPU1 和双核平均占用率估算。`Tool/app_cpu.c` 复用按键任务，
-约每秒对两核 Idle 累计运行时间取差值，不创建监控任务、不遍历任务列表；日志给出实际
-采样窗口和样本距今时间。依赖 `sdkconfig.defaults` 中 ESP Timer + 64 位 FreeRTOS 运行时间
-统计；中断时间归属和调度粒度会影响估算精度，不能单凭占用率认定无线链路瓶颈。
+按键诊断（GPIO40，低电平有效）会打印内部 SRAM / PSRAM 的 free、minimum、largest，
+以及各应用任务的栈水位。该路径只在按键任务内执行，不创建监控任务、不遍历任务列表；
+FreeRTOS 运行时间统计保持关闭（`CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS`），
+因此不再输出 CPU 占用率估算。
 
 `appTask.c` 约 5.5k 行，是编排中枢：UART/RS485/BLE 接收处理、MQTT 与 HTTP 的 JSON 命令解析、
 以及老化状态机都在这里。建议先读它的函数表

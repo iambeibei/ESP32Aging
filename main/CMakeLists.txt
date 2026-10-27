@@ -18,7 +18,6 @@ idf_component_register(SRCS "main.c"
                             "Tool/app_enc.c"
                             "Tool/Json_data.c"
                             "Tool/app_mem.c"
-                            "Tool/app_cpu.c"
                             "Tool/app_queue.c"
                             "Tool/SelfRecovery.c"
                             

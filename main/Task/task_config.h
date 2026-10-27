@@ -100,9 +100,4 @@
 #define LG_STACK_BUTTON            3072
 #define LG_PRIO_BUTTON             1
 
-/* 状态指示灯轮询（main/APP/Status/status_led.c）：50 ms 周期驱动 IO18 快闪/慢闪。
- * 与 button 同为最低优先级，栈仅需局部计数与 vTaskDelay。 */
-#define LG_STACK_STATUS_LED        2048
-#define LG_PRIO_STATUS_LED         1
-
 #endif /* LIGHT_GATEWAY_TASK_CONFIG_H */

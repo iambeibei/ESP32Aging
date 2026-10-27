@@ -21,8 +21,8 @@
   迁移到查询串下载接口的过程。
 - [MESH_LITE_OTA_INTEGRATION.md](MESH_LITE_OTA_INTEGRATION.md) —— Mesh BINARY 分发集成、ota_cache
   边界行为与实机验收记录。
-- [STATUS_LED_DESIGN.md](STATUS_LED_DESIGN.md) —— IO18 PN 状态灯（常亮/快闪/慢闪）与 IO17
-  老化运行灯的状态规则、时序参数、代码注入点与验收表。
+- [STATUS_LED_DESIGN.md](STATUS_LED_DESIGN.md) —— IO18 PN 灯与 IO17 老化运行灯的纯事件驱动
+  规则（点亮/双灭）、代码注入点与验收表。
 - [MODIFICATION_NOTES.md](MODIFICATION_NOTES.md) —— 上传队列与采样时刻固化 Value 格式的设计依据。
 - `SQLITE_FIRST_BOOT_FIX.md` / `SQLITE_FIX_NOTES.md` / `SQLITE_SCHEMA_FIX_V3.md` /
   `SQLITE_SCHEMA_PROBE_FIX_V4.md` —— SQLite 首启动与 schema 探测/迁移的排障记录。
@@ -112,7 +112,6 @@ python3 tests/test_mqtt_uplink.py      # MQTT 上行、交接与 stop 竞态
 python3 tests/test_system_restart.py   # 一键重启服务与 Mesh 控制/事件
 python3 tests/test_mesh_ota_binary.py  # OTA 准入/校验/重试/供数（不含 Mesh-Lite 库本体）
 python3 tests/test_http_protocol.py    # HTTP 累积与目标路由
-python3 tests/test_cpu_usage.py        # CPU 占用采样与百分比
 python3 tests/test_psram_memory.py     # PSRAM 分配器、cJSON hooks、TLS 分配
 ```
 
