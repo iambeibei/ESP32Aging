@@ -18,7 +18,7 @@ extern "C" {
  * 引脚来源：硬件接线约定（2026-10-27 用户确认），与现有 UART/RS485/CAN/SPI/按键
  * 引脚（1/2/4/5/6/7/15/16/40/43/44）不冲突。
  */
-#define STATUS_LED_AGING_GPIO 17
+#define STATUS_LED_AGING_GPIO 8
 #define STATUS_LED_PN_GPIO 18
 
 /** 配置两路 GPIO 为输出并置为熄灭（高电平）；幂等。
