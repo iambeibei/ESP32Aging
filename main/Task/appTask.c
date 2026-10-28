@@ -159,6 +159,9 @@ char RecordId[28] = {0};
 // 已收到但尚未被下一条start_aging消费的新PN。
 char PN_Code_Ready[64] = {0};
 uint16_t s_new_pn_ready = 0;
+/* 当前目标随运行 PN 冻结；待消费目标只由命令任务设置。 */
+static BleTarget s_ble_target_current;
+static BleTarget s_ble_target_ready;
 
 /*
  * MQTT老化启动协调状态：
@@ -1738,9 +1741,11 @@ void ble_scan_complete_cb(ble_device_info_t *devices, int device_count)
     printf("\n=== BLE Scan Results (%d) ===\n", device_count);
     for (int i = 0; i < device_count && i < print_limit; i++)
     {
-        printf("[%d] %s (RSSI: %d dBm) %s\n",
+        printf("[%d] %s (MAC: " ESP_BD_ADDR_STR ", 地址类型: %u, RSSI: %d dBm) %s\n",
                i + 1,
                devices[i].name,
+               ESP_BD_ADDR_HEX(devices[i].bda),
+               (unsigned)devices[i].addr_type,
                devices[i].rssi,
                devices[i].is_connected ? "[Connected]" : "");
     }
@@ -2259,6 +2264,7 @@ static void publish_pn_reply(int cmd_seq, int code, const char *pn)
 static void clear_ready_pn_runtime(void)
 {
     memset(PN_Code_Ready, 0, sizeof(PN_Code_Ready));
+    memset(&s_ble_target_ready, 0, sizeof(s_ble_target_ready));
     s_new_pn_ready = 0;
 }
 
@@ -2267,6 +2273,7 @@ static void clear_aging_command_runtime(void)
     s_aging_cmd_state = AGING_CMD_IDLE;
     s_pending_start_seq = 0;
     memset(PN_Code, 0, sizeof(PN_Code));
+    memset(&s_ble_target_current, 0, sizeof(s_ble_target_current));
     clear_ready_pn_runtime();
 }
 
@@ -2285,13 +2292,14 @@ static void persist_pending_start_state(bool pending, int start_seq)
     }
 }
 
-static void persist_ready_pn_state(void)
+static esp_err_t persist_ready_pn_state(void)
 {
     esp_err_t ret = SelfRecovery_Write_str(NVS_KEY_READY_PN,
                                            s_new_pn_ready ? PN_Code_Ready : "");
     if (ret != ESP_OK)
     {
         local_error_log("Write ready PN failed, error=%s", esp_err_to_name(ret));
+        return ret;
     }
 
     ret = SelfRecovery_Write_uint16(NVS_KEY_NEW_PN_READY,
@@ -2300,6 +2308,32 @@ static void persist_ready_pn_state(void)
     {
         local_error_log("Write new_pn_ready failed, error=%s", esp_err_to_name(ret));
     }
+    return ret;
+}
+
+/* 先校验并提交 PN/地址绑定，再发布 Ready；失败不接受新目标。 */
+static esp_err_t accept_ready_pn_data(const cJSON *data)
+{
+    if (s_aging_cmd_state == AGING_CMD_RUNNING || s_new_pn_ready == 1)
+        return ESP_ERR_INVALID_STATE;
+    const cJSON *pn = cJSON_IsObject(data) ? cJSON_GetObjectItemCaseSensitive(data, "PN") : NULL;
+    BleTarget target;
+    if (!cJSON_IsString(pn) || pn->valuestring == NULL || pn->valuestring[0] == '\0' ||
+        strlen(pn->valuestring) >= sizeof(PN_Code_Ready) || ble_target_parse(data, &target) != ESP_OK)
+        return ESP_ERR_INVALID_ARG;
+    esp_err_t ret = ble_target_save(true, pn->valuestring, &target);
+    if (ret != ESP_OK) return ret;
+    copy_string_checked(PN_Code_Ready, sizeof(PN_Code_Ready), pn->valuestring);
+    s_ble_target_ready = target;
+    s_new_pn_ready = 1;
+    ret = persist_ready_pn_state();
+    if (ret != ESP_OK) {
+        clear_ready_pn_runtime();
+        /* 防止部分旧键写入后，下次启动把失败指令当作 Ready。 */
+        esp_err_t rollback = persist_ready_pn_state();
+        if (rollback != ESP_OK) local_error_log("清除未提交的蓝牙目标失败: %s", esp_err_to_name(rollback));
+    }
+    return ret;
 }
 
 /*
@@ -2407,10 +2441,22 @@ static bool start_aging_with_ready_pn(const char *aging_json, int start_seq)
         return false;
     }
 
+    s_ble_target_current = s_ble_target_ready;
+    ret = ble_target_save(false, PN_Code, &s_ble_target_current);
+    if (ret != ESP_OK) {
+        memset(PN_Code, 0, sizeof(PN_Code));
+        memset(&s_ble_target_current, 0, sizeof(s_ble_target_current));
+        device_response_publish_point(start_seq, 0, "蓝牙目标保存失败");
+        return false;
+    }
     ret = SelfRecovery_Write_str(NVS_KEY_CURRENT_PN, PN_Code);
     if (ret != ESP_OK)
     {
         local_error_log("Write current PN before starting failed, error=%s", esp_err_to_name(ret));
+        memset(PN_Code, 0, sizeof(PN_Code));
+        memset(&s_ble_target_current, 0, sizeof(s_ble_target_current));
+        device_response_publish_point(start_seq, 0, "当前 PN 保存失败");
+        return false;
     }
 
     /* 新任务不能继承上一次运行时的恢复游标。 */
@@ -2428,6 +2474,7 @@ static bool start_aging_with_ready_pn(const char *aging_json, int start_seq)
         s_aging_cmd_state = AGING_CMD_IDLE;
         s_pending_start_seq = 0;
         memset(PN_Code, 0, sizeof(PN_Code));
+        memset(&s_ble_target_current, 0, sizeof(s_ble_target_current));
         SelfRecovery_Write_str(NVS_KEY_CURRENT_PN, "");
         SelfRecovery_Write_uint16(NVS_KEY_AGING_VALID, 0);
         persist_pending_start_state(false, 0);
@@ -2456,7 +2503,7 @@ static bool start_aging_with_ready_pn(const char *aging_json, int start_seq)
 
     /* 3. 再清除Ready PN */
     clear_ready_pn_runtime();
-    persist_ready_pn_state();
+    (void)persist_ready_pn_state(); /* 清理失败已在内部记录；运行目标已先提交。 */
 
     /* 4. 最后清除WAIT_PN */
     s_pending_start_seq = 0;
@@ -3056,6 +3103,11 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                 aging_runtime_log("Stop aging command received, command_state=%s",
                                   aging_cmd_state_name(s_aging_cmd_state));
 
+                if (ble_control_pause() != ESP_OK) {
+                    device_response_publish_point(Seq->valueint, 0, "蓝牙控制尚未退出，请重试停止");
+                    goto cleanup;
+                }
+
                 if (Aging_test_task_handle != NULL)
                 {
                     vTaskDelete(Aging_test_task_handle);
@@ -3119,28 +3171,15 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                 }
                 else
                 {
-                    char new_pn[sizeof(PN_Code_Ready)] = {0};
                     cJSON *Data_obj = cJSON_GetObjectItem(pRoot, "Data");
-                    cJSON *pn_obj = cJSON_IsObject(Data_obj) ? cJSON_GetObjectItem(Data_obj, "PN") : NULL;
-
-                    if (!cJSON_IsString(pn_obj) || pn_obj->valuestring == NULL || pn_obj->valuestring[0] == '\0')
+                    esp_err_t target_ret = accept_ready_pn_data(Data_obj);
+                    if (target_ret != ESP_OK)
                     {
                         publish_pn_reply(Seq->valueint, 0, "");
-                        local_error_log("Invalid or empty PN code was rejected");
-                    }
-                    else if (!copy_string_checked(new_pn, sizeof(new_pn), pn_obj->valuestring))
-                    {
-                        publish_pn_reply(Seq->valueint, 0, "");
-                        local_error_log("PN code is too long and was rejected");
+                        local_error_log("设置 PN/蓝牙目标失败: %s", esp_err_to_name(target_ret));
                     }
                     else
                     {
-                        /* 先完整校验到局部变量，再覆盖Ready PN，避免异常JSON破坏旧状态。 */
-                        memset(PN_Code_Ready, 0, sizeof(PN_Code_Ready));
-                        copy_string_checked(PN_Code_Ready, sizeof(PN_Code_Ready), new_pn);
-                        s_new_pn_ready = 1;
-                        persist_ready_pn_state();
-
                         publish_pn_reply(Seq->valueint, 1, PN_Code_Ready);
                         ESP_LOGI(TAG, "New PN ready for next aging: %s", PN_Code_Ready);
                         /*
@@ -3585,7 +3624,8 @@ void Init_ByNetwork_Flag(void *arg)
                 if (SelfRecovery_Read_uint16(NVS_KEY_NEW_PN_READY, &persisted_new_pn_ready) == ESP_OK &&
                     persisted_new_pn_ready == 1 &&
                     SelfRecovery_Read_str(NVS_KEY_READY_PN, PN_Code_Ready, sizeof(PN_Code_Ready)) == ESP_OK &&
-                    PN_Code_Ready[0] != '\0')
+                    PN_Code_Ready[0] != '\0' &&
+                    ble_target_load(true, PN_Code_Ready, &s_ble_target_ready) == ESP_OK)
                 {
                     s_new_pn_ready = 1;
                     ESP_LOGI(TAG, "Recovered ready PN: %s", PN_Code_Ready);
@@ -3613,7 +3653,7 @@ void Init_ByNetwork_Flag(void *arg)
                      * RUNNING状态下不允许存在下一台Ready PN或WAIT_PN任务。
                      */
                     clear_ready_pn_runtime();
-                    persist_ready_pn_state();
+                    (void)persist_ready_pn_state(); /* 运行记录优先，清理失败已在内部记录。 */
                     persist_pending_start_state(false, 0);
                     s_pending_start_seq = 0;
 
@@ -3630,7 +3670,8 @@ void Init_ByNetwork_Flag(void *arg)
                     agingResumeState.AgingJson = read_json_from_spiffs("Aging.json");
                     vTaskDelay(pdMS_TO_TICKS(1000));
 
-                    if (agingResumeState.AgingJson != NULL && PN_Code[0] != '\0')
+                    if (agingResumeState.AgingJson != NULL && PN_Code[0] != '\0' &&
+                        ble_target_load(false, PN_Code, &s_ble_target_current) == ESP_OK)
                     {
                         AgingLogActive = true;
                         aging_runtime_log("Power-loss recovery command loaded, resume_step=%u",
@@ -3660,7 +3701,7 @@ void Init_ByNetwork_Flag(void *arg)
                     }
                     else
                     {
-                        ESP_LOGE(TAG, "Aging recovery data invalid: Aging.json or current PN missing");
+                        ESP_LOGE(TAG, "老化恢复失败：工艺、当前 PN 或绑定的蓝牙目标记录无效");
                         s_aging_cmd_state = AGING_CMD_IDLE;
                         memset(PN_Code, 0, sizeof(PN_Code));
                         SelfRecovery_Write_uint16(NVS_KEY_AGING_VALID, 0);
@@ -4308,6 +4349,11 @@ static bool aging_command_json_parse(const char *packet_copy)
         return false;
     }
 
+    if (ble_control_pause() != ESP_OK) {
+        aging_error_log("旧蓝牙控制操作尚未退出，拒绝创建新老化任务");
+        return false;
+    }
+
     agingState = AgingIdle;
     agingDataAMode = IdleState;
 
@@ -4320,6 +4366,10 @@ static bool aging_command_json_parse(const char *packet_copy)
     {
         vTaskDelete(AgingData_task_handle);
         AgingData_task_handle = NULL;
+    }
+    if (ble_control_resume() != ESP_OK) {
+        aging_error_log("旧蓝牙连接请求尚未结束，请重试启动老化");
+        return false;
     }
     if (ble_is_connected())
     {
@@ -4804,7 +4854,7 @@ void Aging_Test_Task(void *arg)
                     /* 复位上一轮可能残留的扫描完成标志：提前停扫后 GAP 完成事件
                      * 仍可能迟到置位，不清零会让下一轮误判"扫描已完成"而空跑。 */
                     ScanComplete = false;
-                    if (!ble_start_scan(BLE_AGING_SCAN_SECONDS))
+                    if (ble_start_target_scan(&s_ble_target_current, BLE_AGING_SCAN_SECONDS) != ESP_OK)
                     {
                         /*
                          * 上一轮扫描未结束或仍处于连接态时 ble_start_scan 返回 false 且不会启动扫描，
@@ -4825,7 +4875,9 @@ void Aging_Test_Task(void *arg)
                     bool target_found_early = false;
                     while (!ScanComplete)
                     {
-                        if (ble_scanned_has_name(PN_Code))
+                        if (s_ble_target_current.use_mac ?
+                            ble_scanned_has_address(s_ble_target_current.bda, s_ble_target_current.addr_type) :
+                            ble_scanned_has_name(PN_Code))
                         {
                             target_found_early = true;
                             break;
@@ -4841,7 +4893,10 @@ void Aging_Test_Task(void *arg)
                     {
                         aging_runtime_log("Bluetooth target seen during scan, stop scanning early, attempt=%u",
                                           (unsigned)FailCount);
-                        ble_stop_scan();
+                        if (ble_stop_scan_wait() != ESP_OK) {
+                            aging_error_log("目标已发现但停扫未确认，本轮不建立连接");
+                            break;
+                        }
                     }
 
                     bool scan_completed = ScanComplete || target_found_early;
@@ -4856,6 +4911,12 @@ void Aging_Test_Task(void *arg)
                         break;
                     }
 
+                    if (s_ble_target_current.use_mac &&
+                        !ble_scanned_has_address(s_ble_target_current.bda, s_ble_target_current.addr_type)) {
+                        aging_error_log("本轮白名单扫描未发现目标 MAC，等待下轮重试");
+                        break;
+                    }
+
                     /*
                      * ble_connect_by_name() 返回 true 仅代表 enh_open 被受理，
                      * 连接尚未建立：结果由 CONNECT_EVT（成功）/ OPEN_EVT 133 或
@@ -4866,7 +4927,9 @@ void Aging_Test_Task(void *arg)
                     BleConnectComplete = false;
                     BleConnectSuccess = false;
 
-                    if (ble_connect_by_name(PN_Code))
+                    if (s_ble_target_current.use_mac ?
+                        ble_connect_by_address(s_ble_target_current.bda, s_ble_target_current.addr_type) :
+                        ble_connect_by_name(PN_Code))
                     {
                         aging_runtime_log("Bluetooth connect request accepted, awaiting establishment result, attempt=%u",
                                           (unsigned)FailCount);
@@ -5481,6 +5544,7 @@ void Aging_Test_Task(void *arg)
             s_last_data_upload_error_report_tick = 0;
 
             memset(PN_Code, 0, sizeof(PN_Code));
+            memset(&s_ble_target_current, 0, sizeof(s_ble_target_current));
             clear_ready_pn_runtime();
             Aging_test_task_handle = NULL;
             /* 自删除前释放本任务持有的丢失数据列表（任务删除不回收堆块）。 */

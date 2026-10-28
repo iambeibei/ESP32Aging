@@ -47,7 +47,7 @@ esp_err_t SelfRecovery_Write_str(const char *key, const char *value)
     {
         ESP_LOGE(TAG, "Write str failed: %s", esp_err_to_name(err));
     }
-    err = nvs_commit(my_handle);
+    /* 保留 set/commit 的真实错误，不能用第二次 commit 的成功覆盖写入失败。 */
     return err;
 }
 

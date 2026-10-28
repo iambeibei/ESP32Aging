@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include "esp_gatt_defs.h"
 #include "esp_err.h"
+#include "ble_target.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -66,13 +67,34 @@ void ble_control_set_callbacks(ble_scan_cb_t scan_cb,
 
 /**
  * @brief 开始扫描BLE设备
+ * @note 任务上下文，可能阻塞；每个控制步骤最多 5 秒，不可在 ISR/蓝牙回调调用。
  * @param scan_time 扫描时间(秒)
  * @return true: 成功, false: 失败
  */
 bool ble_start_scan(uint8_t scan_time);
 
+/* CPU1 任务上下文，非 ISR/蓝牙回调；串行配置白名单并启动扫描。
+ * target 仅在调用期间借用；每个异步步骤最多等待 5 秒，失败不启动扫描。
+ * 名称模式传 use_mac=false 的目标。初始化完成后可重复调用。 */
+esp_err_t ble_start_target_scan(const BleTarget *target, uint8_t scan_time);
+
+/* 任务上下文，非 ISR；可能短暂等待列表锁。按地址及类型匹配，不依赖名称。 */
+bool ble_scanned_has_address(const uint8_t *bda, uint8_t addr_type);
+
+/* 任务上下文，非 ISR/蓝牙回调；停止并等待确认，每步最多 5 秒。
+ * 未确认停扫时返回错误，调用方不得发起连接。 */
+esp_err_t ble_stop_scan_wait(void);
+
+/* 命令任务删除老化任务前调用 pause；等待其退出控制锁，最多 5 秒。
+ * pause 成功后禁止新扫描/建链；旧任务删除后、新会话初始化前调用 resume。
+ * resume 在旧连接请求仍在途时返回错误并保持暂停，防止旧目标迟到连接进入新会话。
+ * 任务上下文可用，不可在 ISR 或蓝牙回调调用。 */
+esp_err_t ble_control_pause(void);
+esp_err_t ble_control_resume(void);
+
 /**
  * @brief 停止扫描
+ * @note 任务上下文，等待停止确认；错误会记录日志。不可在 ISR/蓝牙回调调用。
  */
 void ble_stop_scan(void);
 

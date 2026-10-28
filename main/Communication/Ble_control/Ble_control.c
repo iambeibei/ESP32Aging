@@ -3,6 +3,7 @@
 #include "task_config.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include "esp_log.h"
 #include "esp_bt.h"
 #include "esp_bt_main.h"
@@ -60,10 +61,14 @@ static QueueHandle_t data_forword_queue; // 转发的数据队列
 /* GAP/GATTC 回调为任务上下文；应用扫描列表不供控制器 DMA/ISR 使用。 */
 EXT_RAM_BSS_ATTR static ble_device_info_t s_scanned_devices[MAX_SCAN_DEVICES];
 static int s_scanned_count = 0;
-static bool s_is_scanning = false;
-static bool s_is_connected = false;
+static atomic_bool s_is_scanning = false;
+static atomic_bool s_is_connected = false;
 static char s_connected_name[20] = {0};
 static SemaphoreHandle_t s_device_list_mutex = NULL; // 互斥锁保护设备列表
+static SemaphoreHandle_t s_scan_control_mutex;
+/* 列表锁保护目标快照；只在停扫确认后由任务更新。 */
+static BleTarget s_scan_target;
+static atomic_bool s_control_paused;
 
 // 回调函数
 static ble_scan_cb_t s_scan_cb = NULL;
@@ -71,7 +76,7 @@ static ble_connect_cb_t s_connect_cb = NULL;
 static ble_disconnect_cb_t s_disconnect_cb = NULL;
 
 /*
- * 连接尝试状态机（Bluedroid 回调写、老化任务经回调间接触发，均 volatile）：
+ * 连接尝试状态机（Bluedroid 回调与 CPU1 任务共享，使用原子标志）：
  *   s_connect_attempting    —— enh_open 已被接受，连接结果尚未交付
  *   s_connect_result_pending—— 结果尚未经 s_connect_cb 交付；实测建立失败时
  *                              DISCONNECT_EVT 与 OPEN_EVT(133) 会先后到达
@@ -80,8 +85,65 @@ static ble_disconnect_cb_t s_disconnect_cb = NULL;
  *   建立失败 → s_connect_cb(false)（老化任务据此重试）；
  *   已建立连接掉线 → s_disconnect_cb()（老化任务据此优雅中止，行为不变）。
  */
-static volatile bool s_connect_attempting = false;
-static volatile bool s_connect_result_pending = false;
+static atomic_bool s_connect_attempting = false;
+static atomic_bool s_connect_result_pending = false;
+
+/* 仅释放当前任务已经成功取得的互斥锁。 */
+static void ble_control_unlock(SemaphoreHandle_t mutex)
+{
+    if (xSemaphoreGive(mutex) != pdTRUE) ESP_LOGE(TAG, "释放蓝牙控制锁失败");
+}
+
+/* 超时后保留在途操作，直到原回调到达，避免迟到结果确认下一次同类请求。 */
+typedef enum {
+    BLE_SCAN_OP_NONE, BLE_SCAN_OP_STOP, BLE_SCAN_OP_CLEAR,
+    BLE_SCAN_OP_ADD, BLE_SCAN_OP_PARAMS, BLE_SCAN_OP_START
+} BleScanOp;
+#define BLE_SCAN_STEP_TIMEOUT_MS 5000
+static atomic_int s_scan_op = BLE_SCAN_OP_NONE;
+static atomic_int s_scan_op_result = ESP_OK;
+
+static void ble_scan_op_complete(BleScanOp op, bool success)
+{
+    if (atomic_load(&s_scan_op) == (int)op) {
+        atomic_store(&s_scan_op_result, success ? ESP_OK : ESP_FAIL);
+        atomic_store(&s_scan_op, BLE_SCAN_OP_NONE);
+    }
+}
+
+static esp_err_t ble_scan_op_wait(void)
+{
+    TickType_t start = xTaskGetTickCount();
+    if (s_control_paused) return ESP_ERR_INVALID_STATE;
+    while (atomic_load(&s_scan_op) != BLE_SCAN_OP_NONE) {
+        if (s_control_paused) return ESP_ERR_INVALID_STATE;
+        if (xTaskGetTickCount() - start >= pdMS_TO_TICKS(BLE_SCAN_STEP_TIMEOUT_MS))
+            return ESP_ERR_TIMEOUT;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return atomic_load(&s_scan_op_result);
+}
+
+static esp_err_t ble_scan_op_finish(esp_err_t submitted)
+{
+    if (submitted != ESP_OK) {
+        atomic_store(&s_scan_op, BLE_SCAN_OP_NONE);
+        return submitted;
+    }
+    return ble_scan_op_wait();
+}
+
+/* 调用方持扫描控制锁；回调不取此锁。 */
+static esp_err_t ble_stop_scan_locked(void)
+{
+    if (atomic_load(&s_scan_op) != BLE_SCAN_OP_NONE) {
+        esp_err_t ret = ble_scan_op_wait();
+        if (ret != ESP_OK) return ret;
+    }
+    if (!s_is_scanning) return ESP_OK;
+    atomic_store(&s_scan_op, BLE_SCAN_OP_STOP);
+    return ble_scan_op_finish(esp_ble_gap_stop_scanning());
+}
 /*
  * GATT 设置阶段是否已得出结论：连接建立后依次进行服务发现、notify 特征
  * 注册与 CCCD 写入；本标志在 CCCD 写结果到达（ESP_GATTC_WRITE_DESCR_EVT）
@@ -324,6 +386,8 @@ esp_err_t ble_control_init(void)
     {
         s_device_list_mutex = xSemaphoreCreateMutex();
     }
+    if (s_scan_control_mutex == NULL) s_scan_control_mutex = xSemaphoreCreateMutex();
+    if (s_device_list_mutex == NULL || s_scan_control_mutex == NULL) return ESP_ERR_NO_MEM;
 
     // 释放经典蓝牙内存
     ret = esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
@@ -423,58 +487,109 @@ void ble_control_set_callbacks(ble_scan_cb_t scan_cb, ble_connect_cb_t connect_c
 
 bool ble_start_scan(uint8_t scan_time)
 {
-    if (s_is_scanning)
-    {
-        ESP_LOGW(TAG, "Scanning already in progress");
-        return false;
-    }
+    const BleTarget target = {0};
+    return ble_start_target_scan(&target, scan_time) == ESP_OK;
+}
 
-    if (s_is_connected)
-    {
-        ESP_LOGW(TAG, "Please disconnect first before scanning");
-        return false;
-    }
-
-    // 清空之前的扫描结果
+esp_err_t ble_start_target_scan(const BleTarget *target, uint8_t scan_time)
+{
+    if (target == NULL || target->addr_type > 1) return ESP_ERR_INVALID_ARG;
+    if (!IsInited || s_scan_control_mutex == NULL) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_scan_control_mutex, pdMS_TO_TICKS(BLE_SCAN_STEP_TIMEOUT_MS)) != pdTRUE)
+        return ESP_ERR_TIMEOUT;
+    esp_err_t ret = ESP_ERR_INVALID_STATE;
+    /* GATT 注册异步完成，初始化返回不代表接口已就绪。 */
+    if (s_control_paused || s_is_connected || s_connect_attempting || s_gattc_profile.gattc_if == ESP_GATT_IF_NONE)
+        goto done;
+    ret = ble_stop_scan_locked();
+    if (ret != ESP_OK) goto done;
     ble_clear_scan_results();
 
-    // 设置扫描参数
-    esp_err_t ret = esp_ble_gap_set_scan_params(&s_ble_scan_params);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Set scan params failed: 0x%x", ret);
-        return false;
+    atomic_store(&s_scan_op, BLE_SCAN_OP_CLEAR);
+    ret = ble_scan_op_finish(esp_ble_gap_clear_whitelist());
+    if (ret != ESP_OK) goto done;
+    if (target->use_mac) {
+        atomic_store(&s_scan_op, BLE_SCAN_OP_ADD);
+        /* SDK 参数非 const，使用本地快照，调用不会改变目标地址。 */
+        esp_bd_addr_t bda;
+        memcpy(bda, target->bda, sizeof(bda));
+        ret = ble_scan_op_finish(esp_ble_gap_update_whitelist(true, bda,
+            target->addr_type == BLE_ADDR_TYPE_PUBLIC ? BLE_WL_ADDR_TYPE_PUBLIC : BLE_WL_ADDR_TYPE_RANDOM));
+        if (ret != ESP_OK) goto done;
     }
+    s_ble_scan_params.scan_filter_policy = target->use_mac ?
+        BLE_SCAN_FILTER_ALLOW_ONLY_WLST : BLE_SCAN_FILTER_ALLOW_ALL;
+    atomic_store(&s_scan_op, BLE_SCAN_OP_PARAMS);
+    ret = ble_scan_op_finish(esp_ble_gap_set_scan_params(&s_ble_scan_params));
+    if (ret != ESP_OK) goto done;
+    if (xSemaphoreTake(s_device_list_mutex, pdMS_TO_TICKS(BLE_SCAN_STEP_TIMEOUT_MS)) != pdTRUE) {
+        ret = ESP_ERR_TIMEOUT;
+        goto done;
+    }
+    s_scan_target = *target;
+    xSemaphoreGive(s_device_list_mutex);
+    ble_Scan_complate = false;
+    ble_coex_prefer_bt(true);
+    atomic_store(&s_scan_op, BLE_SCAN_OP_START);
+    ret = ble_scan_op_finish(esp_ble_gap_start_scanning(scan_time ? scan_time : DEFAULT_SCAN_TIME));
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "蓝牙扫描已启动，时长=%u 秒，模式=%s", (unsigned)(scan_time ? scan_time : DEFAULT_SCAN_TIME),
+                 target->use_mac ? "MAC白名单" : "名称");
+        if (target->use_mac)
+            ESP_LOGI(TAG, "扫描目标 MAC: " ESP_BD_ADDR_STR ", 地址类型: %u",
+                     ESP_BD_ADDR_HEX(target->bda), (unsigned)target->addr_type);
+    }
+done:
+    if (ret != ESP_OK) {
+        ble_coex_prefer_bt(false);
+        ESP_LOGE(TAG, "蓝牙扫描配置失败，不启动后续扫描: %s", esp_err_to_name(ret));
+    }
+    ble_control_unlock(s_scan_control_mutex);
+    return ret;
+}
 
-    // 开始扫描
-    ret = esp_ble_gap_start_scanning(scan_time > 0 ? scan_time : DEFAULT_SCAN_TIME);
-    if (ret == ESP_OK)
-    {
-        s_is_scanning = true;
-        ble_Scan_complate = false;
-        /* 扫描期间优先蓝牙：连续监听需要射频窗口，Wi-Fi 抢占会放大漏包。 */
-        ble_coex_prefer_bt(true);
-        ESP_LOGI(TAG, "BLE scanning started for %d seconds", scan_time);
-        return true;
+esp_err_t ble_stop_scan_wait(void)
+{
+    if (!IsInited || s_scan_control_mutex == NULL) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_scan_control_mutex, pdMS_TO_TICKS(BLE_SCAN_STEP_TIMEOUT_MS)) != pdTRUE)
+        return ESP_ERR_TIMEOUT;
+    esp_err_t ret = ble_stop_scan_locked();
+    ble_coex_prefer_bt(false);
+    ble_control_unlock(s_scan_control_mutex);
+    return ret;
+}
+
+esp_err_t ble_control_pause(void)
+{
+    s_control_paused = true;
+    if (s_scan_control_mutex == NULL) return ESP_OK;
+    if (xSemaphoreTake(s_scan_control_mutex, pdMS_TO_TICKS(BLE_SCAN_STEP_TIMEOUT_MS)) != pdTRUE)
+        return ESP_ERR_TIMEOUT;
+    /* 若无在途操作，可以非阻塞提交停扫；后续会话仍须等待实际回调。 */
+    if (s_is_scanning && atomic_load(&s_scan_op) == BLE_SCAN_OP_NONE) {
+        atomic_store(&s_scan_op, BLE_SCAN_OP_STOP);
+        esp_err_t ret = esp_ble_gap_stop_scanning();
+        if (ret != ESP_OK) {
+            atomic_store(&s_scan_op, BLE_SCAN_OP_NONE);
+            ESP_LOGW(TAG, "暂停蓝牙时停扫提交失败: %s", esp_err_to_name(ret));
+        }
     }
-    else
-    {
-        ESP_LOGE(TAG, "Failed to start scanning: 0x%x", ret);
-        return false;
-    }
+    ble_coex_prefer_bt(false);
+    ble_control_unlock(s_scan_control_mutex);
+    return ESP_OK;
+}
+
+esp_err_t ble_control_resume(void)
+{
+    if (s_connect_attempting) return ESP_ERR_INVALID_STATE;
+    s_control_paused = false;
+    return ESP_OK;
 }
 
 void ble_stop_scan(void)
 {
-    /* 停止扫描即结束蓝牙优先（幂等）；自然扫完的兜底复位由老化任务兜住。 */
-    ble_coex_prefer_bt(false);
-
-    if (s_is_scanning)
-    {
-        esp_ble_gap_stop_scanning();
-        s_is_scanning = false;
-        ESP_LOGI(TAG, "Scanning stopped");
-    }
+    esp_err_t ret = ble_stop_scan_wait();
+    if (ret != ESP_OK) ESP_LOGW(TAG, "停止蓝牙扫描未确认: %s", esp_err_to_name(ret));
 }
 
 /* 供上层在老化中止/检查轮次边界兜底恢复 Wi-Fi/BLE 平衡，避免长期压缩 Wi-Fi。 */
@@ -547,6 +662,23 @@ bool ble_scanned_has_name(const char *name)
     return found;
 }
 
+bool ble_scanned_has_address(const uint8_t *bda, uint8_t addr_type)
+{
+    if (bda == NULL || s_device_list_mutex == NULL) return false;
+    if (xSemaphoreTake(s_device_list_mutex, pdMS_TO_TICKS(BLE_SCAN_STEP_TIMEOUT_MS)) != pdTRUE)
+        return false;
+    bool found = false;
+    for (int i = 0; i < s_scanned_count; ++i) {
+        if (s_scanned_devices[i].addr_type == addr_type &&
+            memcmp(s_scanned_devices[i].bda, bda, ESP_BD_ADDR_LEN) == 0) {
+            found = true;
+            break;
+        }
+    }
+    xSemaphoreGive(s_device_list_mutex);
+    return found;
+}
+
 void ble_clear_scan_results(void)
 {
     if (s_device_list_mutex != NULL)
@@ -567,6 +699,15 @@ void ble_clear_scan_results(void)
 
 static void add_scanned_device(esp_ble_gap_cb_param_t *scan_result)
 {
+    if (s_control_paused || !s_is_scanning || s_device_list_mutex == NULL) return;
+    if (xSemaphoreTake(s_device_list_mutex, portMAX_DELAY) != pdTRUE) return;
+    /* 控制器白名单之外再核对目标，避免切换前排队的旧报告进入新列表。 */
+    if (s_scan_target.use_mac &&
+        (scan_result->scan_rst.ble_addr_type != s_scan_target.addr_type ||
+         memcmp(scan_result->scan_rst.bda, s_scan_target.bda, ESP_BD_ADDR_LEN) != 0)) {
+        xSemaphoreGive(s_device_list_mutex);
+        return;
+    }
     uint8_t *adv_name = NULL;
     uint8_t adv_name_len = 0;
 
@@ -579,18 +720,19 @@ static void add_scanned_device(esp_ble_gap_cb_param_t *scan_result)
 
     if (adv_name == NULL || adv_name_len == 0)
     {
-        return; // 无名设备，忽略
-    }
-
-    if (s_device_list_mutex != NULL)
-    {
-        xSemaphoreTake(s_device_list_mutex, portMAX_DELAY);
+        if (!s_scan_target.use_mac) {
+            xSemaphoreGive(s_device_list_mutex);
+            return; // 名称模式仍忽略无名称设备
+        }
+        adv_name = (uint8_t *)"未命名";
+        adv_name_len = strlen((char *)adv_name);
     }
 
     // 检查是否已存在
     for (int i = 0; i < s_scanned_count; i++)
     {
-        if (memcmp(s_scanned_devices[i].bda, scan_result->scan_rst.bda, ESP_BD_ADDR_LEN) == 0)
+        if (s_scanned_devices[i].addr_type == scan_result->scan_rst.ble_addr_type &&
+            memcmp(s_scanned_devices[i].bda, scan_result->scan_rst.bda, ESP_BD_ADDR_LEN) == 0)
         {
             // 更新RSSI
             s_scanned_devices[i].rssi = scan_result->scan_rst.rssi;
@@ -619,8 +761,9 @@ static void add_scanned_device(esp_ble_gap_cb_param_t *scan_result)
 
         s_scanned_count++;
 
-        ESP_LOGI(TAG, "Found device [%d]: %s, RSSI: %d",
-                 s_scanned_count, dev->name, dev->rssi);
+        ESP_LOGI(TAG, "Found device [%d]: %s, MAC: " ESP_BD_ADDR_STR ", 地址类型: %u, RSSI: %d",
+                 s_scanned_count, dev->name, ESP_BD_ADDR_HEX(dev->bda),
+                 (unsigned)dev->addr_type, dev->rssi);
     }
 
     if (s_device_list_mutex != NULL)
@@ -643,7 +786,7 @@ static ble_device_info_t *find_device_by_address(uint8_t *bda)
 
 //==================== 连接相关函数 ====================
 
-bool ble_connect_by_name(const char *device_name)
+static bool ble_connect_by_name_locked(const char *device_name)
 {
     if (s_is_connected)
     {
@@ -703,20 +846,23 @@ bool ble_connect_by_name(const char *device_name)
     ble_coex_prefer_bt(true);
 
     // 发起连接
+    /* 先发布在途状态，避免快速回调早于 API 返回时被漏掉。 */
+    s_connect_attempting = true;
+    s_connect_result_pending = true;
+    s_gatt_setup_done = false;
     esp_err_t ret = esp_ble_gattc_enh_open(s_gattc_profile.gattc_if, &conn_params);
 
     if (ret == ESP_OK)
     {
         /* 标记连接尝试在途：结果由 CONNECT_EVT/OPEN_EVT/DISCONNECT_EVT
          * 经 notify_connect_result() 一次性交付（成功或建立失败）。 */
-        s_connect_attempting = true;
-        s_connect_result_pending = true;
-        s_gatt_setup_done = false; // 新尝试的 GATT 设置阶段尚未开始
         ESP_LOGI(TAG, "Connecting to device: %s", device_name);
         return true;
     }
     else
     {
+        s_connect_attempting = false;
+        s_connect_result_pending = false;
         ESP_LOGE(TAG, "Failed to connect: 0x%x", ret);
         /* 请求未被受理：立即恢复平衡，不留蓝牙优先。 */
         ble_coex_prefer_bt(false);
@@ -724,7 +870,7 @@ bool ble_connect_by_name(const char *device_name)
     }
 }
 
-bool ble_connect_by_address(uint8_t *bda, uint8_t addr_type)
+static bool ble_connect_by_address_locked(uint8_t *bda, uint8_t addr_type)
 {
     if (s_is_connected)
     {
@@ -761,25 +907,58 @@ bool ble_connect_by_address(uint8_t *bda, uint8_t addr_type)
     /* 与按名称连接一致：建链窗口提升蓝牙优先，失败/断开时由状态机恢复。 */
     ble_coex_prefer_bt(true);
 
+    /* 先发布在途状态，避免快速回调早于 API 返回时被漏掉。 */
+    s_connect_attempting = true;
+    s_connect_result_pending = true;
+    s_gatt_setup_done = false;
     esp_err_t ret = esp_ble_gattc_enh_open(s_gattc_profile.gattc_if, &conn_params);
 
     if (ret == ESP_OK)
     {
         /* 标记连接尝试在途：结果由 CONNECT_EVT/OPEN_EVT/DISCONNECT_EVT
          * 经 notify_connect_result() 一次性交付（成功或建立失败）。 */
-        s_connect_attempting = true;
-        s_connect_result_pending = true;
-        s_gatt_setup_done = false; // 新尝试的 GATT 设置阶段尚未开始
         ESP_LOGI(TAG, "Connecting to device at address: " ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(bda));
         return true;
     }
     else
     {
+        s_connect_attempting = false;
+        s_connect_result_pending = false;
         ESP_LOGE(TAG, "Failed to connect: 0x%x", ret);
         /* 请求未被受理：立即恢复平衡，不留蓝牙优先。 */
         ble_coex_prefer_bt(false);
         return false;
     }
+}
+
+/* 扫描配置和连接提交共用控制锁，回调不等待控制锁。 */
+static bool ble_connect_control_enter(void)
+{
+    if (!IsInited || s_scan_control_mutex == NULL ||
+        xSemaphoreTake(s_scan_control_mutex, pdMS_TO_TICKS(BLE_SCAN_STEP_TIMEOUT_MS)) != pdTRUE)
+        return false;
+    if (s_control_paused || s_is_scanning || s_connect_attempting || s_is_connected ||
+        atomic_load(&s_scan_op) != BLE_SCAN_OP_NONE) {
+        ble_control_unlock(s_scan_control_mutex);
+        return false;
+    }
+    return true;
+}
+
+bool ble_connect_by_name(const char *device_name)
+{
+    if (device_name == NULL || device_name[0] == '\0' || !ble_connect_control_enter()) return false;
+    bool accepted = ble_connect_by_name_locked(device_name);
+    ble_control_unlock(s_scan_control_mutex);
+    return accepted;
+}
+
+bool ble_connect_by_address(uint8_t *bda, uint8_t addr_type)
+{
+    if (bda == NULL || addr_type > 1 || !ble_connect_control_enter()) return false;
+    bool accepted = ble_connect_by_address_locked(bda, addr_type);
+    ble_control_unlock(s_scan_control_mutex);
+    return accepted;
 }
 
 void ble_disconnect(void)
@@ -893,10 +1072,20 @@ static void ble_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
     switch (event)
     {
     case ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT: // 扫描参数设置完成事件
+        ble_scan_op_complete(BLE_SCAN_OP_PARAMS, param->scan_param_cmpl.status == ESP_BT_STATUS_SUCCESS);
         ESP_LOGD(TAG, "Scan params set complete");
         break;
 
+    case ESP_GAP_BLE_UPDATE_WHITELIST_COMPLETE_EVT:
+        if (param->update_whitelist_cmpl.wl_operation == ESP_BLE_WHITELIST_CLEAR)
+            ble_scan_op_complete(BLE_SCAN_OP_CLEAR, param->update_whitelist_cmpl.status == ESP_BT_STATUS_SUCCESS);
+        else if (param->update_whitelist_cmpl.wl_operation == ESP_BLE_WHITELIST_ADD)
+            ble_scan_op_complete(BLE_SCAN_OP_ADD, param->update_whitelist_cmpl.status == ESP_BT_STATUS_SUCCESS);
+        break;
+
     case ESP_GAP_BLE_SCAN_START_COMPLETE_EVT: // 扫描开始完成事件
+        s_is_scanning = param->scan_start_cmpl.status == ESP_BT_STATUS_SUCCESS;
+        ble_scan_op_complete(BLE_SCAN_OP_START, s_is_scanning);
         if (param->scan_start_cmpl.status != ESP_BT_STATUS_SUCCESS)
         {
             ESP_LOGE(TAG, "Scan start failed: %x", param->scan_start_cmpl.status);
@@ -927,7 +1116,8 @@ static void ble_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
         break;
 
     case ESP_GAP_BLE_SCAN_STOP_COMPLETE_EVT:
-        s_is_scanning = false;
+        if (param->scan_stop_cmpl.status == ESP_BT_STATUS_SUCCESS) s_is_scanning = false;
+        ble_scan_op_complete(BLE_SCAN_OP_STOP, param->scan_stop_cmpl.status == ESP_BT_STATUS_SUCCESS);
         ESP_LOGI(TAG, "Scan stopped");
         break;
 
