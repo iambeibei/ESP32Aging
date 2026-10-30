@@ -1993,6 +1993,35 @@ int QueryStructuredRecordLatestByPN(const char *pn, QueryResult *out_result)
     return ret;
 }
 
+int QueryStructuredRecordBySession(const char *pn, const char *record_id,
+                                   int seq_no, QueryResult *out_result)
+{
+    if (pn == NULL || pn[0] == '\0' || record_id == NULL || record_id[0] == '\0' ||
+        seq_no < -1 || out_result == NULL) return -2;
+    memset(out_result, 0, sizeof(*out_result));
+    if (!sqlite_lock()) return -2;
+    int result = -2;
+    sqlite3_stmt *stmt = NULL;
+    if (!sqlite_ready_locked() || !s_record_id_column_ready) goto done;
+    char sql[320];
+    snprintf(sql, sizeof(sql), "%s FROM " SQLITE_CACHE_TABLE_NAME
+             " WHERE pn=? AND record_id=? %s ORDER BY seq_no DESC, local_id DESC LIMIT 1;",
+             structured_select_columns(), seq_no >= 0 ? "AND seq_no=?" : "");
+    if (sqlite3_prepare_v2(s_db, sql, -1, &stmt, NULL) != SQLITE_OK) goto done;
+    if (sqlite3_bind_text(stmt, 1, pn, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 2, record_id, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        (seq_no >= 0 && sqlite3_bind_int(stmt, 3, seq_no) != SQLITE_OK)) goto done;
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        fill_query_result_from_stmt(stmt, out_result);
+        result = 0;
+    } else if (rc == SQLITE_DONE) result = -1;
+done:
+    if (stmt != NULL) sqlite3_finalize(stmt);
+    sqlite_unlock();
+    return result;
+}
+
 int QueryStructuredRecordBySeq(int seq_no, QueryResult *out_result)
 {
     if (seq_no < 0 || out_result == NULL) return -1;

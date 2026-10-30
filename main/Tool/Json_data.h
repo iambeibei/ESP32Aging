@@ -50,7 +50,7 @@ extern "C"
 
     char *create_json_agingComplete(int timestamp, int is_complete, const char *aging_number);
 
-    char *create_sensor_json(int idnum, const char *pn, int current_step, int timestamp, const char *value_json);
+    char *create_sensor_json(int idnum, const char *pn, int current_step, int timestamp, const char *value_json, const char *record_id);
 
     char *create_aging_state_json(int seq, const char *aging_state);
 

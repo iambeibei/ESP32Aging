@@ -188,9 +188,9 @@ AgingDeviceCheck → AgingAction → AgingComplete`，由 `Aging_Test_Task`
    安排日志卷重建。迁移说明见 `PARTITION_LAYOUT_REVIEW.md`，数据库及配置分区保持原位置和大小。
 4. **每条日志都写一次 NVS**（[log.c:143](main/DataStorage/Log/log.c#L143)）：每次写日志都会持久化
    `LogIndex` —— 这是一个显著的 flash 磨损来源。
-5. **BLE 接收截断**：`copy_len = ble_data.data_len % (max_len + 1)`
-   （[Ble_control.c:189](main/Communication/Ble_control/Ble_control.c#L189)）是回绕而不是钳位；
-   UART/RS485 的钳位是正确的。300 字节的通知写入 256 字节缓冲区会静默返回 44 字节。
+5. **BLE 连接状态隔离**：加密状态与接收队列按连接代次隔离，新连接默认明文，只有当前
+   连接鉴权处理及确认提交成功后才启用加密；超长报文明确拒绝，不得恢复全局 `IsEnc` 或
+   取模截断。设计和验证见 `BLE_MAC_TARGET_DESIGN.md`。
 6. **CAN 读取会永久阻塞**：CAN 接收用 `portMAX_DELAY`，而 SCPI/Modbus 用的是 1000 ms ——
    CAN 设备无响应会导致调用方无限挂起。
 7. **CAN 组帧逻辑不一致**：`can_json_parser.c` 中的构造代码与 `appTask.c` 实际走的路径在负载布局

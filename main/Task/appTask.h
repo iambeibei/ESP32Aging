@@ -48,15 +48,6 @@ int publish_device_mode(int mode);
  */
 void app_mqtt_publish_settled(int msg_id, bool acked);
 
-/** 创建断线补传任务（幂等：已建则直接成功）。任务上下文调用，非ISR。 */
-BaseType_t app_create_mqtt_backfill_task(void);
-
-/** 唤醒补传扫描：mqtt_app.c 在 MQTT_SETUP_DONE（上线完成）时调用。 */
-void app_mqtt_backfill_wake(void);
-
-
-
-extern bool IsEnc;
 
 extern uint8_t AgingCMode; // 0表示单控模式，1表示群控模式
 

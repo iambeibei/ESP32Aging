@@ -69,8 +69,9 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 }
 
 /* 诊断请求不指定 target，不会将任意网页响应装入设备协议队列。 */
-static esp_err_t http_request_execute(esp_http_client_config_t *config,
-                                     const HttpProtocolTarget *target, const char *post_data)
+static esp_err_t http_request_execute_full(esp_http_client_config_t *config,
+                                          const HttpProtocolTarget *target, const char *post_data,
+                                          char *out, size_t out_size)
 {
     HttpRequestContext ctx = {0};
     if (target != NULL) ctx.response.target = *target;
@@ -91,6 +92,11 @@ static esp_err_t http_request_execute(esp_http_client_config_t *config,
     if (err == ESP_OK && (status < 200 || status >= 300 || !ctx.finished ||
                           !esp_http_client_is_complete_data_received(client)))
         err = ESP_ERR_INVALID_RESPONSE;
+    if (err == ESP_OK && out != NULL) {
+        if (ctx.response.len_bytes == 0) err = ESP_ERR_INVALID_RESPONSE;
+        else if (ctx.response.len_bytes >= out_size) err = ESP_ERR_INVALID_SIZE;
+        else memcpy(out, ctx.response.data, ctx.response.len_bytes + 1U);
+    }
     if (err == ESP_OK && target != NULL) {
         if (ctx.response.len_bytes == 0 || HttpData_queue == NULL) err = ESP_ERR_INVALID_STATE;
         else if (xQueueSend(HttpData_queue, &ctx.response, pdMS_TO_TICKS(100)) != pdTRUE)
@@ -104,6 +110,12 @@ static esp_err_t http_request_execute(esp_http_client_config_t *config,
     if (err != ESP_OK)
         ESP_LOGW(TAG, "HTTP request rejected: status=%d error=%s", status, esp_err_to_name(err));
     return err;
+}
+
+static esp_err_t http_request_execute(esp_http_client_config_t *config,
+                                     const HttpProtocolTarget *target, const char *post_data)
+{
+    return http_request_execute_full(config, target, post_data, NULL, 0);
 }
 
 esp_err_t http_get_protocol(const HttpProtocolTarget *target)
@@ -164,103 +176,31 @@ void test_http_connection_simple(void)
     if (err != ESP_OK) ESP_LOGW(TAG, "HTTP diagnostic failed: %s", esp_err_to_name(err));
 }
 
-esp_err_t test_http_post_record_query(int32_t seq, int32_t id_num, const char *record_id,char *out_response_buffer, int out_buffer_len)
+/* 复用完整响应累积器，perform 负责完整发送请求体；不接受短写/截断响应。 */
+esp_err_t test_http_post_record_query(int32_t seq, int32_t id_num, const char *record_id,
+                                      char *out_response_buffer, int out_buffer_len)
 {
-    /*
-     * 服务器 IP 运行时取自 baseconfig.json 的 SERVER_IP（与 MQTT broker 同一
-     * 机制），端口/路径为编译期模板；换服务器 IP 无需重新编译 app。
-     */
+    if (record_id == NULL || record_id[0] == '\0' || id_num < 0 ||
+        out_response_buffer == NULL || out_buffer_len < 2) return ESP_ERR_INVALID_ARG;
+    out_response_buffer[0] = '\0';
     char url[LG_URL_MAX_LEN];
-    esp_err_t build_err = lg_url_build(LG_URL_GET_LOST_IDNUM_URL_FMT, url, sizeof(url));
-    if (build_err != ESP_OK) {
-        ESP_LOGE(TAG, "Build GetMissingIdNums URL failed: %s", esp_err_to_name(build_err));
-        return build_err;
-    }
-
-    // ---- Build request JSON body: {"Seq":...,"Data":{"RecordId":"...","IdNum":...}} ----
+    esp_err_t err = lg_url_build(LG_URL_GET_LOST_IDNUM_URL_FMT, url, sizeof(url));
+    if (err != ESP_OK) return err;
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddItemToObject(root, "Seq", cJSON_CreateNumber(seq));
-
-    cJSON *data = cJSON_CreateObject();
-    cJSON_AddItemToObject(data, "RecordId", cJSON_CreateString(record_id));
-    cJSON_AddItemToObject(data, "IdNum", cJSON_CreateNumber(id_num));
-
-    cJSON_AddItemToObject(root, "Data", data);
-
-    char *post_data = cJSON_PrintUnformatted(root);
-    if (post_data == NULL) {
-        ESP_LOGE(TAG, "Failed to print JSON body");
-        cJSON_Delete(root);
-        return ESP_ERR_NO_MEM;
-    }
-
-    esp_http_client_config_t config = {
-        .url = url,
-        .method = HTTP_METHOD_POST,
-        .timeout_ms = 30000,
-        .buffer_size = 1024,
-        .buffer_size_tx = 1024,
-        .keep_alive_enable = false,
-        //.crt_bundle_attach = esp_crt_bundle_attach,
-        // 不再需要 .event_handler
-    };
-
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client == NULL) {
-        ESP_LOGE(TAG, "esp_http_client_init failed");
-        free(post_data);
-        cJSON_Delete(root);
-        return ESP_ERR_NO_MEM;
-    }
-
-    esp_err_t err;
-
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_header(client, "User-Agent", "CSharp-HttpClient/1.0");
-    esp_http_client_set_header(client, "Accept", "application/json");
-
-    // 走底层流程，而不是 esp_http_client_perform
-    err = esp_http_client_open(client, strlen(post_data));
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
-        goto cleanup;
-    }
-
-    int wlen = esp_http_client_write(client, post_data, strlen(post_data));
-    if (wlen < 0) {
-        ESP_LOGE(TAG, "Write failed");
-        err = ESP_FAIL;
-        goto cleanup;
-    }
-
-    int content_length = esp_http_client_fetch_headers(client);
-    if (content_length < 0) {
-        ESP_LOGE(TAG, "HTTP client fetch headers failed");
-        err = ESP_FAIL;
-        goto cleanup;
-    }
-
-    // 直接把响应体读入调用者提供的 buffer
-    int data_read = esp_http_client_read_response(client, out_response_buffer, out_buffer_len - 1);
-    if (data_read < 0) {
-        ESP_LOGE(TAG, "Failed to read response");
-        err = ESP_FAIL;
-        goto cleanup;
-    }
-    out_response_buffer[data_read] = '\0';
-
-    int status_code = esp_http_client_get_status_code(client);
-    ESP_LOGI(TAG, "HTTP Status = %d, content_length = %d", status_code, content_length);
-    ESP_LOGI(TAG, "Response Body: %s", out_response_buffer);
-
-    err = ESP_OK;
-
-cleanup:
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-    free(post_data);
+    if (root == NULL) return ESP_ERR_NO_MEM;
+    cJSON *data = cJSON_AddObjectToObject(root, "Data");
+    bool valid = data != NULL && cJSON_AddNumberToObject(root, "Seq", seq) != NULL &&
+                 cJSON_AddStringToObject(data, "RecordId", record_id) != NULL &&
+                 cJSON_AddNumberToObject(data, "IdNum", id_num) != NULL;
+    char *post_data = valid ? cJSON_PrintUnformatted(root) : NULL;
     cJSON_Delete(root);
-
+    if (post_data == NULL) return ESP_ERR_NO_MEM;
+    esp_http_client_config_t config = {
+        .url = url, .method = HTTP_METHOD_POST, .timeout_ms = 10000,
+        .buffer_size = 1024, .buffer_size_tx = 1024, .keep_alive_enable = false,
+    };
+    err = http_request_execute_full(&config, NULL, post_data, out_response_buffer,
+                                    (size_t)out_buffer_len);
+    free(post_data);
     return err;
 }
-

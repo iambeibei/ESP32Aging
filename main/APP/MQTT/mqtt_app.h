@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
 #include "dual_net.h"
@@ -18,6 +19,25 @@ void mqtt_app_restart(void);
 void mqtt_app_service_task(void *arg);
 /** 返回 >=0 表示接受（QoS0 为0）；-2容量不足，-1其他失败，不表示服务器落库。 */
 int app_mqtt_publish(char *topic_name, char *publish_string, char *UDP_ID);
+
+typedef enum {
+    MQTT_EVENT_REPORT_STATE,   /* 老化状态，使用预留容量。 */
+    MQTT_EVENT_REPORT_TASKCP,  /* 群控完成，使用预留容量并检查有效性。 */
+    MQTT_EVENT_REPORT_CONTEXT, /* 程序、工步、阶段和设备模式。 */
+    MQTT_EVENT_REPORT_WARN,
+} MqttEventReportKind;
+
+/** 任务上下文、可并发、非 ISR/SDK 回调接口；队列互斥锁最多等待100ms。
+ * 复制完整主题和原始 JSON，调用者仍拥有传入字符串。device_id 可为 NULL，
+ * 非空时 topic_name 必须是仅含一个 %s 的主题模板。
+ * 0=本次开机内已缓存（不是 PUBACK），-2=容量不足，-1=参数/长度/初始化失败。
+ * 队列保留到 PUBACK；MQTT 重建不清空，整机重启清空。 */
+int app_mqtt_event_submit(const char *topic_name, const char *payload,
+                          const char *device_id, MqttEventReportKind kind);
+
+/** 任务上下文，可并发，非 ISR/SDK 回调接口。使当前会话/工步的未投递 TaskCP
+ * 失效；已经开始交 SDK 的报文不能撤销。以内部代次隔离后续工步，不修改线上 JSON。 */
+void app_mqtt_event_cancel_taskcp(void);
 
 /** 当前是否已连接 Broker（原子读，供补传 worker 等轮询方使用）。 */
 bool app_mqtt_is_connected(void);

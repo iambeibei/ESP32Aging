@@ -5,6 +5,13 @@
 
 网络与指令专题设计文档（根目录）：
 
+- [BLE_MAC_TARGET_DESIGN.md](BLE_MAC_TARGET_DESIGN.md) —— 蓝牙目标绑定、白名单控制，以及
+  明文/加密设备切换时按连接代次隔离加密状态和接收队列。
+- [MQTT_EVENT_RETRY_DESIGN.md](MQTT_EVENT_RETRY_DESIGN.md) —— 关键业务事件本次开机内的
+  PSRAM FIFO、PUBACK/过期/客户端重建补发、TaskCP有效性及构建配置门控。
+- [MQTT_SAMPLE_GAP_DESIGN.md](MQTT_SAMPLE_GAP_DESIGN.md) —— 移除全库采样后台扫描，
+  整轮结束后由http_auto按服务器缺号限速补数，会话身份固化及队尾结算。
+
 - [CHILD_NODE_ROOT_LOSS_DESIGN.md](CHILD_NODE_ROOT_LOSS_DESIGN.md) —— 根节点掉线时子节点
   不得异常重启：依赖/保活/故障转移/恢复流程、根因定位（BLE 异常断开的无条件重启）、
   修复与实机验收、代码审查记录。
@@ -64,9 +71,10 @@ RS485/BLE）、CAN Bluetti（`can_json_parser` + `make_can_*` → TWAI，仅 CAN
 [aging_config.c](main/ConfigData/aging_config.c) 的 `parse_steps_Ex()` 解析，每步含判断条件、
 采样列表、前/后置动作。
 
-**数据流**：`app_AgingData_Get_handle` 周期采样构造 `AgingUploadPacket`（PN、步骤、时间戳和 `Value`
-在**采样时刻固化**，慢速上传不会混步骤），`pushed=0` 插入 → `app_AgingData_Upload_handle` 出队发布
-置 `pushed=1` → `QueryLatestRecordByPNAndPushState` 驱动补发。
+**数据流**：`app_AgingData_Get_handle` 周期采样构造 `AgingUploadPacket`（PN、RecordId、会话token、
+步骤、时间戳和 `Value` 在**采样时刻固化**）。上传先写SQLite `pushed=0`，MQTT入队置1、PUBACK置2。
+正常/异常/人工停止关闭本轮，队尾结算后保留结束意图；已有http_auto在联网空闲时查询服务器
+GetMissingIdNums，按PN+RecordId+IDNUM精确限速补发，不再重连或每60秒全库扫描。
 
 **持久化**：SQLite schema **v6**，表 `data_cache`，`(pn, seq_no)` 唯一（旧列名 `sn`，启动时
 `migrate_legacy_schema_to_v6()` 迁移）；schema 检测探测实际列而非 `PRAGMA user_version`（该嵌入式
@@ -112,6 +120,9 @@ python3 tests/test_mqtt_uplink.py      # MQTT 上行、交接与 stop 竞态
 python3 tests/test_system_restart.py   # 一键重启服务与 Mesh 控制/事件
 python3 tests/test_mesh_ota_binary.py  # OTA 准入/校验/重试/供数（不含 Mesh-Lite 库本体）
 python3 tests/test_http_protocol.py    # HTTP 累积与目标路由
+python3 tests/test_aging_gap.py       # 结束会话缺号补查（另需宿主libsqlite3.so.0）
+python3 tests/test_ble_target.py      # 蓝牙目标绑定、白名单和控制生命周期
+python3 tests/test_ble_session.py     # 蓝牙连接加密状态隔离、原始收发与鉴权接入
 python3 tests/test_psram_memory.py     # PSRAM 分配器、cJSON hooks、TLS 分配
 ```
 
@@ -218,7 +229,7 @@ flash/NVS 掉电行为仍需编译 + 串口实机验证。
 2. `g_db1_result`（SqLite.h）是无保护共享全局量，跨任务会串数据；应改用堆上 `QueryResult`。
 3. `cleanup_database_files()` 故意无调用方，仅供人工维修，绝不接进初始化/错误处理路径。
 4. 每条日志都写一次 NVS（`log.c` 持久化 `LogIndex`），是显著 flash 磨损来源。
-5. BLE 接收 `copy_len = data_len % (max_len + 1)` 是回绕不是钳位，超长通知静默截断。
+5. BLE 加密状态及接收队列按连接代次隔离，超长报文明确拒绝；不得恢复全局 `IsEnc` 或取模截断。
 6. CAN 接收用 `portMAX_DELAY` 永久阻塞（其他协议族 1000 ms）；CAN 设备无响应会挂起调用方。
 7. `QueryResult` 按值传递约 4.7 KB，数组类 API memset 可达约 47 KB，必须堆分配。
 8. `Use_Write_Flag`（RS485）/`Use_Send_Flag`（CAN）在收发之间无锁保护。

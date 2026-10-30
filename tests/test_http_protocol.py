@@ -49,6 +49,9 @@ typedef StaticSemaphore_t *SemaphoreHandle_t;
 #define ESP_LOGI(...) ((void)0)
 static void app_memory_log(const char *stage) { (void)stage; }
 #define LG_URL_HTTP_PROTOCOL_WHOLE_URL "https://protocol"
+#define LG_URL_MAX_LEN 320
+#define LG_URL_GET_LOST_IDNUM_URL_FMT "http://%s:11282/DeviceServiceCallback/GetMissingIdNums"
+static esp_err_t lg_url_build(const char *fmt,char *out,size_t size){snprintf(out,size,fmt,"10.0.0.1");return ESP_OK;}
 static const char *esp_err_to_name(esp_err_t e) { (void)e; return "mock"; }
 static SemaphoreHandle_t xSemaphoreCreateMutexStatic(StaticSemaphore_t *s) { pthread_mutex_init(&s->lock,NULL); return s; }
 static int xSemaphoreTake(SemaphoreHandle_t s, TickType_t wait) { (void)wait; return pthread_mutex_lock(&s->lock)==0; }
@@ -75,23 +78,31 @@ typedef struct {
     const char *url; int method,timeout_ms,buffer_size,buffer_size_tx; bool keep_alive_enable;
     void *crt_bundle_attach,*user_data; esp_err_t (*event_handler)(esp_http_client_event_t *);
 } esp_http_client_config_t;
-typedef struct { esp_http_client_config_t config; char body[64]; } *esp_http_client_handle_t;
+typedef struct { esp_http_client_config_t config; char body[256]; } *esp_http_client_handle_t;
 static void *esp_crt_bundle_attach;
 static int http_status=200, mode;
 static bool interleave;
+static bool fail_client_init,fail_post_field,gap_empty;
+static char gap_request[256];
 static pthread_barrier_t request_barrier;
 static esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t *config) {
+    if(fail_client_init)return NULL;
     esp_http_client_handle_t c=calloc(1,sizeof(*c)); c->config=*config; return c;
 }
 static esp_err_t esp_http_client_set_header(esp_http_client_handle_t c,const char *k,const char *v) { (void)c;(void)k;(void)v;return ESP_OK; }
-static esp_err_t esp_http_client_set_post_field(esp_http_client_handle_t c,const char *b,int n) { assert(n<64);memcpy(c->body,b,n);return ESP_OK; }
+static esp_err_t esp_http_client_set_post_field(esp_http_client_handle_t c,const char *b,int n) { if(fail_post_field)return ESP_FAIL;assert(n<256);memcpy(c->body,b,n);return ESP_OK; }
 static void emit(esp_http_client_handle_t c,int event,void *body,int n) {
     esp_http_client_event_t e={.event_id=event,.user_data=c->config.user_data,.data=body,.data_len=n}; c->config.event_handler(&e);
 }
 static esp_err_t esp_http_client_perform(esp_http_client_handle_t c) {
     char body[256]; int id=atoi(c->body);
     snprintf(body,sizeof(body),"{\"data\":{\"protocolTypeStr\":\"%s\",\"id\":%d,\"label\":\"A B\\nC\"}}",id==11?"SCPI":"MODBUS",id);
+    if(strstr(c->config.url,"GetMissingIdNums")){
+        snprintf(gap_request,sizeof(gap_request),"%s",c->body);
+        snprintf(body,sizeof(body),"{\"Data\":{\"Ids\":%s}}",gap_empty?"[]":"[2,0,1]");
+    }
     emit(c,HTTP_EVENT_ON_CONNECTED,NULL,0);
+    if(mode==4)return ESP_FAIL; /* SDK perform 检测到请求体短写/传输失败。 */
     if(mode==1) { // oversize
         char *large=calloc(1,16385);emit(c,HTTP_EVENT_ON_DATA,large,16385);free(large);
     } else if(mode==2) {
@@ -104,7 +115,7 @@ static esp_err_t esp_http_client_perform(esp_http_client_handle_t c) {
     emit(c,HTTP_EVENT_ON_FINISH,NULL,0);return ESP_OK;
 }
 static int esp_http_client_get_status_code(esp_http_client_handle_t c) { (void)c;return http_status; }
-static bool esp_http_client_is_complete_data_received(esp_http_client_handle_t c) { (void)c;return mode!=2; }
+static bool esp_http_client_is_complete_data_received(esp_http_client_handle_t c) { (void)c;return mode!=2&&mode!=3; }
 static esp_err_t esp_http_client_cleanup(esp_http_client_handle_t c) { emit(c,HTTP_EVENT_DISCONNECTED,NULL,0);free(c);return ESP_OK; }
 #endif
 '''
@@ -143,6 +154,8 @@ static void *free_aging_device(void *arg) {
     pthread_mutex_lock(&import_gate);free_done=true;pthread_cond_broadcast(&import_cond);pthread_mutex_unlock(&import_gate);return NULL;
 }
 static void drain(void) { HttpProtocolResponse r; while(http_receive_protocol(&r,0)==ESP_OK) http_protocol_response_release(&r); }
+static int json_alloc_left=-1;
+static void *json_allocate(size_t bytes){if(json_alloc_left==0)return NULL;if(json_alloc_left>0)json_alloc_left--;return malloc(bytes);}
 int main(void) {
     assert(Http_init()==ESP_OK);QueueHandle_t original=HttpData_queue;assert(Http_init()==ESP_OK && original==HttpData_queue);
     s_protocol_lifecycle_mutex=xSemaphoreCreateMutexStatic(&s_protocol_lifecycle_storage);
@@ -197,13 +210,36 @@ int main(void) {
     release_import=true;pthread_cond_broadcast(&import_cond);pthread_mutex_unlock(&import_gate);
     pthread_join(a,NULL);pthread_join(b,NULL);assert(Aging_device==NULL && free_done);http_protocol_response_release(&first);
     puts("PASS protocol installation and concurrent device free share lifetime lock");
-    AgingDevice_RuntimeFree();free(read_devices);free(HttpData_queue->data);free(HttpData_queue);
+    AgingDevice_RuntimeFree();free(read_devices);
+    char out[512];
+    assert(test_http_post_record_query(123,2,"record-A",out,sizeof(out))==ESP_OK);
+    cJSON *query=cJSON_Parse(gap_request);assert(query);
+    cJSON *data=cJSON_GetObjectItem(query,"Data");
+    assert(cJSON_GetObjectItem(query,"Seq")->valueint==123&&cJSON_GetObjectItem(data,"IdNum")->valueint==2);
+    assert(!strcmp(cJSON_GetObjectItem(data,"RecordId")->valuestring,"record-A"));cJSON_Delete(query);
+    assert(strstr(out,"[2,0,1]")&&HttpData_queue->count==0);
+    gap_empty=true;assert(test_http_post_record_query(123,2,"record-A",out,sizeof(out))==ESP_OK&&strstr(out,"[]"));gap_empty=false;
+    http_status=503;assert(test_http_post_record_query(123,2,"record-A",out,sizeof(out))==ESP_ERR_INVALID_RESPONSE&&out[0]==0);http_status=200;
+    for(int error_mode=1;error_mode<=4;error_mode++){
+        mode=error_mode;assert(test_http_post_record_query(123,2,"record-A",out,sizeof(out))!=ESP_OK&&out[0]==0);
+    }
+    mode=0;assert(test_http_post_record_query(123,2,"record-A",out,8)==ESP_ERR_INVALID_SIZE&&out[0]==0);
+    fail_allocation=true;assert(test_http_post_record_query(123,2,"record-A",out,sizeof(out))==ESP_ERR_NO_MEM);fail_allocation=false;
+    fail_client_init=true;assert(test_http_post_record_query(123,2,"record-A",out,sizeof(out))==ESP_ERR_NO_MEM);fail_client_init=false;
+    fail_post_field=true;assert(test_http_post_record_query(123,2,"record-A",out,sizeof(out))==ESP_FAIL);fail_post_field=false;
+    cJSON_Hooks hooks={.malloc_fn=json_allocate,.free_fn=free};cJSON_InitHooks(&hooks);
+    for(int allocation=0;allocation<6;allocation++){json_alloc_left=allocation;assert(test_http_post_record_query(123,2,"record-A",out,sizeof(out))==ESP_ERR_NO_MEM);}
+    json_alloc_left=-1;cJSON_InitHooks(NULL);
+    assert(test_http_post_record_query(123,-1,"record-A",out,sizeof(out))==ESP_ERR_INVALID_ARG);
+    assert(test_http_post_record_query(123,2,"",out,sizeof(out))==ESP_ERR_INVALID_ARG);
+    puts("PASS real missing-ID HTTP request preserves wire format and rejects non-2xx, short writes, truncation, incomplete responses and allocation failures");
+    free(HttpData_queue->data);free(HttpData_queue);
     puts("All HTTP protocol regression scenarios passed");return 0;
 }
 '''
 
 def main():
-    source = (ROOT / 'main/APP/HTTP/GetProto.c').read_text().split('esp_err_t test_http_post_record_query')[0]
+    source = (ROOT / 'main/APP/HTTP/GetProto.c').read_text()
     app = (ROOT / 'main/Task/appTask.c').read_text()
     state_start = app.index('static StaticSemaphore_t s_protocol_lifecycle_storage;')
     state_end = app.index('static esp_err_t import_scpi_protocol_to_device', state_start)

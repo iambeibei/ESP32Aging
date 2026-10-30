@@ -43,7 +43,7 @@ static const char *TAG = "BLE_CTRL";
  * 连接参数偏好（2026-10-16，CONNECT_EVT 时由主控端主动提议）：
  * interval 12 × 1.25ms = 15ms（与 DUT 惯常请求值一致）；
  * supervision timeout 2000 × 10ms = 20s——实机日志显示 DUT 建链后会请求
- * timeout=400（仅 500ms），WiFi/BLE 射频共存下一有抖动即以 rsn 0x08
+ * timeout=400（4s），WiFi/BLE 射频共存抖动可能触发 rsn 0x08
  * （Connection Timeout）掉线。主控端提议宽松值可显著提高链路存活率，
  * 最终生效值以 ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT 日志为准。
  */
@@ -63,6 +63,42 @@ EXT_RAM_BSS_ATTR static ble_device_info_t s_scanned_devices[MAX_SCAN_DEVICES];
 static int s_scanned_count = 0;
 static atomic_bool s_is_scanning = false;
 static atomic_bool s_is_connected = false;
+/* 高 31 位为连接代次，最低位为加密状态；CAS 防止旧鉴权迟到启用新连接加密。 */
+static atomic_uint s_session_state;
+static atomic_bool s_session_closing = true;
+
+static void ble_session_reset(void)
+{
+    unsigned state = atomic_load(&s_session_state);
+    while (!atomic_compare_exchange_weak(&s_session_state, &state,
+                                         (state & ~1u) + 2u)) { }
+}
+
+uint32_t ble_session_id(void)
+{
+    return atomic_load(&s_session_state) & ~1u;
+}
+
+bool ble_session_is_encrypted(void)
+{
+    return (atomic_load(&s_session_state) & 1u) != 0;
+}
+
+bool ble_session_is_current(uint32_t session_id)
+{
+    return atomic_load(&s_is_connected) && !atomic_load(&s_session_closing) &&
+           session_id == ble_session_id();
+}
+
+bool ble_session_set_encrypted(uint32_t session_id, bool encrypted)
+{
+    unsigned state = atomic_load(&s_session_state);
+    do {
+        if (!ble_session_is_current(session_id) || (state & ~1u) != session_id) return false;
+    } while (!atomic_compare_exchange_weak(&s_session_state, &state,
+                                           encrypted ? (state | 1u) : (state & ~1u)));
+    return true;
+}
 static char s_connected_name[20] = {0};
 static SemaphoreHandle_t s_device_list_mutex = NULL; // 互斥锁保护设备列表
 static SemaphoreHandle_t s_scan_control_mutex;
@@ -196,6 +232,7 @@ typedef struct
     uint16_t gattc_if;
     uint16_t app_id;
     uint16_t conn_id;
+    uint16_t mtu;
     uint16_t service_start_handle;
     uint16_t service_end_handle;
     uint16_t notify_char_handle;
@@ -209,6 +246,7 @@ static gattc_profile_t s_gattc_profile = {
     .gattc_if = ESP_GATT_IF_NONE,
     .app_id = PROFILE_A_APP_ID,
     .conn_id = 0,
+    .mtu = 23, /* ATT 默认 MTU，协商成功后更新。 */
     .service_start_handle = 0,
     .service_end_handle = 0,
     .notify_char_handle = 0,
@@ -283,11 +321,22 @@ void app_ble_recv_task(void *arg)
 {
     uint16_t datalen = 0;
     uint32_t wait_time = portMAX_DELAY;
+    uint32_t session_id = 0;
     while (1)
     {
         ble_mtu_data_t mtu_recv;
         if (xQueueReceive(data_queue, &mtu_recv, wait_time) == pdTRUE) /* 获取队列 */
         {
+            if (!ble_session_is_current(mtu_recv.session_id)) {
+                free(mtu_recv.data);
+                if (!ble_session_is_current(session_id)) {
+                    datalen = 0;
+                    wait_time = portMAX_DELAY;
+                }
+                continue;
+            }
+            if (session_id != mtu_recv.session_id) datalen = 0;
+            session_id = mtu_recv.session_id;
             if ((datalen + mtu_recv.data_len) < BUFFER_MAX)
             {
                 memcpy(&a_data[datalen], mtu_recv.data, mtu_recv.data_len);
@@ -302,17 +351,24 @@ void app_ble_recv_task(void *arg)
         }
         else
         {
+            if (datalen == 0 || !ble_session_is_current(session_id)) {
+                datalen = 0;
+                wait_time = portMAX_DELAY;
+                continue;
+            }
             ESP_LOGI(TAG, "ble a recv len: %d", datalen);
-            ble_data_t ble_data;
+            ble_data_t ble_data = {0};
             ble_data.data = app_malloc_prefer_psram(datalen);
             if (ble_data.data)
             {
                 ble_data.data_len = datalen;
                 ble_data.profile_id = PROFILE_A_APP_ID;
+                ble_data.session_id = session_id;
                 // memcpy(ble_data.remote, gl_profile_tab[PROFILE_A_APP_ID].remote_bda, 6);
                 memcpy(ble_data.data, a_data, datalen);
                 if (!data_forword_queue || xQueueSend(data_forword_queue, &ble_data, pdMS_TO_TICKS(250)) != pdTRUE)
                 {
+                    ESP_LOGW(TAG, "蓝牙业务接收队列已满或未初始化，丢弃 %u 字节", (unsigned)datalen);
                     free(ble_data.data);
                 }
             }
@@ -324,8 +380,16 @@ void app_ble_recv_task(void *arg)
 
 int app_ble_recv_data_form_remote(uint8_t *data, int max_len, uint32_t wait_time)
 {
+    uint32_t session_id;
+    return app_ble_recv_data_for_session(data, max_len, wait_time, &session_id);
+}
+
+int app_ble_recv_data_for_session(uint8_t *data, int max_len, uint32_t wait_time,
+                                  uint32_t *session_id)
+{
     ble_data_t ble_data = {0};
-    if (!data || !data_forword_queue || xQueueReceive(data_forword_queue, &ble_data, wait_time) != pdTRUE)
+    if (!data || max_len <= 0 || !session_id || !data_forword_queue ||
+        xQueueReceive(data_forword_queue, &ble_data, wait_time) != pdTRUE)
     {
         return -1;
     }
@@ -334,14 +398,18 @@ int app_ble_recv_data_form_remote(uint8_t *data, int max_len, uint32_t wait_time
     // esp_log_buffer_hex(GATTC_TAG, ble_data.data, ble_data.data_len);
     int copy_len = -1;
     uint8_t id = ble_data.profile_id;
-    if (id < PROFILE_NUM)
+    if (id < PROFILE_NUM && ble_session_is_current(ble_data.session_id) &&
+        ble_data.data_len <= max_len)
     {
-        copy_len = ble_data.data_len % (max_len + 1);
+        copy_len = ble_data.data_len;
         memcpy(data, ble_data.data, copy_len);
+        *session_id = ble_data.session_id;
     }
     else
     {
-        ESP_LOGE(TAG, "ble profile id error [id: %d]", id);
+        ESP_LOGW(TAG, "丢弃蓝牙接收包: profile=%u, bytes=%u, session=%lu, current=%lu",
+                 (unsigned)id, (unsigned)ble_data.data_len,
+                 (unsigned long)ble_data.session_id, (unsigned long)ble_session_id());
     }
     free(ble_data.data);
     return copy_len;
@@ -850,6 +918,7 @@ static bool ble_connect_by_name_locked(const char *device_name)
     s_connect_attempting = true;
     s_connect_result_pending = true;
     s_gatt_setup_done = false;
+    ble_session_reset();
     esp_err_t ret = esp_ble_gattc_enh_open(s_gattc_profile.gattc_if, &conn_params);
 
     if (ret == ESP_OK)
@@ -911,6 +980,7 @@ static bool ble_connect_by_address_locked(uint8_t *bda, uint8_t addr_type)
     s_connect_attempting = true;
     s_connect_result_pending = true;
     s_gatt_setup_done = false;
+    ble_session_reset();
     esp_err_t ret = esp_ble_gattc_enh_open(s_gattc_profile.gattc_if, &conn_params);
 
     if (ret == ESP_OK)
@@ -963,10 +1033,14 @@ bool ble_connect_by_address(uint8_t *bda, uint8_t addr_type)
 
 void ble_disconnect(void)
 {
+    /* 立即使鉴权结果和队列旧包失效，不等异步断开回调。 */
+    atomic_store(&s_session_closing, true);
+    ble_session_reset();
     if (s_is_connected)
     {
-        esp_ble_gattc_close(s_gattc_profile.gattc_if, s_gattc_profile.conn_id);
-        ESP_LOGI(TAG, "Disconnecting...");
+        esp_err_t ret = esp_ble_gattc_close(s_gattc_profile.gattc_if, s_gattc_profile.conn_id);
+        if (ret != ESP_OK) ESP_LOGE(TAG, "提交蓝牙断开失败: %s", esp_err_to_name(ret));
+        else ESP_LOGI(TAG, "Disconnecting...");
     }
     else
     {
@@ -1012,36 +1086,40 @@ bool ble_get_connected_device_addr(uint8_t *bda)
 
 // ==================== 数据发送函数 ====================
 
-int ble_send_data(void *pdata, int len, uint32_t timeout)
+static int ble_send_for_session(uint32_t session_id, const uint8_t *data, int len,
+                                bool encrypt)
 {
-    uint8_t sendBuf[1024] = {0};
-    uint16_t nlen = 0;
-    if (IsEnc)
-    {
-        app_enc_process_Encrypt(pdata, len, sendBuf, &nlen);
-
-    }
-    else
-    {
-        memcpy(sendBuf, pdata, len);
-        nlen = len;
-    }
-
-    if (!s_is_connected)
-    {
-        ESP_LOGE(TAG, "Not connected to any device");
+    if (!data || len <= 0 || len > 500) {
+        ESP_LOGE(TAG, "蓝牙发送参数无效: bytes=%d", len);
         return 0;
     }
-
-    if (s_gattc_profile.write_char_handle == INVALID_HANDLE)
-    {
+    if (!ble_session_is_current(session_id)) {
+        ESP_LOGW(TAG, "蓝牙连接已失效，取消发送: session=%lu", (unsigned long)session_id);
+        return 0;
+    }
+    if (s_gattc_profile.write_char_handle == INVALID_HANDLE) {
         ESP_LOGE(TAG, "Write characteristic not found");
         return 0;
     }
 
-    if (len > 500)
+    uint8_t sendBuf[1024] = {0};
+    uint16_t nlen = 0;
+    if (encrypt)
     {
-        ESP_LOGE(TAG, "Data too long: %d > 500", len);
+        if (app_enc_process_Encrypt(data, len, sendBuf, &nlen) != ESP_OK) {
+            ESP_LOGE(TAG, "蓝牙报文加密失败");
+            return 0;
+        }
+    }
+    else
+    {
+        memcpy(sendBuf, data, len);
+        nlen = len;
+    }
+
+    if (nlen == 0 || nlen > 500 || !ble_session_is_current(session_id)) {
+        ESP_LOGW(TAG, "取消蓝牙发送: wire_bytes=%u, session=%lu, current=%lu",
+                 (unsigned)nlen, (unsigned long)session_id, (unsigned long)ble_session_id());
         return 0;
     }
 
@@ -1055,7 +1133,10 @@ int ble_send_data(void *pdata, int len, uint32_t timeout)
 
     if (ret == ESP_OK)
     {
-        ESP_LOGI(TAG, "Data sent: %d bytes", len);
+        ESP_LOGI(TAG, "蓝牙发送已受理: session=%lu, encrypted=%u, plain_bytes=%d, wire_bytes=%u",
+                 (unsigned long)session_id, (unsigned)encrypt, len, (unsigned)nlen);
+        /* 仅预览前 32 字节，避免鉴权大包和周期采样日志挤占蓝牙任务。 */
+        ESP_LOG_BUFFER_HEX_LEVEL(TAG, sendBuf, nlen < 32 ? nlen : 32, ESP_LOG_INFO);
         return 1;
     }
     else
@@ -1063,6 +1144,18 @@ int ble_send_data(void *pdata, int len, uint32_t timeout)
         ESP_LOGE(TAG, "Failed to send data: 0x%x", ret);
         return 0;
     }
+}
+
+int ble_send_data(void *pdata, int len, uint32_t timeout)
+{
+    (void)timeout; /* SDK 异步提交，不在此等待业务回复。 */
+    unsigned state = atomic_load(&s_session_state);
+    return ble_send_for_session(state & ~1u, pdata, len, (state & 1u) != 0);
+}
+
+int ble_send_auth_data(uint32_t session_id, const uint8_t *data, int len)
+{
+    return ble_send_for_session(session_id, data, len, false);
 }
 
 // ==================== GAP回调 ====================
@@ -1185,8 +1278,12 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
     case ESP_GATTC_CONNECT_EVT:
         ESP_LOGI(TAG, "Connected to " ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(param->connect.remote_bda));
         s_gattc_profile.conn_id = param->connect.conn_id;
+        s_gattc_profile.mtu = 23;
         memcpy(s_gattc_profile.remote_bda, param->connect.remote_bda, ESP_BD_ADDR_LEN);
+        ble_session_reset();
+        atomic_store(&s_session_closing, false);
         s_is_connected = true;
+        ESP_LOGI(TAG, "蓝牙新连接默认明文: session=%lu", (unsigned long)ble_session_id());
 
         // 更新扫描列表中的连接状态
         if (s_device_list_mutex != NULL)
@@ -1214,7 +1311,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         esp_ble_gattc_send_mtu_req(gattc_if, param->connect.conn_id);
 
         /*
-         * 主动提议宽松的连接参数：DUT 惯于请求 supervision timeout=400（500ms），
+         * 主动提议宽松的连接参数：DUT 惯于请求 supervision timeout=400（4s），
          * WiFi/BLE 射频共存下一有抖动即 rsn 0x08 掉线（2026-10-16 实机日志）。
          * 主控端提议 timeout=BLE_PREF_SUPERVISION_TIMEOUT（20s），对端通常接受；
          * 被拒绝或对端后续再请求紧参数时，以 UPDATE_CONN_PARAMS_EVT 日志为准。
@@ -1256,6 +1353,9 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
 
     case ESP_GATTC_CFG_MTU_EVT:
         ESP_LOGI(TAG, "MTU exchange: %d", param->cfg_mtu.mtu);
+        if (param->cfg_mtu.status == ESP_GATT_OK &&
+            param->cfg_mtu.conn_id == s_gattc_profile.conn_id && param->cfg_mtu.mtu >= 23)
+            s_gattc_profile.mtu = param->cfg_mtu.mtu;
         break;
 
     case ESP_GATTC_SEARCH_RES_EVT:
@@ -1417,10 +1517,21 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         break;
 
     case ESP_GATTC_NOTIFY_EVT:
-        // ESP_LOGI(TAG, "Notification received: %d bytes", param->notify.value_len);
-        // esp_log_buffer_hex(TAG, param->notify.value, param->notify.value_len);
+        if (!ble_session_is_current(ble_session_id()) ||
+            param->notify.conn_id != s_gattc_profile.conn_id ||
+            memcmp(param->notify.remote_bda, s_gattc_profile.remote_bda, ESP_BD_ADDR_LEN) != 0 ||
+            param->notify.handle != s_gattc_profile.notify_char_handle || param->notify.value_len == 0) {
+            ESP_LOGW(TAG, "忽略非当前连接或非当前通知特征的蓝牙数据");
+            break;
+        }
+        ESP_LOGI(TAG, "蓝牙原始接收: session=%lu, handle=0x%04x, bytes=%u",
+                 (unsigned long)ble_session_id(), param->notify.handle, param->notify.value_len);
+        ESP_LOG_BUFFER_HEX_LEVEL(TAG, param->notify.value,
+                                 param->notify.value_len < 32 ? param->notify.value_len : 32,
+                                 ESP_LOG_INFO);
 
-        ble_mtu_data_t recv;
+        ble_mtu_data_t recv = {0};
+        recv.session_id = ble_session_id();
         recv.data = app_malloc_prefer_psram(param->notify.value_len);
         if (!recv.data)
         {
@@ -1429,14 +1540,8 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         }
         recv.data_len = param->notify.value_len;
         memcpy(recv.data, param->notify.value, param->notify.value_len);
-        if (recv.data_len < (param->cfg_mtu.mtu - 3))
-        {
-            recv.wait_time = 0;
-        }
-        else
-        {
-            recv.wait_time = pdMS_TO_TICKS(85);
-        }
+        /* NOTIFY 参数不能读 cfg_mtu 联合体成员，使用本连接已协商的 MTU。 */
+        recv.wait_time = recv.data_len < s_gattc_profile.mtu - 3 ? 0 : pdMS_TO_TICKS(85);
         if (!data_queue || xQueueSend(data_queue, &recv, pdMS_TO_TICKS(250)) != pdTRUE)
         {
             ESP_LOGE(TAG, "send data to data_queue failed");
@@ -1478,6 +1583,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         bool was_established = s_is_connected;
         bool establishing = s_connect_attempting;
         s_is_connected = false;
+        ble_session_reset();
         s_gattc_profile.conn_id = 0; /* 清理陈旧 conn_id，避免下次误用 */
         s_gattc_profile.service_found = false;
         s_gattc_profile.notify_char_handle = 0;

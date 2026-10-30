@@ -18,6 +18,7 @@
 #include "appTask.h"
 #include "dual_net.h"
 #include "mesh.h"
+#include "aging_gap.h"
 
 static const char *TAG = "mesh_mqtt";
 
@@ -84,6 +85,13 @@ static atomic_uint s_last_outbox_bytes;
 #define MQTT_ACK_DELETED 8U
 #define MQTT_UPLINK_DISCONNECT_RETRY_MAX 3
 #define MQTT_PUBLISH_DRAIN_TIMEOUT_MS 11000 /* 现有网络写超时10秒 + 调度余量。 */
+#define MQTT_EVENT_QUEUE_LEN 128
+#define MQTT_EVENT_NORMAL_LIMIT 96
+#define MQTT_EVENT_PAYLOAD_BYTES 512
+#define MQTT_EVENT_RETRY_MS 5000
+#define MQTT_EVENT_ACK_MAP_BYTES (65536U / 4U)
+#define MQTT_EVENT_ACK_PUBLISHED 1U
+#define MQTT_EVENT_ACK_DELETED 2U
 
 typedef enum
 {
@@ -116,6 +124,10 @@ static bool s_mqtt_mutex_initializing;
 static bool s_client_started;
 static StaticSemaphore_t s_mqtt_admission_storage;
 static SemaphoreHandle_t s_mqtt_admission_mutex;
+static StaticSemaphore_t s_event_mutex_storage;
+static SemaphoreHandle_t s_event_mutex;
+/* 生命周期代次跨普通重连不变；销毁/新建递增，独立于连接 epoch。 */
+static uint32_t s_client_generation;
 static TaskHandle_t s_mqtt_service_task;
 static QueueHandle_t s_runtime_queue;
 static AppPsramQueue s_runtime_queue_storage;
@@ -150,7 +162,43 @@ typedef struct {
     char payload[MQTT_RUNTIME_PAYLOAD_BYTES];
 } MqttRuntimeLog;
 
+typedef struct {
+    MqttEventReportKind kind;
+    uint32_t taskcp_generation;
+    char topic[MQTT_TOPIC_ITEM_CAPACITY];
+    char payload[MQTT_EVENT_PAYLOAD_BYTES];
+} MqttPendingEvent;
+
+typedef struct {
+    MqttPendingEvent head;
+    bool has_head;
+    int msg_id;
+    uint32_t client_generation;
+    uint32_t retry_epoch;
+    TickType_t retry_due;
+    /* 仅 enqueue 调用窗口捕获所有 ID 的提前确认，不使用有损事件 FIFO。 */
+    uint8_t early_acks[MQTT_EVENT_ACK_MAP_BYTES];
+} MqttEventWork;
+
+static AppPsramQueue s_event_queue_storage;
+static QueueHandle_t s_event_queue;
+static MqttEventWork *s_event_work;
+/* 这些字段均由 event mutex 保护；含工作槽在内共最多128条。 */
+static unsigned s_event_count, s_event_normal_count;
+static uint32_t s_taskcp_generation;
+static struct {
+    unsigned cached, submitted, acked, retried, cancelled, rejected;
+} s_event_stats;
+/* 仅状态自旋锁保护：回调不等待 event/lifecycle/admission mutex。 */
+static struct {
+    uint32_t generation;
+    int msg_id;
+    bool capture;
+    uint8_t flags;
+} s_event_ack;
+
 static esp_err_t mqtt_init_locked(void);
+static esp_err_t mqtt_event_storage_init(void);
 
 static void mqtt_service_wake(void)
 {
@@ -195,6 +243,22 @@ static void mqtt_service_ack_event(esp_mqtt_event_handle_t event, uint8_t flags)
     mqtt_service_wake();
 }
 
+static void mqtt_event_ack_event(esp_mqtt_event_handle_t event, uint8_t flags)
+{
+    if (event->msg_id <= 0 || event->msg_id > UINT16_MAX) return;
+    uint8_t result = flags == MQTT_ACK_PUBLISHED ? MQTT_EVENT_ACK_PUBLISHED : MQTT_EVENT_ACK_DELETED;
+    portENTER_CRITICAL(&s_mqtt_state_lock);
+    if (event->client == s_client && s_event_ack.generation == s_client_generation) {
+        if (s_event_ack.capture) {
+            unsigned shift = ((unsigned)event->msg_id % 4U) * 2U;
+            s_event_work->early_acks[(unsigned)event->msg_id / 4U] |= result << shift;
+        }
+        if (event->msg_id == s_event_ack.msg_id) s_event_ack.flags |= result;
+    }
+    portEXIT_CRITICAL(&s_mqtt_state_lock);
+    mqtt_service_wake();
+}
+
 static bool mqtt_session_current(uint32_t epoch)
 {
     portENTER_CRITICAL(&s_mqtt_state_lock);
@@ -230,12 +294,14 @@ static esp_err_t mqtt_lifecycle_init(void)
     portEXIT_CRITICAL(&s_mqtt_state_lock);
     SemaphoreHandle_t mutex = xSemaphoreCreateMutexStatic(&s_mqtt_lifecycle_storage);
     SemaphoreHandle_t admission = xSemaphoreCreateMutexStatic(&s_mqtt_admission_storage);
+    SemaphoreHandle_t events = xSemaphoreCreateMutexStatic(&s_event_mutex_storage);
     portENTER_CRITICAL(&s_mqtt_state_lock);
     s_mqtt_lifecycle_mutex = mutex;
     s_mqtt_admission_mutex = admission;
+    s_event_mutex = events;
     s_mqtt_mutex_initializing = false;
     portEXIT_CRITICAL(&s_mqtt_state_lock);
-    return mutex != NULL && admission != NULL ? ESP_OK : ESP_ERR_NO_MEM;
+    return mutex != NULL && admission != NULL && events != NULL ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
 static void mqtt_lifecycle_unlock(SemaphoreHandle_t mutex)
@@ -507,6 +573,7 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
         break;
     case MQTT_EVENT_CONNECTED:
     {
+        aging_gap_mqtt_ready(false);
         if (!mqtt_connected(event->client))
             break;
         ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED client=%p, connection_count=%u, uplink=%s",
@@ -524,6 +591,7 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
 
     case MQTT_EVENT_DISCONNECTED:
     {
+        aging_gap_mqtt_ready(false);
         mqtt_disconnected(event->client);
         /* 自动重连复用 SDK MQTT 任务、队列和 mqtt_rx，不在这里重建客户端。 */
         ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED client=%p, uplink=%s; keep client and queues",
@@ -561,6 +629,7 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
     case MQTT_EVENT_PUBLISHED:
     {
         mqtt_service_ack_event(event, MQTT_ACK_PUBLISHED);
+        mqtt_event_ack_event(event, MQTT_ACK_PUBLISHED);
         /* 业务发布确认（PUBACK）：appTask 按 msg_id 结算 pushed=acked。
          * 钩子只入队，不写 DB——SDK 任务上下文禁止 SQLite 提交。 */
         app_mqtt_publish_settled(event->msg_id, true);
@@ -569,6 +638,7 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
 
     case MQTT_EVENT_DELETED:
         mqtt_service_ack_event(event, MQTT_ACK_DELETED);
+        mqtt_event_ack_event(event, MQTT_ACK_DELETED);
         /* outbox 淘汰/过期：回滚 inflight → pending，等补传 worker 重试。 */
         app_mqtt_publish_settled(event->msg_id, false);
         /* 汇总诊断在服务任务输出，回调不递归发布日志。 */
@@ -677,6 +747,12 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                                int32_t event_id, void *event_data)
 {
+    esp_mqtt_event_handle_t event = event_data;
+    portENTER_CRITICAL(&s_mqtt_state_lock);
+    bool current = (uint32_t)(uintptr_t)handler_args == s_client_generation &&
+                   event->client == s_client;
+    portEXIT_CRITICAL(&s_mqtt_state_lock);
+    if (!current) return; /* 包括句柄地址复用后，旧客户端的迟到回调。 */
     ESP_LOGD(TAG, "Event dispatched from event loop base=%s, event_id=%" PRId32 "", base, event_id);
     mqtt_event_handler_cb(event_data);
 }
@@ -695,6 +771,7 @@ static void mqtt_destroy_client_locked(void)
     }
     portENTER_CRITICAL(&s_mqtt_state_lock);
     s_client = NULL;
+    s_client_generation++;
     s_mqtt_control.phase = MQTT_APP_STOPPED;
     s_mqtt_control.switch_pending = false;
     s_mqtt_control.expedite_pending = false;
@@ -753,6 +830,7 @@ static esp_err_t mqtt_app_start_locked(void)
     }
     portENTER_CRITICAL(&s_mqtt_state_lock);
     s_client = client;
+    s_client_generation++;
     s_connection_epoch++;
     s_node_retry_step = 0;
     s_node_first_start = IsRoot == 0;
@@ -763,7 +841,8 @@ static esp_err_t mqtt_app_start_locked(void)
     s_mqtt_control.disconnect_requested = false;
     atomic_store(&s_mqtt_connected, false);
     portEXIT_CRITICAL(&s_mqtt_state_lock);
-    esp_err_t ret = esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, client);
+    esp_err_t ret = esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler,
+                                                  (void *)(uintptr_t)s_client_generation);
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to register MQTT event handler: %s", esp_err_to_name(ret));
@@ -805,6 +884,7 @@ esp_err_t mqtt_app_start(void)
 
 void mqtt_app_stop(void)
 {
+    aging_gap_mqtt_ready(false);
     SemaphoreHandle_t mutex = mqtt_lifecycle_mutex();
     if (mutex == NULL)
         return;
@@ -953,6 +1033,91 @@ int app_mqtt_publish(char *topic_name, char *publish_string, char *device_id)
         return 0; // 已接受 best effort 日志；不是 broker 确认。
     }
     return mqtt_enqueue_for_session(topic, publish_string, 0, false);
+}
+
+/* event mutex 持有者调用；初始化失败完整回滚，不替换已接受事件的队列。 */
+static esp_err_t mqtt_event_storage_init(void)
+{
+    if (s_event_queue != NULL) return ESP_OK;
+    QueueHandle_t queue = app_psram_queue_create(&s_event_queue_storage, MQTT_EVENT_QUEUE_LEN,
+                                                 sizeof(MqttPendingEvent), "mqtt_events");
+    if (queue == NULL) return ESP_ERR_NO_MEM;
+    MqttEventWork *work = app_calloc_prefer_psram(1, sizeof(*work));
+    if (work == NULL) {
+        app_psram_queue_delete(&s_event_queue_storage);
+        return ESP_ERR_NO_MEM;
+    }
+    portENTER_CRITICAL(&s_mqtt_state_lock);
+    s_event_work = work;
+    portEXIT_CRITICAL(&s_mqtt_state_lock);
+    s_event_queue = queue;
+    return ESP_OK;
+}
+
+static void mqtt_event_unlock(void)
+{
+    if (xSemaphoreGive(s_event_mutex) != pdTRUE) ESP_LOGE(TAG, "MQTT 事件锁释放失败");
+}
+
+int app_mqtt_event_submit(const char *topic_name, const char *payload,
+                          const char *device_id, MqttEventReportKind kind)
+{
+    if (topic_name == NULL || payload == NULL || payload[0] == '\0' ||
+        kind < MQTT_EVENT_REPORT_STATE || kind > MQTT_EVENT_REPORT_WARN ||
+        strlen(payload) >= MQTT_EVENT_PAYLOAD_BYTES) return -1;
+    MqttPendingEvent item = {.kind = kind};
+    /* 不把外来主题当 printf 格式串：只替换唯一的 %s。 */
+    int length;
+    if (device_id != NULL) {
+        const char *placeholder = strstr(topic_name, "%s");
+        if (placeholder == NULL || strchr(placeholder + 2, '%') != NULL ||
+            memchr(topic_name, '%', (size_t)(placeholder - topic_name)) != NULL) return -1;
+        length = snprintf(item.topic, sizeof(item.topic), "%.*s%s%s",
+                          (int)(placeholder - topic_name), topic_name, device_id, placeholder + 2);
+    } else length = snprintf(item.topic, sizeof(item.topic), "%s", topic_name);
+    if (length <= 0 || (size_t)length >= sizeof(item.topic)) return -1;
+    memcpy(item.payload, payload, strlen(payload) + 1U);
+    if (mqtt_lifecycle_init() != ESP_OK ||
+        xSemaphoreTake(s_event_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return -1;
+    if (mqtt_event_storage_init() != ESP_OK) {
+        s_event_stats.rejected++;
+        mqtt_event_unlock();
+        return -1;
+    }
+    bool normal = kind == MQTT_EVENT_REPORT_CONTEXT || kind == MQTT_EVENT_REPORT_WARN;
+    int result = -2;
+    item.taskcp_generation = s_taskcp_generation;
+    if (s_event_count < MQTT_EVENT_QUEUE_LEN &&
+        (!normal || s_event_normal_count < MQTT_EVENT_NORMAL_LIMIT) &&
+        xQueueSend(s_event_queue, &item, 0) == pdTRUE) {
+        s_event_count++;
+        if (normal) s_event_normal_count++;
+        s_event_stats.cached++;
+        result = 0;
+    } else {
+        s_event_stats.rejected++;
+        ESP_LOGE(TAG, "MQTT 事件缓存已满: pending=%u normal=%u topic=%s",
+                 s_event_count, s_event_normal_count, item.topic);
+    }
+    mqtt_event_unlock();
+    mqtt_service_wake();
+    return result;
+}
+
+void app_mqtt_event_cancel_taskcp(void)
+{
+    /* 与投递开始串行；已开始 SDK 投递的报文无法撤销，失败后会再次检查代次。 */
+    if (mqtt_lifecycle_init() != ESP_OK) {
+        ESP_LOGE(TAG, "MQTT TaskCP 失效处理初始化失败");
+        return;
+    }
+    if (xSemaphoreTake(s_event_mutex, portMAX_DELAY) != pdTRUE) {
+        ESP_LOGE(TAG, "MQTT TaskCP 失效处理取锁失败");
+        return;
+    }
+    s_taskcp_generation++;
+    mqtt_event_unlock();
+    mqtt_service_wake();
 }
 
 typedef enum {
@@ -1178,9 +1343,10 @@ static void mqtt_service_poll(void)
     }
     if (work->phase == MQTT_SETUP_ONLINE_ACK) {
         if (flags & MQTT_ACK_PUBLISHED) {
+            aging_gap_mqtt_ready(true);
             if (s_boot_config_enqueued) {
                 work->phase = MQTT_SETUP_DONE;
-                app_mqtt_backfill_wake(); /* 重连同样需要唤醒补传，不能依赖配置再次发布。 */
+
                 ESP_LOGI(TAG, "本次启动已上报配置，MQTT 重连跳过自动配置上报");
             } else {
                 work->phase = MQTT_SETUP_CONFIG_WAIT;
@@ -1227,17 +1393,152 @@ static void mqtt_service_poll(void)
                 atomic_fetch_add(&s_rejected_count, 1);
                 ESP_LOGE(TAG, "MQTT config exceeds budget; full payload rejected, bytes=%u", (unsigned)strlen(json));
                 work->phase = MQTT_SETUP_DONE;
-                app_mqtt_backfill_wake(); /* 上线完成：触发断线补传扫描 */
+
             } else if (mqtt_enqueue_for_session(topic, json, epoch, false) > 0) {
                 s_boot_config_enqueued = true;
                 ESP_LOGI(TAG, "本次启动完整配置已入队，后续重连不重复自动上报");
                 work->phase = MQTT_SETUP_DONE;
-                app_mqtt_backfill_wake(); /* 上线完成：触发断线补传扫描 */
+
             } else mqtt_setup_retry(work, now);
         } else mqtt_setup_retry(work, now);
         free(json);
     }
     mqtt_lifecycle_unlock(mutex);
+}
+
+static void mqtt_event_ack_reset(void)
+{
+    portENTER_CRITICAL(&s_mqtt_state_lock);
+    s_event_ack.capture = false;
+    s_event_ack.msg_id = 0;
+    s_event_ack.flags = 0;
+    portEXIT_CRITICAL(&s_mqtt_state_lock);
+}
+
+/* lifecycle 和 event mutex 已持有；只在已停止捕获时清表，避免长临界区。 */
+static void mqtt_event_ack_begin(uint32_t generation)
+{
+    mqtt_event_ack_reset();
+    memset(s_event_work->early_acks, 0, sizeof(s_event_work->early_acks));
+    portENTER_CRITICAL(&s_mqtt_state_lock);
+    s_event_ack.generation = generation;
+    s_event_ack.capture = true;
+    portEXIT_CRITICAL(&s_mqtt_state_lock);
+}
+
+static void mqtt_event_ack_register(int msg_id)
+{
+    portENTER_CRITICAL(&s_mqtt_state_lock);
+    s_event_ack.capture = false;
+    s_event_ack.msg_id = msg_id > 0 ? msg_id : 0;
+    s_event_ack.flags = msg_id > 0 && msg_id <= UINT16_MAX ?
+        (s_event_work->early_acks[(unsigned)msg_id / 4U] >> (((unsigned)msg_id % 4U) * 2U)) & 3U : 0;
+    portEXIT_CRITICAL(&s_mqtt_state_lock);
+}
+
+static void mqtt_event_retire_head(void)
+{
+    MqttEventReportKind kind = s_event_work->head.kind;
+    if (kind == MQTT_EVENT_REPORT_CONTEXT || kind == MQTT_EVENT_REPORT_WARN) s_event_normal_count--;
+    s_event_count--;
+    s_event_work->has_head = false;
+    s_event_work->msg_id = 0;
+    s_event_work->retry_due = xTaskGetTickCount();
+    mqtt_event_ack_reset();
+}
+
+/* 唯一消费者：沿用 MQTT CPU1 服务任务。先取 lifecycle 再取 event；
+ * SDK 准入时释放 event。回调仅用 state 自旋锁。普通重连保留在途身份。 */
+static void mqtt_event_poll(void)
+{
+    SemaphoreHandle_t lifecycle = mqtt_lifecycle_mutex();
+    if (lifecycle == NULL || s_event_mutex == NULL || xSemaphoreTake(lifecycle, 0) != pdTRUE) return;
+    if (xSemaphoreTake(s_event_mutex, 0) != pdTRUE) {
+        mqtt_lifecycle_unlock(lifecycle);
+        return;
+    }
+    MqttEventWork *work = s_event_work;
+    if (work == NULL) goto done;
+    if (!work->has_head) {
+        if (xQueueReceive(s_event_queue, &work->head, 0) != pdTRUE) goto done;
+        work->has_head = true;
+        work->retry_due = xTaskGetTickCount();
+    }
+    portENTER_CRITICAL(&s_mqtt_state_lock);
+    uint8_t flags = s_event_ack.flags;
+    uint32_t generation = s_client_generation;
+    uint32_t epoch = s_connection_epoch;
+    bool has_client = s_client != NULL;
+    portEXIT_CRITICAL(&s_mqtt_state_lock);
+    if (work->msg_id > 0) {
+        if (flags & MQTT_EVENT_ACK_PUBLISHED) {
+            s_event_stats.acked++;
+            mqtt_event_retire_head();
+            goto done;
+        }
+        if (flags & MQTT_EVENT_ACK_DELETED || !has_client || work->client_generation != generation) {
+            s_event_stats.retried++;
+            work->msg_id = 0;
+            work->retry_due = xTaskGetTickCount() + pdMS_TO_TICKS(MQTT_EVENT_RETRY_MS);
+            mqtt_event_ack_reset();
+        } else goto done; /* 即使离线也等 SDK PUBACK/DELETED，不重新投递同一条。 */
+    }
+    if (work->head.kind == MQTT_EVENT_REPORT_TASKCP &&
+        work->head.taskcp_generation != s_taskcp_generation) {
+        s_event_stats.cancelled++;
+        mqtt_event_retire_head();
+        goto done;
+    }
+    if (s_service_work.epoch != epoch || s_service_work.phase < MQTT_SETUP_CONFIG_WAIT ||
+        !mqtt_session_current(epoch)) goto done;
+    /* 新连接上线后立即重试，不让上次准入失败的退避延迟恢复。 */
+    if (work->retry_epoch != epoch) {
+        work->retry_epoch = epoch;
+        work->retry_due = xTaskGetTickCount();
+    }
+    if (!mqtt_due(xTaskGetTickCount(), work->retry_due)) goto done;
+    mqtt_event_ack_begin(generation);
+    work->client_generation = generation;
+    work->msg_id = -1; /* 投递开始：取消只能影响尚未开始交 SDK 的 TaskCP。 */
+    /* SDK enqueue 可能等内部锁；不持队列锁，离线/并发业务仍可立即缓存。
+     * 工作槽只有本服务任务写，lifecycle 锁保证 SDK 句柄不会在调用中销毁。 */
+    mqtt_event_unlock();
+    int id = mqtt_enqueue_for_session(work->head.topic, work->head.payload, epoch, false);
+    mqtt_event_ack_register(id);
+    work->msg_id = id > 0 ? id : 0;
+    if (xSemaphoreTake(s_event_mutex, portMAX_DELAY) != pdTRUE) {
+        ESP_LOGE(TAG, "MQTT 事件投递后取锁失败");
+        mqtt_lifecycle_unlock(lifecycle);
+        return;
+    }
+    if (id > 0) {
+        s_event_stats.submitted++;
+    } else {
+        s_event_stats.retried++;
+        work->retry_due = xTaskGetTickCount() + pdMS_TO_TICKS(MQTT_EVENT_RETRY_MS);
+    }
+done:
+    mqtt_event_unlock();
+    mqtt_lifecycle_unlock(lifecycle);
+}
+
+static void mqtt_event_diagnostic(void)
+{
+    static unsigned last_cached, last_rejected, last_cancelled, last_acked, last_retried;
+    if (s_event_mutex == NULL || xSemaphoreTake(s_event_mutex, 0) != pdTRUE) return;
+    if (s_event_count != 0 || last_cached != s_event_stats.cached || last_rejected != s_event_stats.rejected ||
+        last_cancelled != s_event_stats.cancelled || last_acked != s_event_stats.acked ||
+        last_retried != s_event_stats.retried) {
+        ESP_LOGI(TAG, "MQTT 事件补发: pending=%u cached=%u submitted=%u acked=%u retry=%u cancelled=%u rejected=%u",
+                 s_event_count, s_event_stats.cached, s_event_stats.submitted, s_event_stats.acked,
+                 s_event_stats.retried, s_event_stats.cancelled, s_event_stats.rejected);
+        last_cached = s_event_stats.cached;
+        last_rejected = s_event_stats.rejected;
+        last_cancelled = s_event_stats.cancelled;
+        last_acked = s_event_stats.acked;
+        last_retried = s_event_stats.retried;
+    }
+    mqtt_event_unlock();
 }
 
 static void mqtt_runtime_poll(void)
@@ -1263,6 +1564,7 @@ void mqtt_app_service_task(void *arg)
     unsigned last_rejected = 0, last_deleted = 0, last_overflow = 0;
     for (;;) {
         mqtt_service_poll();
+        mqtt_event_poll();
         mqtt_runtime_poll();
 
         /* 连接成功后的层数落盘：比较 NVS 后只有不一致才写，失败不阻断服务。 */
@@ -1281,6 +1583,7 @@ void mqtt_app_service_task(void *arg)
             last_deleted = deleted;
             last_overflow = overflow;
             last_diagnostic = now;
+            mqtt_event_diagnostic();
         }
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(MQTT_SERVICE_POLL_MS));
     }
@@ -1378,6 +1681,10 @@ int app_read_MQTT_data(char *data_buffer, int buffer_len, uint32_t timeout)
 
 static esp_err_t mqtt_init_locked(void)
 {
+    if (xSemaphoreTake(s_event_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    esp_err_t event_err = mqtt_event_storage_init();
+    mqtt_event_unlock();
+    if (event_err != ESP_OK) return event_err;
     /* Allow repeated initialization calls without leaking or replacing queues. */
     if (Data_queue == NULL)
     {

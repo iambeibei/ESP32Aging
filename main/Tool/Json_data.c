@@ -838,9 +838,9 @@ char *create_json_agingComplete(int timestamp, int is_complete, const char *agin
  * Value JSON 在采样时生成并同时用于 SQLite，因此实时上报与断网补发
  * 不再维护两套不同的数据名称/数据结构逻辑。
  */
-char *create_sensor_json(int idnum, const char *pn, int current_step, int timestamp, const char *value_json)
+char *create_sensor_json(int idnum, const char *pn, int current_step, int timestamp, const char *value_json, const char *record_id)
 {
-    if (pn == NULL || pn[0] == '\0' || value_json == NULL || value_json[0] == '\0')
+    if (pn == NULL || pn[0] == '\0' || record_id == NULL || value_json == NULL || value_json[0] == '\0')
     {
         return NULL;
     }
@@ -868,7 +868,7 @@ char *create_sensor_json(int idnum, const char *pn, int current_step, int timest
     cJSON_AddNumberToObject(data, "IDNUM", idnum);
     cJSON_AddNumberToObject(data, "TIMESTAMP", timestamp);
     cJSON_AddStringToObject(data, "PN", pn);
-    cJSON_AddStringToObject(data, "RecordId", RecordId);
+    cJSON_AddStringToObject(data, "RecordId", record_id);
     cJSON_AddNumberToObject(data, "CurrentStep", current_step+1);
     cJSON_AddItemToObject(data, "Value", value_array);
 

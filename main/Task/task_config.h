@@ -44,12 +44,6 @@
 #define LG_STACK_MQTT_SERVICE      8192
 #define LG_PRIO_MQTT_SERVICE       4
 
-/* MQTT 断线补传：SQLite pushed=0 → MQTT。
- * QueryResult 单条约 4.7KB（PSRAM 堆），批 4 条约 19KB，栈 4096 足够。
- * 优先级与 mqtt_service 持平（4），低于 mqtt_rx(7)，不抢占命令接收。 */
-#define LG_STACK_MQTT_BACKFILL     4096
-#define LG_PRIO_MQTT_BACKFILL      4
-
 #define LG_STACK_HTTP_RX           3072
 #define LG_PRIO_HTTP_RX            7
 

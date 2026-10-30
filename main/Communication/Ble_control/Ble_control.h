@@ -30,6 +30,7 @@ typedef struct
     uint8_t *data;
     uint16_t data_len;
     uint32_t wait_time;
+    uint32_t session_id;           // 接收时固化的连接代次
 } ble_mtu_data_t;
 
 // 蓝牙数据结构体
@@ -39,6 +40,7 @@ typedef struct
     // uint8_t remote[6];
     uint8_t *data;
     uint16_t data_len;
+    uint32_t session_id;
 }ble_data_t;
 
 // BLE事件回调函数类型
@@ -129,11 +131,24 @@ void ble_disconnect(void);
 
 /**
  * @brief 发送数据到BLE设备
+ * @note 任务上下文，异步提交；新连接默认明文，仅当前连接鉴权成功后加密。
  * @param pdata 数据缓冲区
  * @param len 数据长度
- * @return true: 发送成功, false: 失败
+ * @param timeout 兼容参数，不在此等待对端回复
+ * @return 1: SDK已受理, 0: 参数、连接或提交失败；不代表对端收到或解析成功
  */
 int ble_send_data(void *pdata, int len, uint32_t timeout);
+
+/* 无锁、非阻塞；任务及蓝牙回调可用，不在 ISR 调用。
+ * session_id 是连接代次，不是 SDK conn_id。鉴权结果只能改变原连接的状态。 */
+uint32_t ble_session_id(void);
+bool ble_session_is_current(uint32_t session_id);
+bool ble_session_is_encrypted(void);
+bool ble_session_set_encrypted(uint32_t session_id, bool encrypted);
+
+/* 任务上下文；鉴权帧始终原样提交，仅接收仍有效的连接代次。
+ * data 在调用期间借用；返回 1 仅表示 SDK 已受理，不代表对端业务确认。 */
+int ble_send_auth_data(uint32_t session_id, const uint8_t *data, int len);
 
 /**
  * @brief 获取当前连接的设备名称
@@ -197,12 +212,14 @@ bool ble_scanned_has_name(const char *name);
  */
 void ble_clear_scan_results(void);
 
-/// @brief 接收来自远程设备的数据
-/// @param data 
-/// @param max_len 
-/// @param wait_time 
-/// @return 
+/* 任务上下文；接收当前连接的报文，最多等待 wait_time ticks。
+ * data 由调用方持有，容量 max_len 字节；成功返回实际长度，失败返回 -1，超长不截断。 */
 int app_ble_recv_data_form_remote(uint8_t *data, int max_len, uint32_t wait_time);
+
+/* 任务上下文；最多等待 wait_time ticks，输出缓冲由调用方持有。
+ * 成功同时返回报文所属连接代次；旧连接、超长报文拒绝，返回 -1。 */
+int app_ble_recv_data_for_session(uint8_t *data, int max_len, uint32_t wait_time,
+                                  uint32_t *session_id);
 
 #ifdef __cplusplus
 }

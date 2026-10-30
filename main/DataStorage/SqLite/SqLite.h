@@ -66,6 +66,11 @@ extern "C"
                                const char *record_id);
 
     int QueryStructuredRecordBySeq(int seq_no, QueryResult *out_result);
+    /* 精确会话查询；不按 pushed 过滤。out_result 必须由调用方在堆上分配。
+     * seq_no=-1 查询本会话最大编号，其余值查询指定编号。0=找到，-1=无记录，
+     * -2=参数/数据库错误。任务上下文，内部持 DB 锁。 */
+    int QueryStructuredRecordBySession(const char *pn, const char *record_id,
+                                       int seq_no, QueryResult *out_result);
     int UpdateRecordPushState(int seq_no, bool pushed);
     int QueryUnpushedRecords(QueryResult *out_array, int max_count, int *out_count);
 

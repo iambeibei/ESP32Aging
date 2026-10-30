@@ -5,6 +5,12 @@ if(NOT CMAKE_BUILD_EARLY_EXPANSION AND NOT CONFIG_MESH_LITE_ENABLE)
         "See MESH_LITE_MIGRATION.md for the build command.")
 endif()
 
+if(NOT CMAKE_BUILD_EARLY_EXPANSION AND NOT CONFIG_MQTT_REPORT_DELETED_MESSAGES)
+    message(FATAL_ERROR
+        "MQTT event retry requires CONFIG_MQTT_REPORT_DELETED_MESSAGES=y. "
+        "Enable deleted-message events in the active SDKCONFIG and reconfigure.")
+endif()
+
 idf_component_register(SRCS "main.c"
                             "Communication/Uart/Uart.c"
                             "Communication/RS485/RS485.c"
@@ -14,6 +20,7 @@ idf_component_register(SRCS "main.c"
                             "Communication/Internet/dual_net/dual_net.c"
                             "Communication/Can/can_extended.c"
                             "Task/appTask.c"
+                            "Task/aging_gap.c"
                             "Task/service_urls.c"
                             "Tool/app_crc.c"
                             "Tool/app_enc.c"

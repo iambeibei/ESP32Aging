@@ -45,6 +45,7 @@
 #include "mesh_ota.h"
 #include "system_restart.h"
 #include "status_led.h"
+#include "aging_gap.h"
 
 #pragma region 全局状态与任务辅助
 
@@ -134,6 +135,8 @@ static int read_device_count = 0;           // 外接设备数量
 typedef struct
 {
     char pn[AGING_UPLOAD_PN_MAX_LEN];
+    char record_id[DB_RECORD_ID_MAX_LEN + 1];
+    uint32_t session_token;
     int current_step;
     int timestamp;
     uint8_t value_count;
@@ -208,6 +211,7 @@ static TaskHandle_t s_http_rx_task_handle = NULL;
 static TaskHandle_t s_aging_upload_task_handle = NULL;
 static TaskHandle_t s_button_task_handle = NULL;
 
+static atomic_bool s_sample_reading; /* 正常结束等待本次采样退出后才释放设备对象。 */
 static QueueHandle_t Upload_data_queue = NULL; // 上传数据队列
 
 AgingResumeState agingResumeState = {0}; // 定义全局老化恢复状态变量
@@ -347,12 +351,6 @@ static atomic_bool s_ble_abnormal_disconnect;
  */
 #define BLE_GATT_SETUP_TIMEOUT_MS 10000
 
-/*
- * 蓝牙老化会话的丢失数据列表：随老化任务创建/销毁。
- * 提为文件静态指针，使各退出路径（自删除式中止/完成）能统一释放；
- * 外部 vTaskDelete 路径的残留泄漏见设计文档「已知限制」。
- */
-static char *s_aging_lost_data_list = NULL;
 static uint32_t s_consecutive_data_read_failures = 0;
 static TickType_t s_last_data_read_error_report_tick = 0;
 static uint32_t s_consecutive_data_upload_failures = 0;
@@ -861,7 +859,7 @@ static void aging_state_publish(const char *aging_state)
     char *response = create_aging_state_json(time(NULL), aging_state);
     if (response)
     {
-        if (app_mqtt_publish("device/%s/event/state", response, DEVICE_ID) < 0)
+        if (app_mqtt_event_submit("device/%s/event/state", response, DEVICE_ID, MQTT_EVENT_REPORT_STATE) < 0)
         {
             storage_write_record_cyclic(current_log_pn(), "MQTT state Publish Failed");
         }
@@ -874,7 +872,7 @@ static void aging_state_publish_ProgramId(const char *ProgramId)
     char *response = create_aging_state_json_ProgramId(time(NULL), ProgramId);
     if (response)
     {
-        if (app_mqtt_publish("device/%s/event/state", response, DEVICE_ID) < 0)
+        if (app_mqtt_event_submit("device/%s/event/state", response, DEVICE_ID, MQTT_EVENT_REPORT_CONTEXT) < 0)
         {
             storage_write_record_cyclic(current_log_pn(), "MQTT state Publish Failed");
         }
@@ -887,7 +885,7 @@ static void aging_state_publish_StepId(const char *StepId)
     char *response = create_aging_state_json_StepId(time(NULL), StepId);
     if (response)
     {
-        if (app_mqtt_publish("device/%s/event/StepId", response, DEVICE_ID) < 0)
+        if (app_mqtt_event_submit("device/%s/event/StepId", response, DEVICE_ID, MQTT_EVENT_REPORT_CONTEXT) < 0)
         {
             storage_write_record_cyclic(current_log_pn(), "MQTT state Publish Failed");
         }
@@ -921,7 +919,7 @@ int publish_aging_stage(const char *aging_stage, const char *aging_number)
     }
 
     // 3. MQTT发布
-    int ret = app_mqtt_publish("device/public/agingStage", json_str, NULL);
+    int ret = app_mqtt_event_submit("device/public/agingStage", json_str, NULL, MQTT_EVENT_REPORT_CONTEXT);
     if (ret < 0)
     {
         storage_write_record_cyclic(current_log_pn(),
@@ -966,7 +964,7 @@ int publish_aging_complete(int is_complete, const char *aging_number)
     }
 
     // 3. MQTT发布
-    int ret = app_mqtt_publish("device/%s/event/TaskCP", json_str, DEVICE_ID);
+    int ret = app_mqtt_event_submit("device/%s/event/TaskCP", json_str, DEVICE_ID, MQTT_EVENT_REPORT_TASKCP);
     if (ret < 0)
     {
         storage_write_record_cyclic(current_log_pn(),
@@ -1002,7 +1000,7 @@ int publish_device_mode(int mode)
     }
 
     // 3. MQTT发布
-    int ret = app_mqtt_publish("device/public/deviceMode", json_str, NULL);
+    int ret = app_mqtt_event_submit("device/public/deviceMode", json_str, NULL, MQTT_EVENT_REPORT_CONTEXT);
     if (ret < 0)
     {
         storage_write_record_cyclic(current_log_pn(),
@@ -1717,8 +1715,6 @@ static int make_can_write_transfer_by_nameorid(Externaldevice *device,
 #pragma endregion
 
 #pragma region BLE连接与接收任务
-// 是否加密，暂时只有待老化设备(Modbus协议)
-bool IsEnc = false;
 /* 用于判断是否扫描完成：Bluedroid 扫描回调写、CPU1 老化任务读，需 volatile 保证可见性 */
 static volatile bool ScanComplete = false;
 /*
@@ -1794,137 +1790,129 @@ void ble_disconnect_cb(void)
 static int app_ble_recv_data_Ack(void *BleRecBuf1, int max_len, uint32_t wait_time)
 {
     uint8_t *BleRecBuf = (uint8_t *)BleRecBuf1;
-    int len = app_ble_recv_data_form_remote(BleRecBuf, max_len, wait_time);
+    uint32_t session_id;
+    int len = app_ble_recv_data_for_session(BleRecBuf, max_len, wait_time, &session_id);
     if (len > 0)
     {
         // 会话解密
 
-        if (IsEnc)
+        if (ble_session_is_encrypted())
         {
             uint8_t data[1024] = {0};
             uint16_t outLen = 0;
-            app_enc_process_Decrypt(BleRecBuf, len, data, &outLen);
+            if (app_enc_process_Decrypt(BleRecBuf, len, data, &outLen) != ESP_OK ||
+                outLen > max_len || !ble_session_is_current(session_id)) {
+                ESP_LOGE(TAG, "蓝牙解密失败或接收连接已失效");
+                return -1;
+            }
             memcpy(BleRecBuf, data, outLen);
             len = outLen;
             // 打印解密之后的数据
-            ESP_LOGI(TAG, "Decrypted BLE data: ");
-            for (int i = 0; i < len; i++)
-            {
-                printf("%02X ", data[i]);
-            }
+            ESP_LOGD(TAG, "蓝牙解密完成: session=%lu, bytes=%d", (unsigned long)session_id, len);
         }
     }
     return len;
 }
 
+/* 仅 ble_data 任务调用。鉴权阶段随接收包的连接代次复位，不能复用旧连接结果。 */
+static bool app_ble_process_auth(uint8_t *data, int len, uint32_t session_id)
+{
+    static uint32_t auth_session;
+    static bool auth_started, peer_key_ready, auth_complete;
+    if (!ble_session_is_current(session_id)) return true;
+    if (auth_session != session_id) {
+        auth_session = session_id;
+        auth_started = peer_key_ready = auth_complete = false;
+    }
+    if (len < 2) return false;
+
+    if (data[0] == '*' && data[1] == '*') {
+        if (len == 10) {
+            if (!ble_session_set_encrypted(session_id, false)) return true;
+            auth_started = peer_key_ready = auth_complete = false;
+            uint8_t reply[10];
+            RandomSendPKey();
+            if (app_enc_process_data(data, len, reply) == ESP_OK &&
+                ble_send_auth_data(session_id, reply, sizeof(reply)) == 1) {
+                auth_started = true;
+                ESP_LOGI(TAG, "蓝牙鉴权首包已回复: session=%lu", (unsigned long)session_id);
+            } else {
+                ESP_LOGE(TAG, "蓝牙鉴权首包处理失败: session=%lu", (unsigned long)session_id);
+            }
+        } else if (len == 7 && auth_started && data[4] != 0) {
+            auth_started = peer_key_ready = false;
+            ESP_LOGE(TAG, "蓝牙对端拒绝鉴权: session=%lu", (unsigned long)session_id);
+            ble_disconnect();
+        }
+        return true;
+    }
+
+    if (data[0] == 0 && data[1] == 0x86) {
+        if (len != 146 || !auth_started || auth_complete) {
+            ESP_LOGW(TAG, "忽略非当前鉴权阶段的公钥包: session=%lu", (unsigned long)session_id);
+            return true;
+        }
+        uint8_t reply[146];
+        peer_key_ready = false;
+        if (app_enc_process_data4(data, len, reply) == ESP_OK &&
+            ble_send_auth_data(session_id, reply, sizeof(reply)) == 1) {
+            peer_key_ready = true;
+        } else {
+            ESP_LOGE(TAG, "蓝牙公钥鉴权处理失败: session=%lu", (unsigned long)session_id);
+        }
+        return true;
+    }
+
+    if (data[0] == 0 && len == 18) {
+        /* 无本连接首包/公钥的孤立结果包不能启用加密；重复最终包不重复派生密钥。 */
+        if (!auth_started || !peer_key_ready || auth_complete) {
+            ESP_LOGW(TAG, "忽略非当前鉴权阶段的结果包: session=%lu", (unsigned long)session_id);
+            return true;
+        }
+        uint8_t reply[2];
+        peer_key_ready = false;
+        if (app_enc_process_data6(data, len, reply) == ESP_OK &&
+            ble_send_auth_data(session_id, reply, sizeof(reply)) == 1 &&
+            ble_session_set_encrypted(session_id, true)) {
+            auth_complete = true;
+            ESP_LOGI(TAG, "蓝牙当前连接鉴权成功，启用加密: session=%lu", (unsigned long)session_id);
+            /* 保留原 UART0 成功通知，避免改变外部兼容行为。 */
+            if (app_write_UART_data(reply, sizeof(reply), pdMS_TO_TICKS(250)) != sizeof(reply))
+                ESP_LOGW(TAG, "蓝牙鉴权成功通知 UART 写入失败");
+        } else {
+            ESP_LOGE(TAG, "蓝牙最终鉴权或确认提交失败，未启用加密: session=%lu",
+                     (unsigned long)session_id);
+        }
+        return true; /* 鉴权结果不能继续进入普通业务解密。 */
+    }
+    return false;
+}
+
 void app_ble_data_handle(void *arg)
 {
     uint8_t BleRecBuf[1024] = {0};
-    uint8_t flag_one = 1;
     while (1)
     {
-        // BleRecBuf数据先清0
-        // memset(BleRecBuf, 0, sizeof(BleRecBuf));
-        int len = app_ble_recv_data_form_remote(BleRecBuf, sizeof(BleRecBuf), portMAX_DELAY);
+        uint32_t session_id;
+        int len = app_ble_recv_data_for_session(BleRecBuf, sizeof(BleRecBuf), portMAX_DELAY, &session_id);
         if (len > 0)
         {
-            // printData(BleRecBuf,len,"------------Get Ble Data-------------");
-            bool needSendToUart = true;
-            // 认证鉴权信息
-            if ((BleRecBuf[0] == '*') && (BleRecBuf[1] == '*')) // 鉴权数据
-            {
-                if (len == 10)
-                {
-                    ESP_LOGI(TAG, "01 Pack Recive............");
-                    IsEnc = false;
-                    uint8_t resend[10];
-                    // if (RandomSendPKey() != ESP_OK)
-                    // {
-                    //     ESP_LOGE(TAG, "Failed to initialize ECDH handshake");
-                    //     ble_disconnect();
-                    //     continue;
-                    // }
-                    RandomSendPKey();
-                    if (app_enc_process_data(BleRecBuf, len, resend) == ESP_OK)
-                    {
-                        if (ble_send_data(resend, 10, 0) != 1)
-                        {
-                            ESP_LOGE(TAG, "Failed to re Ble data (len: %d)", 10);
-                        }
-                        else
-                        {
-                            ESP_LOGI(TAG, "02 Pack ReSend............");
-                        }
-                    }
-                }
-                if (len == 7)
-                {
-                    ESP_LOGI(TAG, "03 Pack Recive............");
-                    if (BleRecBuf[0] != '*' || BleRecBuf[1] != '*' || BleRecBuf[4] != 0)
-                    {
-                        ESP_LOGI(TAG, "03 Pack Fail.....");
-                        // 断开连接
-                        ble_disconnect();
-                    }
-                    else
-                    {
-                        // app_write_UART_data((uint8_t *)BleRecBuf, len, pdMS_TO_TICKS(250)); // 验证是否成功，发送鉴权数据
-                    }
-                }
-                needSendToUart = false;
-            }
-
-            // 认证鉴权信息2
-            if ((BleRecBuf[0] == 0) && (BleRecBuf[1] == 0x86) && flag_one) // 鉴权数据
-            {
-                flag_one = 0;
-                ESP_LOGI(TAG, "04 Pack Recive............");
-                uint8_t resend[146];
-                if (app_enc_process_data4(BleRecBuf, len, resend) == ESP_OK) // 可能出问题
-                {
-                    ESP_LOGI(TAG, "05 Pack ReSending............");
-                    if (ble_send_data(resend, sizeof(resend), 0) != 1)
-                    {
-                        ESP_LOGE(TAG, "Failed to re Ble data (len: %d) forword to ble", len);
-                    }
-                    else
-                    {
-                        flag_one = 1;
-                        // app_write_UART_data((uint8_t *)resend, sizeof(resend), pdMS_TO_TICKS(250)); // 验证是否成功，发送鉴权数据
-                    }
-                }
-                needSendToUart = false;
-            }
-
-            if ((BleRecBuf[0] == 0) && (len == 18)) // 鉴权最终结果
-            {
-                ESP_LOGI(TAG, "06 Pack Recive............");
-                uint8_t resend[2];
-                if (app_enc_process_data6(BleRecBuf, len, resend) == ESP_OK)
-                {
-                    if (ble_send_data(resend, sizeof(resend), 0) != 1)
-                    {
-                        ESP_LOGE(TAG, "Failed to re Ble data (len: %d) forword to ble", len);
-                    }
-                    else
-                    {
-                        app_write_UART_data((uint8_t *)resend, sizeof(resend), pdMS_TO_TICKS(250)); // 验证是否成功，发送鉴权数据
-                    }
-                }
-                IsEnc = true;
-                needSendToUart = false;
-            }
+            if (app_ble_process_auth(BleRecBuf, len, session_id)) continue;
             // 会话解密
-            if (IsEnc)
+            if (ble_session_is_encrypted())
             {
                 uint8_t data[1024] = {0};
                 uint16_t outLen = 0;
-                app_enc_process_Decrypt(BleRecBuf, len, data, &outLen);
+                if (app_enc_process_Decrypt(BleRecBuf, len, data, &outLen) != ESP_OK ||
+                    outLen > sizeof(BleRecBuf)) {
+                    ESP_LOGE(TAG, "蓝牙业务报文解密失败");
+                    continue;
+                }
                 memcpy(BleRecBuf, data, outLen);
                 len = outLen;
             }
 
-            if (needSendToUart)
+            if (ble_session_is_current(session_id))
             {
                 if (app_write_UART_data((uint8_t *)BleRecBuf, len, pdMS_TO_TICKS(250)) != len)
                 {
@@ -2169,8 +2157,15 @@ static void app_HTTP_Rdata_handle(void *arg)
 static void app_HTTP_Auto_GetProtocol(void *arg)
 {
     uint8_t checkflag = 0;
+    TickType_t next_protocol_poll = xTaskGetTickCount();
     while (1)
     {
+        aging_gap_poll();
+        TickType_t now = xTaskGetTickCount();
+        if ((int32_t)(now - next_protocol_poll) < 0) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
         for (int i = 0; i < read_device_count; i++)
         {
             if (read_devices[i].ProtoID != 0 && read_devices[i].HaveProtocol == false) // 非老化设备的协议获取
@@ -2186,6 +2181,7 @@ static void app_HTTP_Auto_GetProtocol(void *arg)
                     read_devices[i].LastProtoID = read_devices[i].ProtoID;
                 }
             }
+            aging_gap_poll();
             vTaskDelay(pdMS_TO_TICKS(1000)); // 每秒检查一次
         }
         if (checkflag == 1)
@@ -2206,7 +2202,7 @@ static void app_HTTP_Auto_GetProtocol(void *arg)
                     (void)snprintf(warn_json, sizeof(warn_json),
                                    "{\"Seq\":%lld,\"Data\":{\"Code\":1001,\"Msg\":\"Failed to ExDevice_Check online and protocol match\"}}",
                                    (long long)time(NULL));
-                    if (app_mqtt_publish("device/%s/event/warn", warn_json, DEVICE_ID) < 0)
+                    if (app_mqtt_event_submit("device/%s/event/warn", warn_json, DEVICE_ID, MQTT_EVENT_REPORT_WARN) < 0)
                     {
                         storage_write_record_cyclic(current_log_pn(), "MQTT AgingStartCheck Error Publish Failed");
                     }
@@ -2217,7 +2213,8 @@ static void app_HTTP_Auto_GetProtocol(void *arg)
             }
             checkflag = 0;
         }
-        vTaskDelay(pdMS_TO_TICKS(4000)); // 每秒检查一次
+        next_protocol_poll = xTaskGetTickCount() + pdMS_TO_TICKS(4000);
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 #pragma endregion
@@ -2270,11 +2267,14 @@ static void clear_ready_pn_runtime(void)
 
 static void clear_aging_command_runtime(void)
 {
+    aging_gap_session_close();
+    app_mqtt_event_cancel_taskcp();
     s_aging_cmd_state = AGING_CMD_IDLE;
     s_pending_start_seq = 0;
     memset(PN_Code, 0, sizeof(PN_Code));
     memset(&s_ble_target_current, 0, sizeof(s_ble_target_current));
     clear_ready_pn_runtime();
+    aging_gap_idle();
 }
 
 static void persist_pending_start_state(bool pending, int start_seq)
@@ -2459,6 +2459,8 @@ static bool start_aging_with_ready_pn(const char *aging_json, int start_seq)
         return false;
     }
 
+    /* 新会话令旧 TaskCP 失效；线上报文保持原协议。 */
+    app_mqtt_event_cancel_taskcp();
     /* 新任务不能继承上一次运行时的恢复游标。 */
     memset(&agingResumeState, 0, sizeof(agingResumeState));
 
@@ -2730,13 +2732,13 @@ static void mqtt_seq_record_reply(int seq, const char *suffix, const char *paylo
 
 /*
  * pushed 三态（DB 列语义，与 SqLite.h 注释一致）：
- *   0 pending   待发，补传 worker 的扫描对象；
- *   1 inflight  已交 SDK 等 PUBACK，重启时统一复位为 pending；
- *   2 acked     broker 已确认，不再重传。
+ *   0 pending   待发，服务器缺号补查不依赖本地标记；
+ *   1 inflight  已交SDK等PUBACK；结束补查按服务器缺号取数，不依赖状态复位；
+ *   2 acked     broker已确认；服务器仍有缺号时允许补发。
  *
  * 跨任务边界（关键）：app_mqtt_publish_settled 在 SDK MQTT 任务上下文被
- * 调用，只把 (msg_id, acked) 非阻塞入队；追踪表与 DB 更新全部留在
- * mqtt_rx（单写者，无需同步原语）。绝不在 SDK 回调里写 SQLite——
+ * 调用，只把(msg_id, acked)非阻塞入队；DB结算留在mqtt_rx。
+ * 此追踪仅辅助标记，采样完整性由服务器缺号查询确认。绝不在SDK回调写SQLite——
  * journal_mode=DELETE + synchronous=FULL 的提交会 fsync，阻塞 SDK 任务。
  */
 enum
@@ -3081,10 +3083,10 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                     aging_state_publish_ProgramId(programId->valuestring);
 
                     cJSON *recordId = cJSON_GetObjectItem(pRoot, "RecordId");
+                    /* 缺失身份不能继承上一轮。 */
+                    memset(RecordId, 0, sizeof(RecordId));
                     if (cJSON_IsString(recordId) && recordId->valuestring != NULL)
                     {
-                        // 清空RecordId
-                        memset(RecordId, 0, sizeof(RecordId));
                         strncpy(RecordId, recordId->valuestring, sizeof(RecordId) - 1);
                         RecordId[sizeof(RecordId) - 1] = '\0';
                         // 存nvs
@@ -3093,6 +3095,12 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                         {
                             local_error_log("Write RecordId failed, error=%s", esp_err_to_name(ret));
                         }
+                    }
+                    else
+                    {
+                        local_error_log("老化命令缺少RecordId，本轮不能自动补查缺口");
+                        if (SelfRecovery_Write_str("RecordId", "") != ESP_OK)
+                            local_error_log("清除旧RecordId失败");
                     }
 
                     start_aging_with_ready_pn(packet_copy, start_seq);
@@ -3108,6 +3116,8 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                     goto cleanup;
                 }
 
+                app_mqtt_event_cancel_taskcp();
+                aging_gap_session_close();
                 if (Aging_test_task_handle != NULL)
                 {
                     vTaskDelete(Aging_test_task_handle);
@@ -3117,6 +3127,7 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                 {
                     vTaskDelete(AgingData_task_handle);
                     AgingData_task_handle = NULL;
+                    atomic_store(&s_sample_reading, false);
                 }
                 if (ble_is_connected())
                 {
@@ -3326,6 +3337,7 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                 if (cJSON_IsNumber(NextStep))
                 {
                     Cannextstep = (uint8_t)NextStep->valueint;
+                    if (Cannextstep != 0) app_mqtt_event_cancel_taskcp();
                 }
                 device_response_publish_point(Seq->valueint, 1, "CanNextstep set");
             }
@@ -3545,18 +3557,6 @@ void Init_ByNetwork_Flag(void *arg)
             }
 
             /*
-             * 断线补传 worker：与 mqtt_rx 同条件创建（MQTT 客户端就绪后）。
-             * 优先级 4 低于 mqtt_rx(7)，不抢占命令接收；扫描由上线完成
-             * （MQTT_SETUP_DONE）唤醒，60 秒兜底。
-             */
-            if (app_create_mqtt_backfill_task() != pdPASS)
-            {
-                storage_write_record_cyclic(current_log_pn(), "Failed to create MQTT backfill task");
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                continue;
-            }
-
-            /*
              * SQLite 重置延迟上报：SqLite_Init 远早于 MQTT 建立，重置结果
              * （sqlite_mount_fail/db_rebuilt/rebuild_fail）写入了 NVS 标志。
              * 此处 MQTT 已就绪，读取并上报后清除——保证"缓存已丢"对服务器
@@ -3579,7 +3579,7 @@ void Init_ByNetwork_Flag(void *arg)
                 (void)snprintf(warn_json, sizeof(warn_json),
                                "{\"Seq\":%lld,\"Data\":{\"Code\":1002,\"Msg\":\"SQLite cache reset: %s\"}}",
                                (long long)time(NULL), sqlite_reset_flag);
-                if (app_mqtt_publish("device/%s/event/warn", warn_json, DEVICE_ID) < 0)
+                if (app_mqtt_event_submit("device/%s/event/warn", warn_json, DEVICE_ID, MQTT_EVENT_REPORT_WARN) < 0)
                 {
                     storage_write_record_cyclic(current_log_pn(), "SQLite reset warn publish failed");
                 }
@@ -4277,7 +4277,7 @@ static bool Data_Get_Method(Externaldevice *device, const char *idorname, uint8_
 #pragma region 老化指令与工艺执行
 
 // 最后验证时使用
-int s_idnum_index = 0;
+
 
 static bool WaitAgingDeviceProtocolReady(uint32_t timeout_ms)
 {
@@ -4354,6 +4354,7 @@ static bool aging_command_json_parse(const char *packet_copy)
         return false;
     }
 
+    aging_gap_session_close();
     agingState = AgingIdle;
     agingDataAMode = IdleState;
 
@@ -4366,8 +4367,15 @@ static bool aging_command_json_parse(const char *packet_copy)
     {
         vTaskDelete(AgingData_task_handle);
         AgingData_task_handle = NULL;
+        atomic_store(&s_sample_reading, false);
+    }
+    if (!aging_gap_session_begin(PN_Code, RecordId, agingResumeState.aging_valid == 1)) {
+        aging_error_log("老化采样会话初始化失败");
+        return false;
     }
     if (ble_control_resume() != ESP_OK) {
+        aging_gap_session_close();
+        aging_gap_idle();
         aging_error_log("旧蓝牙连接请求尚未结束，请重试启动老化");
         return false;
     }
@@ -4517,6 +4525,7 @@ static bool aging_command_json_parse(const char *packet_copy)
     return true;
 
 start_failed:
+    aging_gap_session_close();
     agingState = AgingIdle;
     agingDataAMode = IdleState;
     AgingDevice_RuntimeFree();
@@ -4528,6 +4537,7 @@ start_failed:
     }
     spiffs_file_delete("Aging.json");
     app_memory_log("aging_start_failed");
+    aging_gap_idle();
     return false;
 }
 // 老化步骤开始前/结束后执行动作列表，并记录每个失败动作。
@@ -4673,6 +4683,8 @@ static bool aging_ble_link_lost_pending(void)
 
 static void Aging_Task_Abort_Cleanup(void)
 {
+    aging_gap_session_close();
+    app_mqtt_event_cancel_taskcp();
     agingState = AgingIdle;
     agingDataAMode = IdleState;
 
@@ -4683,6 +4695,7 @@ static void Aging_Task_Abort_Cleanup(void)
     {
         vTaskDelete(AgingData_task_handle);
         AgingData_task_handle = NULL;
+        atomic_store(&s_sample_reading, false);
     }
 
     if (ble_is_connected())
@@ -4732,12 +4745,6 @@ static void Aging_Task_Abort_And_Delete(void)
     s_consecutive_data_upload_failures = 0;
     s_last_data_upload_error_report_tick = 0;
     Aging_test_task_handle = NULL;
-    /* 自删除前释放本任务持有的丢失数据列表（任务删除不回收堆块）。 */
-    if (s_aging_lost_data_list != NULL)
-    {
-        free(s_aging_lost_data_list);
-        s_aging_lost_data_list = NULL;
-    }
     vTaskDelete(NULL); // 删除当前任务
 }
 
@@ -4748,15 +4755,6 @@ void Aging_Test_Task(void *arg)
 
     /* 新会话开始：丢弃上一个会话遗留的 BLE 断开事件，避免误中止本次老化。 */
     atomic_store(&s_ble_abnormal_disconnect, false);
-
-    s_aging_lost_data_list = (char *)app_malloc_prefer_psram(1024);
-    if (s_aging_lost_data_list == NULL)
-    {
-        aging_error_log("Aging lost-data list allocation failed; aborting aging session");
-        aging_state_publish("agingError");
-        Aging_Task_Abort_And_Delete();
-        return;
-    }
 
     while (1)
     {
@@ -5159,6 +5157,7 @@ void Aging_Test_Task(void *arg)
                 printf("Aging cycle %d started\n", c + 1);
                 for (; i < agingcfg.step_count; i++)
                 {
+                    app_mqtt_event_cancel_taskcp(); /* 新工步令旧完成通知失效。 */
                     AgingStep *current_step = &agingcfg.steps[i];
                     const char *method = current_step->method != NULL ? current_step->method : "unknown";
                     const char *StepId = current_step->StepId != NULL ? current_step->StepId : "unknown";
@@ -5352,7 +5351,10 @@ void Aging_Test_Task(void *arg)
                     {
                         agingDataAMode = IdleState; // 群控模式下，老化步骤完成后，先把老化状态置为IdleState，等待上位机服务下发下一步任务
                         // 往上位机服务发送任务已完成，等待上位机服务下发下一步任务，得等所有节点都完成
-                        publish_aging_complete(1, AgingNumber);
+                        if (publish_aging_complete(1, AgingNumber) < 0)
+                        {
+                            local_error_log("群控步骤完成通知缓存失败");
+                        }
                         while (Cannextstep == 0)
                         {
                             /* 群控等待上位机下一步指令可能长时间挂起：循环内检查 BLE 断开。 */
@@ -5366,6 +5368,7 @@ void Aging_Test_Task(void *arg)
                             vTaskDelay(pdMS_TO_TICKS(10000));
                         }
                         Cannextstep = 0;
+                        app_mqtt_event_cancel_taskcp();
                     }
                 }
                 i = 0; // 循环次数大于1时，重置步骤索引
@@ -5377,123 +5380,16 @@ void Aging_Test_Task(void *arg)
         }
         case AgingDataCheck:
         {
-            int skipped_records = 0;
-            while (QueryLatestRecordByPNAndPushState(PN_Code, false, g_db1_result) == 0)
-            {
-                /* 历史数据补发轮询：循环内检查 BLE 断开。 */
-                if (aging_ble_link_lost_pending())
-                {
-                    aging_error_log("Bluetooth aging link lost abnormally during data check; abort aging session without restart");
-                    aging_state_publish("agingError");
-                    Aging_Task_Abort_And_Delete();
-                    return;
-                }
-
-                /*
-                 * 坏记录隔离（v7 轮次身份）：
-                 *  - record_id 为空：schema 迁移前的历史记录，无法归属老化轮次，
-                 *    补发会把旧数据挂到当前会话上（串批）；
-                 *  - json_data 为空：value_data 无法重构上报 JSON。
-                 * 两类记录都必须标记后跳过——不更新 pushed 会因 while 反复
-                 * 取到同一条记录而死循环（空 json_data 路径改造前即可死循环）。
-                 */
-                if (g_db1_result->record_id[0] == '\0' || g_db1_result->json_data[0] == '\0')
-                {
-                    ESP_LOGE(TAG,
-                             "Aging backfill record dropped (unattributable): PN=%s seq_no=%d record_id_empty=%d json_empty=%d",
-                             PN_Code,
-                             g_db1_result->seq_no,
-                             g_db1_result->record_id[0] == '\0' ? 1 : 0,
-                             g_db1_result->json_data[0] == '\0' ? 1 : 0);
-                    storage_write_record_cyclic(current_log_pn(),
-                                                "Aging backfill record dropped: unattributable legacy/invalid record");
-                    /* 置 acked 退休：不再重试、不再进补传扫描。 */
-                    (void)UpdateRecordPushStateByPNAndID(PN_Code,
-                                                         g_db1_result->record_id,
-                                                         g_db1_result->seq_no,
-                                                         PUSH_STATE_ACKED);
-                    skipped_records++;
-                    vTaskDelay(pdMS_TO_TICKS(100));
-                    continue;
-                }
-
-                int publish_id = app_mqtt_publish("device/%s/data/aging", g_db1_result->json_data, DEVICE_ID);
-                if (publish_id > 0)
-                {
-                    (void)UpdateRecordPushStateByPNAndID(PN_Code,
-                                                         g_db1_result->record_id,
-                                                         g_db1_result->seq_no,
-                                                         PUSH_STATE_INFLIGHT);
-                    mqtt_publish_track(publish_id, PN_Code, g_db1_result->record_id, g_db1_result->seq_no);
-                }
-                else
-                {
-                    aging_error_log("Historical aging-data retransmission failed, seq_no=%d",
-                                    g_db1_result->seq_no);
-                    break;
-                }
-                vTaskDelay(pdMS_TO_TICKS(100));
-            }
-
-            /*
-             * 跳过的历史记录对服务端即"数据缺口"，发一条 warn 让其知晓
-             * （标准 JSON 格式，与服务端 DeviceEventHandler 兼容）。
-             */
-            if (skipped_records > 0)
-            {
-                char warn_json[192];
-                (void)snprintf(warn_json, sizeof(warn_json),
-                               "{\"Seq\":%lld,\"Data\":{\"Code\":1003,\"Msg\":\"%d aging records skipped: missing RecordId or invalid JSON\"}}",
-                               (long long)time(NULL), skipped_records);
-                if (app_mqtt_publish("device/%s/event/warn", warn_json, DEVICE_ID) < 0)
-                {
-                    storage_write_record_cyclic(current_log_pn(), "Skipped records warn publish failed");
-                }
-                ESP_LOGW(TAG, "Aging backfill skipped %d unattributable record(s)", skipped_records);
-            }
-            // 清空数据
-            memset(s_aging_lost_data_list, 0, 1024);
-            esp_err_t ret = test_http_post_record_query(time(NULL), s_idnum_index, RecordId, s_aging_lost_data_list, 1024);
-            if (ret == ESP_OK)
-            {
-                int count = 0;
-                int *ids = parse_ids_array(s_aging_lost_data_list, &count);
-                if (ids != NULL && count > 0)
-                {
-                    // printf("Parsed %d IDs:\n", count);
-                    for (int i = 0; i < count; i++)
-                    {
-                        printf("ids[%d] = %d\n", i, ids[i]);
-                        query_db1_to_global(ids[i]);
-                        /* 坏记录隔离（v7）：无 RecordId 的历史记录不可补发。 */
-                        if (g_db1_result != NULL && g_db1_result->record_id[0] != '\0' && g_db1_result->json_data[0] != '\0')
-                        {
-                            int publish_id = app_mqtt_publish("device/%s/data/aging", g_db1_result->json_data, DEVICE_ID);
-                            if (publish_id > 0)
-                            {
-                                (void)UpdateRecordPushStateByPNAndID(g_db1_result->PN,
-                                                                     g_db1_result->record_id,
-                                                                     g_db1_result->seq_no,
-                                                                     PUSH_STATE_INFLIGHT);
-                                mqtt_publish_track(publish_id, g_db1_result->PN,
-                                                   g_db1_result->record_id, g_db1_result->seq_no);
-                            }
-                        }
-                        else
-                        {
-                            ESP_LOGW(TAG, "HTTP gap backfill skipped seq_no=%d (unattributable)", ids[i]);
-                        }
-                        vTaskDelay(pdMS_TO_TICKS(1000));
-                    }
-                    free(ids);
-                }
-            }
-
+            /* 先结束采样入口；队尾全部处理后才冻结最后IDNUM并登记补查。 */
+            agingDataAMode = IdleState;
+            aging_gap_session_close();
+            if (atomic_load(&s_sample_reading)) break;
             agingState = AgingComplete;
             break;
         }
         case AgingComplete:
         {
+            app_mqtt_event_cancel_taskcp();
 
             agingState = AgingIdle;
             agingDataAMode = IdleState;
@@ -5546,13 +5442,8 @@ void Aging_Test_Task(void *arg)
             memset(PN_Code, 0, sizeof(PN_Code));
             memset(&s_ble_target_current, 0, sizeof(s_ble_target_current));
             clear_ready_pn_runtime();
+            aging_gap_idle();
             Aging_test_task_handle = NULL;
-            /* 自删除前释放本任务持有的丢失数据列表（任务删除不回收堆块）。 */
-            if (s_aging_lost_data_list != NULL)
-            {
-                free(s_aging_lost_data_list);
-                s_aging_lost_data_list = NULL;
-            }
             vTaskDelete(NULL);
             return;
         }
@@ -5681,7 +5572,9 @@ static int ProcessAgingStepData(AgingUploadPacket *packet)
     }
 
     memset(packet, 0, sizeof(*packet));
-    snprintf(packet->pn, sizeof(packet->pn), "%s", PN_Code);
+    packet->session_token = aging_gap_sample_snapshot(packet->pn, sizeof(packet->pn),
+                                                       packet->record_id, sizeof(packet->record_id));
+    if (packet->session_token == 0) return -1;
     packet->current_step = CurrentAgingStep;
     packet->timestamp = (int)time(NULL);
 
@@ -5835,6 +5728,7 @@ void app_AgingData_Get_handle(void *arg)
     {
         if (agingDataAMode != IdleState)
         {
+            atomic_store(&s_sample_reading, true);
             AgingUploadPacket *packet = (AgingUploadPacket *)app_calloc_prefer_psram(1, sizeof(AgingUploadPacket));
             if (packet == NULL)
             {
@@ -5845,9 +5739,9 @@ void app_AgingData_Get_handle(void *arg)
                 int sample_count = ProcessAgingStepData(packet);
                 if (sample_count > 0 && packet->value_json != NULL)
                 {
-                    if (xQueueSend(Upload_data_queue, &packet, pdMS_TO_TICKS(50)) != pdTRUE)
+                    if (!aging_gap_sample_submit(packet->session_token, Upload_data_queue, &packet))
                     {
-                        aging_error_log("Aging upload-data queue is full; current sample was dropped");
+                        aging_error_log("采样队列已满或会话已关闭，本次采样未提交");
                         AgingUploadPacket_Free(packet);
                     }
                 }
@@ -5859,304 +5753,51 @@ void app_AgingData_Get_handle(void *arg)
             }
         }
 
+        atomic_store(&s_sample_reading, false);
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
 
-static void app_DataUpload_Functiong(const AgingUploadPacket *packet, int idnum)
+static bool app_DataUpload_Functiong(const AgingUploadPacket *packet, int idnum)
 {
-    if (packet == NULL || packet->value_json == NULL)
-    {
-        return;
+    if (packet == NULL || packet->value_json == NULL) return false;
+    /* 无论是否联网，先用采样时固化的会话身份落库。 */
+    int db_ret = InsertStructuredRecord(idnum, packet->pn, packet->current_step,
+        packet->timestamp, false, packet->value_json, packet->record_id);
+    if (db_ret != 0) {
+        aging_error_log("采样落库失败，PN=%s RecordId=%s IDNUM=%d",
+                        packet->pn, packet->record_id, idnum);
     }
-
-    char *publish_string = create_sensor_json(idnum,
-                                              packet->pn,
-                                              packet->current_step,
-                                              packet->timestamp,
-                                              packet->value_json);
-    if (publish_string == NULL)
-    {
-        aging_error_log("Create aging-data report JSON failed, id=%d, step=%d",
-                        idnum,
-                        packet->current_step);
-        return;
+    char *publish_string = create_sensor_json(idnum, packet->pn, packet->current_step,
+        packet->timestamp, packet->value_json, packet->record_id);
+    if (publish_string == NULL) {
+        aging_error_log("采样报文序列化失败，保留已入库数据，IDNUM=%d", idnum);
+        return db_ret == 0;
     }
-
-    /*
-     * 掉电可靠性策略：先落SQLite，再发MQTT。
-     *
-     * 1) 先以 pushed=0 提交数据库；
-     * 2) 再尝试 MQTT；
-     * 3) MQTT publish 被客户端接受后更新 pushed=1。
-     *
-     * 如果步骤2/3之间突然断电，SQLite仍保留 pushed=0，重启后最多重复补发一次，
-     * 不会出现“MQTT刚发出但SQLite还没来得及保存”的本地数据丢失窗口。
-     */
-    int db_ret = InsertStructuredRecord(idnum,
-                                        packet->pn,
-                                        packet->current_step,
-                                        packet->timestamp,
-                                        false,
-                                        packet->value_json,
-                                        RecordId);
-
-    if (db_ret != 0)
-    {
-        aging_error_log("Persist aging data to SQLite failed before MQTT, id=%d, step=%d, PN=%s",
-                        idnum,
-                        packet->current_step,
-                        packet->pn);
+    int publish_id = Network_Flag ? app_mqtt_publish("device/%s/data/aging", publish_string, DEVICE_ID) : -1;
+    if (publish_id > 0 && db_ret == 0) {
+        if (UpdateRecordPushStateByPNAndID(packet->pn, packet->record_id, idnum, PUSH_STATE_INFLIGHT) != 0)
+            aging_error_log("采样已交MQTT但状态更新失败，IDNUM=%d", idnum);
+        mqtt_publish_track(publish_id, packet->pn, packet->record_id, idnum);
     }
-    else
-    {
-        ESP_LOGI(TAG, "Aging data persisted before MQTT, id=%d, pushed=0, value_count=%u",
-                 idnum,
-                 (unsigned)packet->value_count);
-    }
-
-    int publish_id = Network_Flag ? app_mqtt_publish("device/%s/data/aging",
-                                                     publish_string,
-                                                     DEVICE_ID)
-                                  : -1;
-    bool upload_success = publish_id > 0;
-
-    if (upload_success && db_ret == 0)
-    {
-        if (UpdateRecordPushStateByPNAndID(packet->pn, RecordId, idnum, PUSH_STATE_INFLIGHT) != 0)
-        {
-            /*
-             * MQTT已提交但状态更新失败时保持 pushed=0 更安全。
-             * 后续可能重复补发，但不会静默丢数据。
-             */
-            aging_error_log("MQTT submitted but SQLite pushed-state update failed, id=%d, PN=%s",
-                            idnum,
-                            packet->pn);
-        }
-
-        /*
-         * 登记 msg_id ↔ 记录身份：任一 PUBACK 到达即证明已送达（结算为
-         * acked）；DELETED（outbox 淘汰/过期）回滚为 pending 等补传。
-         * 即使上面的状态更新失败也登记——记录此时是 pending，补传会
-         * 重发，而首个 PUBACK 同样能把它结算为 acked。
-         */
-        mqtt_publish_track(publish_id, packet->pn, RecordId, idnum);
-    }
-
-    aging_data_upload_result(upload_success, idnum);
-    s_idnum_index = idnum;
+    aging_data_upload_result(publish_id > 0, idnum);
     free(publish_string);
+    return db_ret == 0;
 }
 
 // 老化数据上传任务
 void app_AgingData_Upload_handle(void *arg)
 {
-    int idnum = 0;
-    char active_pn[AGING_UPLOAD_PN_MAX_LEN] = {0};
-
     while (1)
     {
         AgingUploadPacket *packet = NULL;
-        if (xQueueReceive(Upload_data_queue, &packet, portMAX_DELAY) != pdTRUE || packet == NULL)
-        {
-            continue;
-        }
-
-        /*
-         * 每个PN独立维护IDNUM。
-         * 掉电恢复时，第一包数据到来后从SQLite查询该PN最后一个IDNUM并继续 +1。
-         * 正常新PN则从0开始。
-         */
-        if (strncmp(active_pn, packet->pn, sizeof(active_pn)) != 0)
-        {
-            snprintf(active_pn, sizeof(active_pn), "%s", packet->pn);
-            idnum = 0;
-
-            if (agingResumeState.aging_valid == 1)
-            {
-                QueryResult *resume_record = (QueryResult *)app_malloc_prefer_psram(sizeof(QueryResult));
-                if (QueryStructuredRecordLatestByPN(packet->pn, resume_record) == 0)
-                {
-                    idnum = resume_record->seq_no + 1;
-                    ESP_LOGI(TAG, "Resume aging upload from SQLite: PN=%s, last_id=%d, next_id=%d", packet->pn, resume_record->seq_no, idnum);
-                }
-                else
-                {
-                    ESP_LOGW(TAG,
-                             "No SQLite history found for resumed PN=%s; IDNUM starts from 0",
-                             packet->pn);
-                }
-                free(resume_record);
-            }
-            else
-            {
-                ESP_LOGI(TAG, "New aging upload session: PN=%s, IDNUM starts from 0", packet->pn);
-            }
-        }
-
-        app_DataUpload_Functiong(packet, idnum);
-        idnum++;
+        if (xQueueReceive(Upload_data_queue, &packet, portMAX_DELAY) != pdTRUE || packet == NULL) continue;
+        int idnum = aging_gap_sample_next_id(packet->session_token);
+        bool persisted = false;
+        if (idnum >= 0) persisted = app_DataUpload_Functiong(packet, idnum);
+        else aging_error_log("采样会话或编号无效，PN=%s RecordId=%s", packet->pn, packet->record_id);
+        aging_gap_sample_done(packet->session_token, persisted);
         AgingUploadPacket_Free(packet);
-    }
-}
-
-#pragma endregion
-
-#pragma region 断线补传
-
-/* -------------------------------------------------------------------------- */
-/* 断线补传 worker（v7）                                                        */
-/* -------------------------------------------------------------------------- */
-
-/*
- * 存在的理由：QueryUnpushedRecords 长期无调用者，断线/中止/换 PN 后滞留的
- * pushed=0 记录只能等下次老化结束的 AgingDataCheck（且只补当前 PN）。
- * Broker 离线队列指望不上：30 台 × 5 秒/条 ≈ 2.1 万条/小时，远超默认
- * max_queued_messages（约 1000 量级）——补偿只能来自设备端 SQLite。
- *
- * 触发：MQTT_SETUP_DONE 唤醒 + 1 秒轮询 + 60 秒兜底扫描（防通知丢失）。
- * 为什么不能复用 AgingDataCheck 的补传段：
- *   - 那段只补当前 PN（PN_Code），依赖全局 g_db1_result；
- *   - 耦合 BLE 断链中止与老化任务删除，在别的任务调用会误触发中止；
- *   - 失败即 break，剩余记录静默滞留。
- *
- * 前置依赖：服务端老化采样幂等（S2-1）。补传必然产生重复投递
- * （inflight 掉电/重启即按 pending 重传），需要服务端按
- * PN+RecordId+IDNUM 去重兜底。
- */
-#define MQTT_BACKFILL_BATCH 4
-#define MQTT_BACKFILL_BATCH_MS 100    /* 批间隔：防打满 outbox 56KB 准入预算 */
-#define MQTT_BACKFILL_POLL_MS 1000    /* 无通知时的轮询周期 */
-#define MQTT_BACKFILL_SCAN_MS 60000   /* 通知丢失的兜底扫描周期 */
-#define MQTT_BACKFILL_BACKOFF_MS 5000 /* outbox 预算不足退避 */
-
-static TaskHandle_t s_mqtt_backfill_task = NULL;
-
-static void mqtt_backfill_task(void *arg)
-{
-    (void)arg;
-
-    /* QueryResult 约 4.7KB/条，4 条约 19KB，必须 PSRAM（禁上栈）。 */
-    QueryResult *batch = (QueryResult *)app_malloc_prefer_psram(
-        sizeof(QueryResult) * MQTT_BACKFILL_BATCH);
-    if (batch == NULL)
-    {
-        ESP_LOGE(TAG, "Backfill buffer alloc failed, size=%u",
-                 (unsigned)(sizeof(QueryResult) * MQTT_BACKFILL_BATCH));
-        vTaskDelete(NULL);
-        return;
-    }
-
-    TickType_t last_scan = xTaskGetTickCount();
-
-    for (;;)
-    {
-        bool notified = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(MQTT_BACKFILL_POLL_MS)) > 0;
-        TickType_t now = xTaskGetTickCount();
-
-        bool scan_due = notified ||
-                        (now - last_scan) >= pdMS_TO_TICKS(MQTT_BACKFILL_SCAN_MS);
-        if (!scan_due)
-        {
-            continue;
-        }
-        last_scan = now;
-
-        if (!app_mqtt_is_connected())
-        {
-            continue; /* 离线：等 SETUP_DONE 唤醒或下一轮兜底 */
-        }
-
-        ESP_LOGI(TAG, "Backfill scan start (notified=%u)", notified ? 1U : 0U);
-
-        bool blocked = false;
-        while (!blocked)
-        {
-            int count = 0;
-            if (QueryUnpushedRecords(batch, MQTT_BACKFILL_BATCH, &count) != 0 || count == 0)
-            {
-                break; /* 无待发记录（或查询失败）：本轮结束 */
-            }
-
-            int sent = 0;
-            for (int i = 0; i < count; ++i)
-            {
-                /*
-                 * 双保险隔离：SQL 已过滤 record_id/value_data 为空的记录，
-                 * 此处再兜底一次（7 列兼容模式下 SQL 不过滤）。跳过而不更新
-                 * 状态——同批后续记录仍会被处理，scan 持续推进；整批无可发
-                 * 记录时退出本轮，避免紧循环打爆 SQLite。
-                 */
-                if (batch[i].record_id[0] == '\0' || batch[i].json_data[0] == '\0')
-                {
-                    ESP_LOGW(TAG,
-                             "Backfill record skipped (unattributable): PN=%s seq_no=%d",
-                             batch[i].PN, batch[i].seq_no);
-                    continue;
-                }
-
-                int publish_id = app_mqtt_publish("device/%s/data/aging",
-                                                  batch[i].json_data,
-                                                  DEVICE_ID);
-                if (publish_id > 0)
-                {
-                    (void)UpdateRecordPushStateByPNAndID(batch[i].PN,
-                                                         batch[i].record_id,
-                                                         batch[i].seq_no,
-                                                         PUSH_STATE_INFLIGHT);
-                    mqtt_publish_track(publish_id, batch[i].PN,
-                                       batch[i].record_id, batch[i].seq_no);
-                    sent++;
-                    vTaskDelay(pdMS_TO_TICKS(MQTT_BACKFILL_BATCH_MS));
-                }
-                else if (publish_id == -2)
-                {
-                    /*
-                     * outbox 预算不足：退避后重试，绝不能 break 退出整个
-                     * 循环——那会让剩余记录滞留直到下次唤醒（旧代码缺陷）。
-                     */
-                    ESP_LOGW(TAG, "Backfill blocked by outbox budget; backoff %u ms",
-                             (unsigned)MQTT_BACKFILL_BACKOFF_MS);
-                    blocked = true;
-                    vTaskDelay(pdMS_TO_TICKS(MQTT_BACKFILL_BACKOFF_MS));
-                    break;
-                }
-                else
-                {
-                    /* 未连接/其他失败：本轮结束，等下次唤醒或兜底扫描。 */
-                    ESP_LOGW(TAG, "Backfill publish failed id=%d rc=%d; retry next scan",
-                             batch[i].seq_no, publish_id);
-                    blocked = true;
-                    break;
-                }
-            }
-
-            if (sent == 0)
-            {
-                break; /* 整批都是坏记录：退出本轮，60 秒后再来 */
-            }
-        }
-    }
-}
-
-BaseType_t app_create_mqtt_backfill_task(void)
-{
-    if (s_mqtt_backfill_task != NULL)
-    {
-        return pdPASS; /* 已创建：复用句柄，不重复建任务 */
-    }
-
-    return create_cpu1_task(mqtt_backfill_task, "mqtt_backfill",
-                            LG_STACK_MQTT_BACKFILL, LG_PRIO_MQTT_BACKFILL,
-                            &s_mqtt_backfill_task);
-}
-
-/* mqtt_app.c 在 MQTT_SETUP_DONE（上线完成）调用：立即触发一次补传扫描。 */
-void app_mqtt_backfill_wake(void)
-{
-    if (s_mqtt_backfill_task != NULL)
-    {
-        xTaskNotifyGive(s_mqtt_backfill_task);
     }
 }
 
@@ -6166,6 +5807,10 @@ void app_mqtt_backfill_wake(void)
 
 void app_task_init(void)
 {
+    if (aging_gap_init() != ESP_OK) {
+        ESP_LOGE(TAG, "采样会话与结束补查初始化失败");
+        return;
+    }
     s_protocol_lifecycle_mutex = xSemaphoreCreateMutexStatic(&s_protocol_lifecycle_storage);
     if (s_protocol_lifecycle_mutex == NULL)
     {
