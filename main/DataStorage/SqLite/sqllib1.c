@@ -9,6 +9,7 @@
 #include "cJSON.h"
 #include <time.h>
 #include "appTask.h"
+#include "app_mem.h"
 
 static void safe_copy(char *dst, size_t dst_size, const char *src)
 {
@@ -67,24 +68,30 @@ static cJSON *build_legacy_value_array(const char *legacy_value_data)
         return value_array;
     }
 
-    char temp[DB_VALUE_DATA_MAX_LEN + 1];
-    safe_copy(temp, sizeof(temp), legacy_value_data);
-
-    cJSON *group = cJSON_CreateObject();
-    cJSON *data_array = cJSON_CreateArray();
-    if (group == NULL || data_array == NULL)
-    {
-        cJSON_Delete(group);
-        cJSON_Delete(data_array);
+    /* 仅旧格式需要可修改副本；本函数独占，所有出口释放，不占用任务大栈。 */
+    char *temp = app_malloc_prefer_psram(DB_VALUE_DATA_MAX_LEN + 1U);
+    if (temp == NULL) {
         cJSON_Delete(value_array);
         return NULL;
     }
-
-    cJSON_AddStringToObject(group, "Name", "Legacy");
-    cJSON_AddItemToObject(group, "Data", data_array);
-
+    safe_copy(temp, DB_VALUE_DATA_MAX_LEN + 1U, legacy_value_data);
     char *saveptr = NULL;
     char *token = strtok_r(temp, ",", &saveptr);
+    if (token == NULL) {
+        free(temp);
+        return value_array;
+    }
+    cJSON *group = cJSON_CreateObject();
+    if (group == NULL) goto failed;
+    if (!cJSON_AddItemToArray(value_array, group)) {
+        cJSON_Delete(group);
+        goto failed;
+    }
+    /* 从此 group 和 data_array 均由 value_array 持有。 */
+    if (cJSON_AddStringToObject(group, "Name", "Legacy") == NULL) goto failed;
+    cJSON *data_array = cJSON_AddArrayToObject(group, "Data");
+    if (data_array == NULL) goto failed;
+
     int index = 0;
 
     while (token != NULL)
@@ -109,31 +116,28 @@ static cJSON *build_legacy_value_array(const char *legacy_value_data)
         cJSON *item = cJSON_CreateObject();
         if (item == NULL)
         {
-            cJSON_Delete(value_array);
-            cJSON_Delete(group);
-            return NULL;
+            goto failed;
         }
 
         char value_string[32];
         scaled_int_to_string(atoi(scaled_text), value_string, sizeof(value_string));
-        cJSON_AddStringToObject(item, "name", name);
-        cJSON_AddStringToObject(item, "value", value_string);
-        cJSON_AddItemToArray(data_array, item);
+        if (cJSON_AddStringToObject(item, "name", name) == NULL ||
+            cJSON_AddStringToObject(item, "value", value_string) == NULL ||
+            !cJSON_AddItemToArray(data_array, item)) {
+            cJSON_Delete(item);
+            goto failed;
+        }
 
         index++;
         token = strtok_r(NULL, ",", &saveptr);
     }
 
-    if (index > 0)
-    {
-        cJSON_AddItemToArray(value_array, group);
-    }
-    else
-    {
-        cJSON_Delete(group);
-    }
-
+    free(temp);
     return value_array;
+failed:
+    free(temp);
+    cJSON_Delete(value_array);
+    return NULL;
 }
 
 static cJSON *parse_or_convert_value_array(const char *value_data)
@@ -143,13 +147,15 @@ static cJSON *parse_or_convert_value_array(const char *value_data)
         return NULL;
     }
 
-    cJSON *value_array = cJSON_Parse(value_data);
-    if (cJSON_IsArray(value_array))
-    {
-        return value_array;
+    const char *start = value_data;
+    start += strspn(start, " \t\r\n");
+    if (*start == '[') {
+        cJSON *value_array = cJSON_Parse(value_data);
+        if (cJSON_IsArray(value_array)) return value_array;
+        cJSON_Delete(value_array);
+        /* 新格式解析失败（含内存失败）不能伪装成 Legacy 数据继续发送。 */
+        return NULL;
     }
-
-    cJSON_Delete(value_array);
     return build_legacy_value_array(value_data);
 }
 
@@ -165,28 +171,28 @@ int db_build_data_report_json(const QueryResult *record,
     out_json[0] = '\0';
 
     cJSON *root = cJSON_CreateObject();
-    cJSON *data = cJSON_CreateObject();
-    cJSON *value_array = parse_or_convert_value_array(record->value_data);
-    if (root == NULL || data == NULL || value_array == NULL)
-    {
+    if (root == NULL) return -1;
+    if (cJSON_AddNumberToObject(root, "Seq", time(NULL)) == NULL) {
         cJSON_Delete(root);
-        cJSON_Delete(data);
-        cJSON_Delete(value_array);
         return -1;
     }
-
-    cJSON_AddNumberToObject(root, "Seq", time(NULL));
-    cJSON_AddItemToObject(root, "Data", data);
-    cJSON_AddNumberToObject(data, "IDNUM", record->seq_no);
-    cJSON_AddNumberToObject(data, "TIMESTAMP", record->timestamp);
-    cJSON_AddStringToObject(data, "PN", record->PN);
+    cJSON *data = cJSON_AddObjectToObject(root, "Data");
     /* 必须用采样时固化的 record_id：全局 RecordId 在补传时可能已属于
      * 下一个老化会话，跨 PN 补发会把旧数据挂到新会话上（串批）。 */
-    cJSON_AddStringToObject(data, "RecordId", record->record_id);
     /* CurrentStep 与实时上报路径（Json_data.c create_sensor_json 的 current_step+1）
      * 保持一致：协议为 1 基，数据库存 0 基。 */
-    cJSON_AddNumberToObject(data, "CurrentStep", record->current_step + 1);
-    cJSON_AddItemToObject(data, "Value", value_array);
+    bool valid = data != NULL &&
+        cJSON_AddNumberToObject(data, "IDNUM", record->seq_no) != NULL &&
+        cJSON_AddNumberToObject(data, "TIMESTAMP", record->timestamp) != NULL &&
+        cJSON_AddStringToObject(data, "PN", record->PN) != NULL &&
+        cJSON_AddStringToObject(data, "RecordId", record->record_id) != NULL &&
+        cJSON_AddNumberToObject(data, "CurrentStep", record->current_step + 1) != NULL;
+    cJSON *value_array = valid ? parse_or_convert_value_array(record->value_data) : NULL;
+    if (value_array == NULL || !cJSON_AddItemToObject(data, "Value", value_array)) {
+        cJSON_Delete(value_array);
+        cJSON_Delete(root);
+        return -1;
+    }
 
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);

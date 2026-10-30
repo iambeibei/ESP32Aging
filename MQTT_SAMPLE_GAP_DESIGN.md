@@ -79,3 +79,38 @@ MQTT回归验证上线只恢复订阅/上线/事件，并通知结束意图，�
 软件验证：采样补查、HTTP、MQTT、OTA及根节点上行、重启、PSRAM、蓝牙目标回归通过；
 采样补查、HTTP、MQTT、OTA的ASan/UBSan通过；ESP-IDF v5.4.4构建通过。
 本次未烧录，实机和服务器联调尚未执行。
+
+## http_auto 栈溢出修复（2026-10-30）
+
+实机日志在 `last_id=104 missing=15 valid=1` 后报告 `http_auto` 栈溢出。
+原任务栈仅3072字节；实际Xtensa反汇编显示，读取单条记录经过的
+`app_HTTP_Auto_GetProtocol → aging_gap_poll → QueryStructuredRecordBySession →
+fill_query_result_from_stmt → fill_legacy_float_fields` 栈帧分别为
+224、352、368、32、2112字节，仅应用函数已合计3088字节。旧兼容函数虽然对新格式
+立即返回，但编译器仍在入口分配2049字节临时数组，不能靠提前返回避免栈占用。
+
+修复后 `LG_STACK_HTTP_AUTO=8192`，CPU1及优先级4不变。旧浮点兼容字段只读遍历前四项，
+跳过空项并保留百分之一标度，不修改存储内容；旧格式JSON转换的可修改副本按需使用
+独立PSRAM优先缓冲，各失败/成功出口均释放。新格式不申请这份副本，解析失败不能
+回退成伪造的Legacy数据。JSON各节点及序列化分配失败均拒绝部分报文；精确会话查询
+对记录存在但重构失败返回 `-2`，沿用有限重试、保留意图，不报告为本地记录丢失。
+没有新增公共接口、任务或共享缓冲，不修改schema和线上格式。
+
+查询、发送、补查完成及记录错误后输出 `minimum_free_bytes`，取当前任务历史最低剩余栈。
+低于1024字节时最多每60秒一次串口告警，不写本地存储或MQTT，避免诊断递归。
+现有按钮的任务栈水位查询保留。实机验收要求最低剩余栈至少2048字节，不能用静态帧
+检查替代SDK/SQLite/cJSON完整调用链的运行时验证。
+
+```bash
+python3 tests/test_aging_gap.py
+ASAN_OPTIONS=detect_leaks=1 TEST_SANITIZE=1 python3 tests/test_aging_gap.py
+# 完成ESP-IDF编译后，读取实际Xtensa目标文件检查14个相关应用函数：
+python3 tests/test_aging_gap_stack.py
+```
+
+宿主用例已改为提取真实 `SqLite.c` 填充链，而非误用 `sqllib1.c` 的同名填充实现；
+覆盖2048字节新/旧数据、各JSON分配点失败、PSRAM失败、超长重构、意图保留与重新触发、
+105条记录缺15条的限速补齐、栈水位阶段日志和告警限频。当前实际编译帧为：旧字段兼容
+函数48字节（原2112），旧格式转换112字节（原2160）；检查的14个应用函数均不超过
+512字节，最大464字节。采样补查（含泄漏检测）、HTTP和MQTT回归及ASan/UBSan通过，
+ESP-IDF编译通过。实机烧录、同场景复现及2048字节最低余量验收仍待执行。

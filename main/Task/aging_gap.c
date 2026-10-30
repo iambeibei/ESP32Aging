@@ -7,6 +7,7 @@
 #include <string.h>
 #include <time.h>
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "esp_log.h"
 #include "app_mem.h"
 #include "SqLite.h"
@@ -24,6 +25,8 @@
 #define GAP_SETTLE_MS 5000
 #define GAP_ROUNDS_MAX 3
 #define GAP_QUEUE_SUBMIT_MS 50 /* 保持原采样队列的有界等待。 */
+#define GAP_STACK_WARN_BYTES 1024U
+#define GAP_STACK_WARN_INTERVAL_MS 60000U
 
 typedef enum { GAP_QUERY, GAP_SEND, GAP_VERIFY } GapPhase;
 typedef struct {
@@ -54,6 +57,22 @@ static uint32_t s_next_token, s_current;
 static bool s_running;
 static atomic_uint s_trigger;
 static atomic_bool s_mqtt_ready;
+/* 仅 http_auto 使用；诊断不写本地存储、不进入 MQTT 告警队列。 */
+static bool s_stack_warned;
+static TickType_t s_stack_last_warn;
+
+static void gap_log_stack(const char *phase)
+{
+    UBaseType_t free_bytes = uxTaskGetStackHighWaterMark(NULL); /* ESP-IDF 单位为字节。 */
+    ESP_LOGI(TAG, "补查任务栈水位 phase=%s minimum_free_bytes=%u", phase, (unsigned)free_bytes);
+    TickType_t now = xTaskGetTickCount();
+    if (free_bytes < GAP_STACK_WARN_BYTES &&
+        (!s_stack_warned || now - s_stack_last_warn >= pdMS_TO_TICKS(GAP_STACK_WARN_INTERVAL_MS))) {
+        s_stack_warned = true;
+        s_stack_last_warn = now;
+        ESP_LOGW(TAG, "http_auto 栈余量不足: minimum_free_bytes=%u", (unsigned)free_bytes);
+    }
+}
 
 static bool gap_lock(void)
 {
@@ -370,6 +389,7 @@ void aging_gap_poll(void)
         if (!gap_can_run(&snapshot)) return; /* 新老化/重连/会话合并：不应用旧结果。 */
         int *ids = NULL, count = 0;
         bool valid = err == ESP_OK && gap_parse_ids(s_work.response, snapshot.last_id, &ids, &count);
+        gap_log_stack("query");
         ESP_LOGI(TAG, "采样缺号查询 RecordId=%s round=%u phase=%d last_id=%d missing=%d valid=%d",
                  snapshot.record_id, snapshot.round, snapshot.phase, snapshot.last_id, count, valid);
         if (!gap_lock()) { free(ids); return; }
@@ -380,6 +400,7 @@ void aging_gap_poll(void)
         if (valid && count == 0) {
             slot->used = false; /* 仅服务器明确无缺号，才结束意图。 */
             gap_unlock(); free(ids); gap_work_clear_ids();
+            gap_log_stack("complete");
             ESP_LOGI(TAG, "本轮采样补查完成 PN=%s RecordId=%s last_id=%d",
                      snapshot.pn, snapshot.record_id, snapshot.last_id);
             return;
@@ -421,6 +442,7 @@ void aging_gap_poll(void)
     int id = s_work.ids[s_work.index];
     int query = QueryStructuredRecordBySession(snapshot.pn, snapshot.record_id, id, s_work.record);
     if (query == -2) {
+        gap_log_stack("record_error");
         bool exhausted = false;
         if (gap_lock()) {
             slot = gap_find(snapshot.token);
@@ -440,6 +462,7 @@ void aging_gap_poll(void)
     }
     if (!gap_can_run(&snapshot)) return;
     int publish_id = app_mqtt_publish("device/%s/data/aging", s_work.record->json_data, DEVICE_ID);
+    gap_log_stack("send");
     if (!gap_lock()) return;
     slot = gap_find(snapshot.token);
     bool exhausted = false;

@@ -127,6 +127,8 @@ python3 tests/test_psram_memory.py     # PSRAM 分配器、cJSON hooks、TLS 分
 ```
 
 ASan/UBSan：`ASAN_OPTIONS=detect_leaks=0 TEST_SANITIZE=1 python3 tests/<脚本>.py`。
+采样补查栈帧检查需先完成ESP-IDF编译，再运行 `python3 tests/test_aging_gap_stack.py`；
+读取实际Xtensa目标文件，要求14个相关应用函数栈帧不超过512字节，不能替代实机栈水位验收。
 注意：`pytest_hello_world.py` 是未修改的 ESP-IDF 模板残留，不测试本工程；无线链路、真实
 flash/NVS 掉电行为仍需编译 + 串口实机验证。
 

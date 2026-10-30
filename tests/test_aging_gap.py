@@ -20,10 +20,13 @@ MOCKS = r'''
 #include <stdarg.h>
 #include <pthread.h>
 #include <time.h>
+#include <limits.h>
+#include <math.h>
 #include "sqlite3.h"
 #include "cJSON.h"
 typedef int esp_err_t;
 typedef uint32_t TickType_t;
+typedef unsigned UBaseType_t;
 #define ESP_OK 0
 #define ESP_FAIL -1
 #define ESP_ERR_NO_MEM 1
@@ -52,12 +55,28 @@ static int xQueueSend(QueueHandle_t q,const void *item,uint32_t wait){
     if(q->count==3)return 0;
     q->items[(q->head+q->count)%3]=*(void *const *)item;q->count++;return 1;
 }
-static bool fail_alloc;
+static bool fail_alloc,fail_legacy_alloc;
+static unsigned legacy_alloc_calls;
+static void *app_malloc_prefer_psram(size_t size){assert(size==2049);legacy_alloc_calls++;return fail_alloc||fail_legacy_alloc?NULL:malloc(size);}
 static void *app_calloc_prefer_psram(size_t n,size_t size){return fail_alloc?NULL:calloc(n,size);}
-static void mock_log(const char *tag,const char *fmt,...){(void)tag;(void)fmt;}
+static unsigned stack_warn_count,query_watermarks,send_watermarks,complete_watermarks;
+static UBaseType_t stack_free_bytes=4096;
+static UBaseType_t uxTaskGetStackHighWaterMark(void *task){assert(task==NULL);return stack_free_bytes;}
+static void mock_log(const char *tag,const char *fmt,...){
+    (void)tag;
+    if(strstr(fmt,"补查任务栈水位")){
+        va_list args;va_start(args,fmt);const char *phase=va_arg(args,const char*);va_end(args);
+        if(!strcmp(phase,"query"))query_watermarks++;
+        if(!strcmp(phase,"send"))send_watermarks++;
+        if(!strcmp(phase,"complete"))complete_watermarks++;
+    }
+}
+static void mock_warn(const char *tag,const char *fmt,...){(void)tag;if(strstr(fmt,"http_auto 栈余量不足"))stack_warn_count++;}
 #define ESP_LOGI mock_log
-#define ESP_LOGW mock_log
+#define ESP_LOGW mock_warn
 #define ESP_LOGE mock_log
+static int json_fail_after=-1;
+static void *json_malloc(size_t bytes){if(json_fail_after==0)return NULL;if(json_fail_after>0)json_fail_after--;return malloc(bytes);}
 static unsigned warn_count,local_count,http_calls,publish_count,tracked;
 static bool mqtt_connected,server_accept,fail_publish,fail_db,preempt_http;
 static bool backend_received[256];
@@ -115,6 +134,7 @@ static esp_err_t test_http_post_record_query(int32_t seq,int32_t max_id,const ch
     char *json=cJSON_PrintUnformatted(root);assert((int)strlen(json)<size);strcpy(out,json);free(json);cJSON_Delete(root);return ESP_OK;
 }
 static void reset(void){
+    json_fail_after=-1;
     gap_work_clear_ids();free(s_work.response);free(s_work.record);memset(&s_work,0,sizeof(s_work));
     if(s_db)assert(sqlite3_close(s_db)==SQLITE_OK);
     assert(sqlite3_open(":memory:",&s_db)==SQLITE_OK);
@@ -124,6 +144,9 @@ static void reset(void){
     memset(backend_received,0,sizeof(backend_received));now_ms=0;http_calls=publish_count=warn_count=local_count=tracked=0;
     mqtt_connected=server_accept=true;fail_alloc=fail_publish=fail_db=preempt_http=false;http_override=NULL;
     block_queue=queue_entered=release_queue=false;
+    fail_legacy_alloc=false;legacy_alloc_calls=0;
+    stack_free_bytes=4096;stack_warn_count=query_watermarks=send_watermarks=complete_watermarks=0;
+    s_stack_warned=false;s_stack_last_warn=0;
 }
 static uint32_t current_token(void){char pn[64],r[29];uint32_t token=aging_gap_sample_snapshot(pn,sizeof(pn),r,sizeof(r));assert(token);return token;}
 static int intent_count(void){int n=0;for(unsigned i=0;i<GAP_SESSION_SLOTS;i++)if(s_sessions[i].used&&s_sessions[i].intent)n++;return n;}
@@ -142,6 +165,7 @@ static uint32_t thread_token;
 static void *submit_thread(void *arg){void *item=(void*)1;assert(aging_gap_sample_submit(thread_token,arg,&item));return NULL;}
 static void *close_thread(void *arg){(void)arg;aging_gap_session_close();return NULL;}
 int main(void){
+    cJSON_Hooks hooks={.malloc_fn=json_malloc,.free_fn=free};cJSON_InitHooks(&hooks);
     reset();uint32_t token=session("pn","run",0);(void)token;assert(!intent_count());online();run_for(120000);assert(!http_calls&&!publish_count);
     puts("PASS idle/reconnect without ended sampled sessions performs no database backlog scan or network query");
 
@@ -230,15 +254,88 @@ int main(void){
     aging_gap_mqtt_ready(false);online();run_for(15000);assert(!intent_count());
     puts("PASS work-buffer allocation failure has finite retries and recovers on a fresh trigger");
     reset();session("pn","run",1);free(s_sessions);s_sessions=NULL;assert(aging_gap_init()==ESP_OK);s_current=0;s_running=false;online();run_for(60000);assert(!http_calls);
-    free(record);gap_work_clear_ids();free(s_work.response);free(s_work.record);free(s_sessions);sqlite3_close(s_db);
-    puts("PASS simulated reboot clears RAM intents while retaining the SQLite contract");return 0;
+    puts("PASS simulated reboot clears RAM intents while retaining the SQLite contract");
+
+    reset();const char *legacy=",,SOC=7400,,5266,Voltage=-1234,0,ignored=999";
+    assert(InsertStructuredRecord(0,"pn",0,1,false,legacy,"legacy")==0);
+    assert(QueryStructuredRecordBySession("pn","legacy",0,record)==0);
+    assert(!strcmp(record->value_data,legacy));
+    assert(fabsf(record->Equipmentvoltage-74.0f)<0.001f && fabsf(record->EquipmentCurrent-52.66f)<0.001f);
+    assert(fabsf(record->Testvoltage+12.34f)<0.001f && record->TestCurrent==0);
+    cJSON *legacy_root=cJSON_Parse(record->json_data);assert(legacy_root);
+    cJSON *legacy_values=cJSON_GetObjectItem(cJSON_GetArrayItem(cJSON_GetObjectItem(cJSON_GetObjectItem(legacy_root,"Data"),"Value"),0),"Data");
+    assert(cJSON_GetArraySize(legacy_values)==5);
+    assert(!strcmp(cJSON_GetObjectItem(cJSON_GetArrayItem(legacy_values,1),"name")->valuestring,"Value1"));
+    cJSON_Delete(legacy_root);
+    char boundary[DB_VALUE_DATA_MAX_LEN+1];
+    const char *prefix="[{\"Name\":\"D\",\"Data\":[{\"name\":\"V\",\"value\":\"",*suffix="\"}]}]";
+    size_t prefix_len=strlen(prefix),suffix_len=strlen(suffix);
+    memcpy(boundary,prefix,prefix_len);memset(boundary+prefix_len,'1',DB_VALUE_DATA_MAX_LEN-prefix_len-suffix_len);
+    memcpy(boundary+DB_VALUE_DATA_MAX_LEN-suffix_len,suffix,suffix_len+1);
+    assert(strlen(boundary)==DB_VALUE_DATA_MAX_LEN);
+    assert(InsertStructuredRecord(1,"pn",0,1,false,boundary,"boundary")==0);
+    unsigned alloc_before=legacy_alloc_calls;
+    assert(QueryStructuredRecordBySession("pn","boundary",1,record)==0 && !strcmp(record->value_data,boundary));
+    assert(legacy_alloc_calls==alloc_before && record->Equipmentvoltage==0);
+    strcpy(boundary,"Voltage=");memset(boundary+8,' ',DB_VALUE_DATA_MAX_LEN-12);strcpy(boundary+DB_VALUE_DATA_MAX_LEN-4,"1250");
+    assert(InsertStructuredRecord(2,"pn",0,1,false,boundary,"boundary")==0);
+    assert(QueryStructuredRecordBySession("pn","boundary",2,record)==0 && !strcmp(record->value_data,boundary));
+    assert(record->Equipmentvoltage==12.5f && legacy_alloc_calls==alloc_before+1);
+    puts("PASS actual SqLite.c fill path: read-only first four legacy fields and full 2048-byte structured/legacy records");
+
+    fail_legacy_alloc=true;assert(QueryStructuredRecordBySession("pn","legacy",0,record)==-2 && !record->json_data[0]);fail_legacy_alloc=false;
+    for(int format=0;format<2;format++) {
+        const char *r=format?"legacy":"boundary";int seq=format?0:1;bool succeeded=false;
+        for(int fail=0;fail<512;fail++) {
+            json_fail_after=fail;int rc=QueryStructuredRecordBySession("pn",r,seq,record);json_fail_after=-1;
+            if(rc==0){assert(fail>10);succeeded=true;break;}
+            assert(rc==-2 && !record->json_data[0]);
+        }
+        assert(succeeded);
+    }
+    assert(InsertStructuredRecord(3,"pn",0,1,false,"[broken","bad")==0);
+    assert(QueryStructuredRecordBySession("pn","bad",3,record)==-2 && !record->json_data[0]);
+    for(unsigned i=0;i<DB_VALUE_DATA_MAX_LEN;i++)boundary[i]=(i%2)?',':'1';
+    boundary[DB_VALUE_DATA_MAX_LEN]=0;
+    assert(InsertStructuredRecord(4,"pn",0,1,false,boundary,"bad")==0);
+    assert(QueryStructuredRecordBySession("pn","bad",4,record)==-2 && !record->json_data[0]);
+    puts("PASS scratch PSRAM/each cJSON allocation, malformed new JSON and oversized rebuilt JSON fail as -2, never missing or partial payload");
+
+    reset();session("pn","legacy",1);assert(InsertStructuredRecord(0,"pn",0,1,false,"SOC=7400","legacy")==0);
+    online();fail_legacy_alloc=true;run_for(120000);
+    assert(intent_count()==1 && !publish_count && http_calls==3 && warn_count==1 && s_work.missing==0);
+    fail_legacy_alloc=false;aging_gap_mqtt_ready(false);online();run_for(15000);
+    assert(!intent_count() && publish_count==1);
+    reset();session("pn","run",1);online();run_for(5100);assert(http_calls==1 && !publish_count);
+    json_fail_after=0;aging_gap_poll();json_fail_after=-1;
+    assert(intent_count()==1 && !publish_count && s_work.missing==0);
+    run_for(25000);assert(!intent_count() && publish_count==1);
+    puts("PASS reconstruction failures retain SQLite row and intent with bounded retry; fresh trigger recovers");
+
+    reset();session("EL102611110001759","471634628172587008",105);
+    for(unsigned i=0;i<90;i++)backend_received[i]=true;
+    online();run_for(30000);
+    assert(last_request_max==104 && publish_count==15 && !intent_count());
+    for(unsigned i=0;i<15;i++){assert(published_ids[i]==(int)i+90);if(i)assert(published_ticks[i]-published_ticks[i-1]>=1000);}
+    assert(query_watermarks>=2 && send_watermarks==15 && complete_watermarks==1 && !stack_warn_count);
+    puts("PASS reported last_id=104/missing=15 scenario completes at one per second with query/send/complete stack watermarks");
+
+    reset();stack_free_bytes=1024;gap_log_stack("query");assert(!stack_warn_count);
+    now_ms=100;stack_free_bytes=1023;gap_log_stack("send");assert(stack_warn_count==1 && !warn_count && !local_count);
+    now_ms=60099;gap_log_stack("send");assert(stack_warn_count==1);
+    now_ms=60100;gap_log_stack("complete");assert(stack_warn_count==2);
+    puts("PASS stack warning threshold is below 1024 bytes, limited to once per 60 seconds without MQTT/storage recursion");
+    free(record);gap_work_clear_ids();free(s_work.response);free(s_work.record);free(s_sessions);sqlite3_close(s_db);return 0;
 }
 '''
 
 def main():
     db_source = (ROOT / 'main/DataStorage/SqLite/SqLite.c').read_text()
-    sql = function_source(db_source, 'static const char *structured_select_columns(')
-    sql += '\n' + function_source(db_source, 'int QueryStructuredRecordBySession(')
+    sql = '\n'.join(function_source(db_source, signature) for signature in [
+        'static void safe_copy(', 'static float scaled_int_to_float(',
+        'static void fill_legacy_float_fields(', 'static void fill_query_result_from_stmt(',
+        'static const char *structured_select_columns(', 'int QueryStructuredRecordBySession(',
+    ])
     app = (ROOT / 'main/Task/appTask.c').read_text()
     packet_start = app.index('typedef struct\n{\n    char pn[AGING_UPLOAD_PN_MAX_LEN];')
     packet = app[packet_start:app.index('} AgingUploadPacket;', packet_start) + len('} AgingUploadPacket;')]
@@ -248,12 +345,15 @@ def main():
         tmp = Path(directory)
         (tmp / 'mocks.h').write_text(MOCKS)
         for header in ['esp_err.h', 'esp_log.h', 'app_mem.h', 'GetProto.h', 'mqtt_app.h', 'ConfigData.h',
-                       'log.h', 'esp_timer.h', 'appTask.h', 'freertos/FreeRTOS.h', 'freertos/queue.h', 'freertos/semphr.h']:
+                       'log.h', 'esp_timer.h', 'appTask.h', 'freertos/FreeRTOS.h', 'freertos/queue.h', 'freertos/semphr.h', 'freertos/task.h']:
             target = tmp / header
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text('#include "mocks.h"\n')
         (tmp / 'test.c').write_text('#include "mocks.h"\n#include "SqLite.h"\n' + DB_STATE
-            + f'\n#include "{ROOT}/main/DataStorage/SqLite/sqllib1.c"\n' + sql + DB_WRITE
+            # 两个真实源文件均有同名 static helper，隔离 sqllib1 名称，让会话查询走实际 SqLite.c 填充链。
+            + '\n#define safe_copy sqllib_safe_copy\n#define fill_query_result_from_stmt sqllib_fill_query_result_from_stmt\n'
+            + f'#include "{ROOT}/main/DataStorage/SqLite/sqllib1.c"\n'
+            + '\n#undef safe_copy\n#undef fill_query_result_from_stmt\n' + sql + DB_WRITE
             + f'\n#include "{ROOT}/main/Task/aging_gap.c"\n' + packet + sensor + upload + TESTS)
         cjson = IDF / 'components/json/cJSON'
         args = [os.environ.get('CC', 'cc'), '-std=c11', '-D_DEFAULT_SOURCE', '-pthread', '-Wall', '-Wextra', '-Werror',
@@ -262,7 +362,7 @@ def main():
                 '-I', str(IDF / 'components/esp32-idf-sqlite3/include'), '-I', str(cjson),
                 str(tmp / 'test.c'), str(cjson / 'cJSON.c'), '-l:libsqlite3.so.0', '-lm', '-o', str(tmp / 'test')]
         if os.environ.get('TEST_SANITIZE') == '1':
-            args[1:1] = ['-fsanitize=address,undefined', '-fno-omit-frame-pointer']
+            args[1:1] = ['-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-g', '-no-pie']
         subprocess.run(args, check=True)
         subprocess.run([str(tmp / 'test')], check=True, timeout=20)
 

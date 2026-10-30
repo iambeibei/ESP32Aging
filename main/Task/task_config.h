@@ -56,7 +56,8 @@
 #define LG_STACK_NET_INIT          8192
 #define LG_PRIO_NET_INIT           6
 
-#define LG_STACK_HTTP_AUTO         3072
+/* 同步缺号 HTTP、SQLite 重构及 MQTT 提交共用此栈；保留库调用链余量。 */
+#define LG_STACK_HTTP_AUTO         8192
 #define LG_PRIO_HTTP_AUTO          4
 
 #define LG_STACK_AGING_UPLOAD      8192

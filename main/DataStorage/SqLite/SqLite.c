@@ -3,6 +3,7 @@
 #include <sys/unistd.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <limits.h>
 #include <time.h>
 #include <stdlib.h>
 
@@ -105,20 +106,22 @@ static void fill_legacy_float_fields(QueryResult *result)
         return;
     }
 
-    char temp[DB_VALUE_DATA_MAX_LEN + 1];
-    safe_copy(temp, sizeof(temp), result->value_data);
-
-    char *saveptr = NULL;
-    char *token = strtok_r(temp, ",", &saveptr);
+    /* 只读遍历，保留 strtok_r 跳过空项的语义，不为立即返回的新格式预留 2KiB 栈。 */
+    const char *cursor = result->value_data;
     float values[4] = {0};
     int index = 0;
 
-    while (token != NULL && index < 4)
+    while (*cursor != '\0' && index < 4)
     {
-        char *equal = strchr(token, '=');
-        const char *number = equal ? equal + 1 : token;
-        values[index++] = scaled_int_to_float(atoi(number));
-        token = strtok_r(NULL, ",", &saveptr);
+        cursor += strspn(cursor, ",");
+        if (*cursor == '\0') break;
+        const char *end = strchr(cursor, ',');
+        if (end == NULL) end = cursor + strlen(cursor);
+        const char *equal = memchr(cursor, '=', (size_t)(end - cursor));
+        long number = strtol(equal != NULL ? equal + 1 : cursor, NULL, 10);
+        int bounded = number > INT_MAX ? INT_MAX : number < INT_MIN ? INT_MIN : (int)number;
+        values[index++] = scaled_int_to_float(bounded);
+        cursor = end;
     }
 
     result->Equipmentvoltage = values[0];
@@ -2014,7 +2017,8 @@ int QueryStructuredRecordBySession(const char *pn, const char *record_id,
     int rc = sqlite3_step(stmt);
     if (rc == SQLITE_ROW) {
         fill_query_result_from_stmt(stmt, out_result);
-        result = 0;
+        /* 行存在但重构失败（内存不足/输出超长等）必须重试，不能视为本地无数据。 */
+        result = out_result->json_data[0] != '\0' ? 0 : -2;
     } else if (rc == SQLITE_DONE) result = -1;
 done:
     if (stmt != NULL) sqlite3_finalize(stmt);
