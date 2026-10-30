@@ -1089,7 +1089,8 @@ static void lg_mesh_node_scan_done_handler(void *arg, esp_event_base_t base,
  * communication and espnow tags (very noisy, only for targeted debugging).
  */
 #ifndef LG_MESH_DIAG_LOG
-#define LG_MESH_DIAG_LOG 1
+/* 默认关闭：启动期 [vendor_ie]/Mesh-Lite 的 DEBUG 行会与业务日志争用同一串口。 */
+#define LG_MESH_DIAG_LOG 0
 #endif
 
 #if LG_MESH_DIAG_LOG

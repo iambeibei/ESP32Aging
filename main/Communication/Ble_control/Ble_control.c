@@ -215,7 +215,7 @@ static void ble_coex_prefer_bt(bool enable)
     }
 
     s_coex_bt_boost = enable;
-    ESP_LOGI(TAG, "Coex preference: %s", enable ? "PREFER_BT" : "BALANCE");
+    ESP_LOGD(TAG, "Coex preference: %s", enable ? "PREFER_BT" : "BALANCE");
 }
 
 /* GATT 设置阶段得出结论：交付老化任务轮询，同时结束扫描/建链期间的蓝牙优先。 */
@@ -356,7 +356,7 @@ void app_ble_recv_task(void *arg)
                 wait_time = portMAX_DELAY;
                 continue;
             }
-            ESP_LOGI(TAG, "ble a recv len: %d", datalen);
+            ESP_LOGD(TAG, "ble a recv len: %d", datalen);
             ble_data_t ble_data = {0};
             ble_data.data = app_malloc_prefer_psram(datalen);
             if (ble_data.data)
@@ -601,10 +601,10 @@ esp_err_t ble_start_target_scan(const BleTarget *target, uint8_t scan_time)
     atomic_store(&s_scan_op, BLE_SCAN_OP_START);
     ret = ble_scan_op_finish(esp_ble_gap_start_scanning(scan_time ? scan_time : DEFAULT_SCAN_TIME));
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "蓝牙扫描已启动，时长=%u 秒，模式=%s", (unsigned)(scan_time ? scan_time : DEFAULT_SCAN_TIME),
+        ESP_LOGD(TAG, "蓝牙扫描已启动，时长=%u 秒，模式=%s", (unsigned)(scan_time ? scan_time : DEFAULT_SCAN_TIME),
                  target->use_mac ? "MAC白名单" : "名称");
         if (target->use_mac)
-            ESP_LOGI(TAG, "扫描目标 MAC: " ESP_BD_ADDR_STR ", 地址类型: %u",
+            ESP_LOGD(TAG, "扫描目标 MAC: " ESP_BD_ADDR_STR ", 地址类型: %u",
                      ESP_BD_ADDR_HEX(target->bda), (unsigned)target->addr_type);
     }
 done:
@@ -762,7 +762,7 @@ void ble_clear_scan_results(void)
         xSemaphoreGive(s_device_list_mutex);
     }
 
-    ESP_LOGI(TAG, "Scan results cleared");
+    ESP_LOGD(TAG, "Scan results cleared");
 }
 
 static void add_scanned_device(esp_ble_gap_cb_param_t *scan_result)
@@ -829,7 +829,7 @@ static void add_scanned_device(esp_ble_gap_cb_param_t *scan_result)
 
         s_scanned_count++;
 
-        ESP_LOGI(TAG, "Found device [%d]: %s, MAC: " ESP_BD_ADDR_STR ", 地址类型: %u, RSSI: %d",
+        ESP_LOGD(TAG, "Found device [%d]: %s, MAC: " ESP_BD_ADDR_STR ", 地址类型: %u, RSSI: %d",
                  s_scanned_count, dev->name, ESP_BD_ADDR_HEX(dev->bda),
                  (unsigned)dev->addr_type, dev->rssi);
     }
@@ -925,7 +925,7 @@ static bool ble_connect_by_name_locked(const char *device_name)
     {
         /* 标记连接尝试在途：结果由 CONNECT_EVT/OPEN_EVT/DISCONNECT_EVT
          * 经 notify_connect_result() 一次性交付（成功或建立失败）。 */
-        ESP_LOGI(TAG, "Connecting to device: %s", device_name);
+        ESP_LOGD(TAG, "Connecting to device: %s", device_name);
         return true;
     }
     else
@@ -987,7 +987,7 @@ static bool ble_connect_by_address_locked(uint8_t *bda, uint8_t addr_type)
     {
         /* 标记连接尝试在途：结果由 CONNECT_EVT/OPEN_EVT/DISCONNECT_EVT
          * 经 notify_connect_result() 一次性交付（成功或建立失败）。 */
-        ESP_LOGI(TAG, "Connecting to device at address: " ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(bda));
+        ESP_LOGD(TAG, "Connecting to device at address: " ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(bda));
         return true;
     }
     else
@@ -1040,7 +1040,7 @@ void ble_disconnect(void)
     {
         esp_err_t ret = esp_ble_gattc_close(s_gattc_profile.gattc_if, s_gattc_profile.conn_id);
         if (ret != ESP_OK) ESP_LOGE(TAG, "提交蓝牙断开失败: %s", esp_err_to_name(ret));
-        else ESP_LOGI(TAG, "Disconnecting...");
+        else ESP_LOGD(TAG, "Disconnecting...");
     }
     else
     {
@@ -1133,10 +1133,8 @@ static int ble_send_for_session(uint32_t session_id, const uint8_t *data, int le
 
     if (ret == ESP_OK)
     {
-        ESP_LOGI(TAG, "蓝牙发送已受理: session=%lu, encrypted=%u, plain_bytes=%d, wire_bytes=%u",
+        ESP_LOGD(TAG, "蓝牙发送已受理: session=%lu, encrypted=%u, plain_bytes=%d, wire_bytes=%u",
                  (unsigned long)session_id, (unsigned)encrypt, len, (unsigned)nlen);
-        /* 仅预览前 32 字节，避免鉴权大包和周期采样日志挤占蓝牙任务。 */
-        ESP_LOG_BUFFER_HEX_LEVEL(TAG, sendBuf, nlen < 32 ? nlen : 32, ESP_LOG_INFO);
         return 1;
     }
     else
@@ -1196,7 +1194,7 @@ static void ble_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
         else if (param->scan_rst.search_evt == ESP_GAP_SEARCH_INQ_CMPL_EVT) // 扫描完成事件
         {
             s_is_scanning = false;
-            ESP_LOGI(TAG, "Scan completed, found %d devices", s_scanned_count);
+            ESP_LOGD(TAG, "Scan completed, found %d devices", s_scanned_count);
 
             // 调用扫描完成回调
             if (s_scan_cb != NULL)
@@ -1211,11 +1209,11 @@ static void ble_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
     case ESP_GAP_BLE_SCAN_STOP_COMPLETE_EVT:
         if (param->scan_stop_cmpl.status == ESP_BT_STATUS_SUCCESS) s_is_scanning = false;
         ble_scan_op_complete(BLE_SCAN_OP_STOP, param->scan_stop_cmpl.status == ESP_BT_STATUS_SUCCESS);
-        ESP_LOGI(TAG, "Scan stopped");
+        ESP_LOGD(TAG, "Scan stopped");
         break;
 
     case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT: // 连接参数更新事件
-        ESP_LOGI(TAG, "Connection params updated: int %d, latency %d, timeout %d",
+        ESP_LOGD(TAG, "Connection params updated: int %d, latency %d, timeout %d",
                  param->update_conn_params.conn_int,
                  param->update_conn_params.latency,
                  param->update_conn_params.timeout);
@@ -1236,7 +1234,7 @@ static void ble_gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp
         if (param->reg.status == ESP_GATT_OK)
         {
             s_gattc_profile.gattc_if = gattc_if;
-            ESP_LOGI(TAG, "GATT client registered, interface: %d", gattc_if);
+            ESP_LOGD(TAG, "GATT client registered, interface: %d", gattc_if);
         }
         else
         {
@@ -1283,7 +1281,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         ble_session_reset();
         atomic_store(&s_session_closing, false);
         s_is_connected = true;
-        ESP_LOGI(TAG, "蓝牙新连接默认明文: session=%lu", (unsigned long)ble_session_id());
+        ESP_LOGD(TAG, "蓝牙新连接默认明文: session=%lu", (unsigned long)ble_session_id());
 
         // 更新扫描列表中的连接状态
         if (s_device_list_mutex != NULL)
@@ -1345,14 +1343,14 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
             ESP_LOGE(TAG, "Service discover failed: %d", param->dis_srvc_cmpl.status);
             break;
         }
-        ESP_LOGI(TAG, "Service discover complete");
+        ESP_LOGD(TAG, "Service discover complete");
         // 开始搜索服务
         esp_ble_gattc_search_service(gattc_if, param->dis_srvc_cmpl.conn_id, &s_remote_service_uuid);
 
         break;
 
     case ESP_GATTC_CFG_MTU_EVT:
-        ESP_LOGI(TAG, "MTU exchange: %d", param->cfg_mtu.mtu);
+        ESP_LOGD(TAG, "MTU exchange: %d", param->cfg_mtu.mtu);
         if (param->cfg_mtu.status == ESP_GATT_OK &&
             param->cfg_mtu.conn_id == s_gattc_profile.conn_id && param->cfg_mtu.mtu >= 23)
             s_gattc_profile.mtu = param->cfg_mtu.mtu;
@@ -1362,7 +1360,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         if (param->search_res.srvc_id.uuid.len == ESP_UUID_LEN_16 &&
             param->search_res.srvc_id.uuid.uuid.uuid16 == REMOTE_SERVICE_UUID)
         {
-            ESP_LOGI(TAG, "Service found");
+            ESP_LOGD(TAG, "Service found");
             s_gattc_profile.service_start_handle = param->search_res.start_handle;
             s_gattc_profile.service_end_handle = param->search_res.end_handle;
             s_gattc_profile.service_found = true;
@@ -1382,7 +1380,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
             break;
         }
 
-        ESP_LOGI(TAG, "Service search complete, discovering characteristics");
+        ESP_LOGD(TAG, "Service search complete, discovering characteristics");
 
         // 查找通知特征
         uint16_t count = 0;
@@ -1419,7 +1417,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         if (status == ESP_GATT_OK && count > 0)
         {
             s_gattc_profile.notify_char_handle = char_result[0].char_handle; // 通知句柄赋值
-            ESP_LOGI(TAG, "Notify characteristic found: 0x%04x", char_result[0].char_handle);
+            ESP_LOGD(TAG, "Notify characteristic found: 0x%04x", char_result[0].char_handle);
 
             // 注册通知
             esp_ble_gattc_register_for_notify(gattc_if, s_gattc_profile.remote_bda,
@@ -1445,7 +1443,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         {
 
             s_gattc_profile.write_char_handle = char_result[0].char_handle; // 写句柄赋值
-            ESP_LOGI(TAG, "Write characteristic found: 0x%04x", char_result[0].char_handle);
+            ESP_LOGD(TAG, "Write characteristic found: 0x%04x", char_result[0].char_handle);
         }
         else
         {
@@ -1462,7 +1460,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
             break;
         }
 
-        ESP_LOGI(TAG, "Register notify success");
+        ESP_LOGD(TAG, "Register notify success");
 
         // 查找并配置CCCD
         uint16_t descr_count = 0;
@@ -1524,11 +1522,8 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
             ESP_LOGW(TAG, "忽略非当前连接或非当前通知特征的蓝牙数据");
             break;
         }
-        ESP_LOGI(TAG, "蓝牙原始接收: session=%lu, handle=0x%04x, bytes=%u",
+        ESP_LOGD(TAG, "蓝牙原始接收: session=%lu, handle=0x%04x, bytes=%u",
                  (unsigned long)ble_session_id(), param->notify.handle, param->notify.value_len);
-        ESP_LOG_BUFFER_HEX_LEVEL(TAG, param->notify.value,
-                                 param->notify.value_len < 32 ? param->notify.value_len : 32,
-                                 ESP_LOG_INFO);
 
         ble_mtu_data_t recv = {0};
         recv.session_id = ble_session_id();
@@ -1556,7 +1551,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         }
         else
         {
-            ESP_LOGI(TAG, "Descriptor write success");
+            ESP_LOGD(TAG, "Descriptor write success");
         }
         /* CCCD 写结果到达：GATT 设置阶段得出结论（成败均交付，由老化任务
          * 后续通信检查判定 notify 通道是否真正可用）。 */

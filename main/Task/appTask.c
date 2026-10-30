@@ -3445,7 +3445,7 @@ static void app_MQTT_Rdata_handle(void *arg)
                     memset(json_str, 0, MQTT_DATA_Cache);
                 }
 
-                ESP_LOGI(TAG, "Complete JSON packet: %s", Databuf);
+                ESP_LOGD(TAG, "Complete JSON packet: %s", Databuf);
                 parse_jsonCommand_MQTT(Databuf, datalen);
             }
             else
@@ -3460,7 +3460,7 @@ static void app_MQTT_Rdata_handle(void *arg)
                     // 当前数据可能已经是完整包
                     if (is_complete_packet(Databuf, datalen))
                     {
-                        ESP_LOGI(TAG, "Current data is a complete packet");
+                        ESP_LOGD(TAG, "Current data is a complete packet");
                         parse_jsonCommand_MQTT(Databuf, datalen);
                     }
                     else
@@ -3469,7 +3469,7 @@ static void app_MQTT_Rdata_handle(void *arg)
                         strncpy(json_str, Databuf, datalen);
                         json_str_len = datalen;
                         json_str[json_str_len] = '\0';
-                        ESP_LOGI(TAG, "Start new accumulation: %d bytes", json_str_len);
+                        ESP_LOGD(TAG, "Start new accumulation: %d bytes", json_str_len);
                     }
                 }
                 else
@@ -3483,7 +3483,7 @@ static void app_MQTT_Rdata_handle(void *arg)
                     if (is_complete_packet(json_str, json_str_len))
                     {
 
-                        ESP_LOGI(TAG, "Accumulated complete JSON: %s", json_str);
+                        ESP_LOGD(TAG, "Accumulated complete JSON: %s", json_str);
                         parse_jsonCommand_MQTT(json_str, json_str_len);
                         json_str_len = 0;
                         memset(json_str, 0, MQTT_DATA_Cache);
@@ -3527,10 +3527,16 @@ static void app_MQTT_Rdata_handle(void *arg)
 // 本机取得 STA IP 后启动 MQTT；仅子节点再启动 HTTP 与老化业务。
 void Init_ByNetwork_Flag(void *arg)
 {
+    /* 离线告警限频：状态翻转时立即输出一次，持续离线期间每 30 秒最多一行。 */
+    const TickType_t offline_log_period_ticks = pdMS_TO_TICKS(30000);
+    bool offline_logged = false;
+    TickType_t offline_last_log_ticks = 0;
+
     while (1)
     {
         if (__atomic_load_n(&Network_Flag, __ATOMIC_ACQUIRE) == 1)
         {
+            offline_logged = false;
             esp_err_t err = mqtt_init();
             if (err != ESP_OK)
             {
@@ -3754,7 +3760,15 @@ void Init_ByNetwork_Flag(void *arg)
         }
         else
         {
-            ESP_LOGW(TAG, "Network is not available, MQTT And HTTP will not start");
+            TickType_t now_ticks = xTaskGetTickCount();
+            /* 无符号差值比较，跨越 tick 回绕仍正确（周期远小于半个 tick 范围）。 */
+            if (!offline_logged ||
+                (TickType_t)(now_ticks - offline_last_log_ticks) >= offline_log_period_ticks)
+            {
+                ESP_LOGW(TAG, "Network is not available, MQTT And HTTP will not start");
+                offline_logged = true;
+                offline_last_log_ticks = now_ticks;
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
@@ -3966,7 +3980,7 @@ static bool Data_Set_Method(Externaldevice *device, const char *idorname, const 
 
             if (len > 0)
             {
-                ESP_LOGI(TAG, "SCPI write ack: %s", RecBuf);
+                ESP_LOGD(TAG, "SCPI write ack: %s", RecBuf);
             }
         }
         else
@@ -4040,7 +4054,7 @@ static bool Data_Set_Method(Externaldevice *device, const char *idorname, const 
                 /*
                  * 简单校验：回包长度 >= 8 通常表示正常
                  */
-                ESP_LOGI(TAG, "Modbus write success: %s = %s",
+                ESP_LOGD(TAG, "Modbus write success: %s = %s",
                          idorname, param);
 
                 SetFlag = true;
@@ -4568,7 +4582,7 @@ static bool Aging_Execute_ActionList(AgingActionItem *actions, size_t action_cou
             continue;
         }
 
-        ESP_LOGI(TAG, "Action: Para=%s Value=%s", parameter, act->ParaValue);
+        ESP_LOGD(TAG, "Action: Para=%s Value=%s", parameter, act->ParaValue);
 
         if (!Data_Set_Method(cdevice, parameter, act->ParaValue, slave_addr, is_name))
         {
@@ -4648,7 +4662,7 @@ static bool ExDevice_Check(void)
 
         device->online = true;
 
-        ESP_LOGI(TAG, "Test device %s online check passed", device->name);
+        ESP_LOGD(TAG, "Test device %s online check passed", device->name);
     }
 
     return true;
@@ -5805,6 +5819,26 @@ void app_AgingData_Upload_handle(void *arg)
 
 #pragma region 启动与任务创建
 
+/*
+ * 串口日志分级统一入口。
+ *
+ * 默认级别保持 INFO（启动诊断与错误面不变），只把整条链路都是高频
+ * 十六进制/流程打印的 TAG 降到 WARN。原先此处为
+ * esp_log_level_set("*", ESP_LOG_INFO)，它在 mesh_init_Custom() 之后执行，
+ * 会把所有 TAG（含 Mesh 诊断提升）重置回 INFO，使任何降级失效，故改为按 TAG 精确设置。
+ */
+static void app_log_level_init(void)
+{
+    static const char *const warn_tags[] = {
+        "App_Enc", /* app_enc.c 的 TAG（大小写敏感），蓝牙加解密逐包十六进制打印无运维价值 */
+    };
+
+    for (size_t i = 0; i < sizeof(warn_tags) / sizeof(warn_tags[0]); ++i)
+    {
+        esp_log_level_set(warn_tags[i], ESP_LOG_WARN);
+    }
+}
+
 void app_task_init(void)
 {
     if (aging_gap_init() != ESP_OK) {
@@ -5966,8 +6000,7 @@ void app_task_init(void)
         ESP_LOGE(TAG, "button_task create failed");
     }
 
-    // 设置日志级别，后面注释掉
-    esp_log_level_set("*", ESP_LOG_INFO);
+    app_log_level_init();
 }
 
 #pragma endregion

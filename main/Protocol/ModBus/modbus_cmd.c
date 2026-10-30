@@ -1,10 +1,14 @@
 #include "modbus_cmd.h"
 #include "app_crc.h"
 #include "app_mem.h"
+#include "lg_log_config.h"
+#include "esp_log.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static const char *TAG = "modbus_cmd";
 
 static bool modbus_alloc_frame(ModbusFrame *out_frame, size_t len)
 {
@@ -137,21 +141,28 @@ bool Modbus_CheckCrc(const uint8_t *frame, size_t len)
 
 void Modbus_PrintFrame(const uint8_t *frame, size_t len, const char *title)
 {
+#if !LG_LOG_PROTO_DUMP
+    /* 纯打印诊断函数：宏关闭时整体裁剪，避免空循环。 */
+    (void)frame;
+    (void)len;
+    (void)title;
+#else
     if (title)
-        printf("%s: ", title);
+        LG_PROTO_LOG("%s: ", title);
 
     if (!frame || len == 0)
     {
-        printf("NULL\n");
+        LG_PROTO_LOG("NULL\n");
         return;
     }
 
     for (size_t i = 0; i < len; i++)
     {
-        printf("%02X ", frame[i]);
+        LG_PROTO_LOG("%02X ", frame[i]);
     }
 
-    printf("\n");
+    LG_PROTO_LOG("\n");
+#endif /* LG_LOG_PROTO_DUMP */
 }
 
 static int32_t sign_extend(uint32_t value, uint8_t bits)
@@ -185,7 +196,8 @@ bool Modbus_Parse03RawValue(const uint8_t *response,
 
     if (!Modbus_CheckCrc(response, response_len))
     {
-        printf("Modbus CRC check failed\n");
+        /* 现场故障诊断依赖这一行，保持 WARN 而非随协议 dump 关闭。 */
+        ESP_LOGW(TAG, "Modbus CRC check failed");
         return false;
     }
 
@@ -193,7 +205,7 @@ bool Modbus_Parse03RawValue(const uint8_t *response,
 
     if (func & 0x80)
     {
-        printf("Modbus exception response, func=0x%02X, exception=0x%02X\n", func, response[2]);
+        ESP_LOGW(TAG, "Modbus exception response, func=0x%02X, exception=0x%02X", func, response[2]);
         return false;
     }
 
@@ -237,21 +249,26 @@ bool Modbus_Parse03RawValue(const uint8_t *response,
         return true;
     }
 
-    printf("Unsupported register length: %u\n", reg_len);
+    ESP_LOGW(TAG, "Unsupported register length: %u", reg_len);
     return false;
 }
 
 void Modbus_ParseResponseBasic(const uint8_t *response, size_t length)
 {
+#if !LG_LOG_PROTO_DUMP
+    /* 纯打印诊断函数：宏关闭时整体裁剪，避免仅用于打印的局部变量产生告警。 */
+    (void)response;
+    (void)length;
+#else
     if (!response || length < 5)
     {
-        printf("Invalid Modbus response\n");
+        LG_PROTO_LOG("Invalid Modbus response\n");
         return;
     }
 
     if (!Modbus_CheckCrc(response, length))
     {
-        printf("CRC error\n");
+        LG_PROTO_LOG("CRC error\n");
         return;
     }
 
@@ -260,7 +277,7 @@ void Modbus_ParseResponseBasic(const uint8_t *response, size_t length)
 
     if (func_code & 0x80)
     {
-        printf("Slave: %u, Exception Function: 0x%02X, Exception Code: 0x%02X\n",
+        LG_PROTO_LOG("Slave: %u, Exception Function: 0x%02X, Exception Code: 0x%02X\n",
                slave_addr,
                func_code,
                response[2]);
@@ -271,28 +288,28 @@ void Modbus_ParseResponseBasic(const uint8_t *response, size_t length)
     {
         uint8_t byte_count = response[2];
 
-        printf("Slave: %u, Function: 0x03, Byte Count: %u\n", slave_addr, byte_count);
+        LG_PROTO_LOG("Slave: %u, Function: 0x03, Byte Count: %u\n", slave_addr, byte_count);
 
         for (uint8_t i = 0; i < byte_count / 2; i++)
         {
             uint16_t reg_value = ((uint16_t)response[3 + i * 2] << 8) |
                                  response[4 + i * 2];
 
-            printf("Register[%u] raw: %u, hex: 0x%04X\n", i, reg_value, reg_value);
+            LG_PROTO_LOG("Register[%u] raw: %u, hex: 0x%04X\n", i, reg_value, reg_value);
         }
     }
     else if (func_code == 0x06 || func_code == 0x10)
     {
         if (length < 8)
         {
-            printf("Invalid write response length\n");
+            LG_PROTO_LOG("Invalid write response length\n");
             return;
         }
 
         uint16_t reg_addr = ((uint16_t)response[2] << 8) | response[3];
         uint16_t value_or_qty = ((uint16_t)response[4] << 8) | response[5];
 
-        printf("Slave: %u, Function: 0x%02X, Register Address: %u, Value/Quantity: %u\n",
+        LG_PROTO_LOG("Slave: %u, Function: 0x%02X, Register Address: %u, Value/Quantity: %u\n",
                slave_addr,
                func_code,
                reg_addr,
@@ -300,8 +317,9 @@ void Modbus_ParseResponseBasic(const uint8_t *response, size_t length)
     }
     else
     {
-        printf("Unknown function code: 0x%02X\n", func_code);
+        LG_PROTO_LOG("Unknown function code: 0x%02X\n", func_code);
     }
+#endif /* LG_LOG_PROTO_DUMP */
 }
 
 
@@ -322,7 +340,7 @@ bool Modbus_Parse03Response_Simple(const uint8_t *response, size_t response_len,
     // 1. CRC 校验
     if (!Modbus_CheckCrc(response, response_len))
     {
-        printf("Modbus CRC check failed\n");
+        LG_PROTO_LOG("Modbus CRC check failed\n");
         return false;
     }
 
@@ -331,14 +349,14 @@ bool Modbus_Parse03Response_Simple(const uint8_t *response, size_t response_len,
     // 2. 检查异常响应
     if (func & 0x80)
     {
-        printf("Modbus exception response, func=0x%02X, exception code=0x%02X\n", func, response[2]);
+        LG_PROTO_LOG("Modbus exception response, func=0x%02X, exception code=0x%02X\n", func, response[2]);
         return false;
     }
 
     // 3. 检查功能码
     if (func != 0x03)
     {
-        printf("Invalid function code: 0x%02X, expected 0x03\n", func);
+        LG_PROTO_LOG("Invalid function code: 0x%02X, expected 0x03\n", func);
         return false;
     }
 
@@ -348,7 +366,7 @@ bool Modbus_Parse03Response_Simple(const uint8_t *response, size_t response_len,
 
     if (response_len < expected_len)
     {
-        printf("Response too short: %d < %d\n", (int)response_len, (int)expected_len);
+        LG_PROTO_LOG("Response too short: %d < %d\n", (int)response_len, (int)expected_len);
         return false;
     }
 
@@ -357,7 +375,7 @@ bool Modbus_Parse03Response_Simple(const uint8_t *response, size_t response_len,
     
     if (reg_count == 0 || byte_count % 2 != 0)
     {
-        printf("Invalid byte count: %d\n", byte_count);
+        LG_PROTO_LOG("Invalid byte count: %d\n", byte_count);
         return false;
     }
 
@@ -383,7 +401,7 @@ bool Modbus_Parse03Response_Simple(const uint8_t *response, size_t response_len,
     }
     else
     {
-        printf("Unsupported register count: %d (only 1 or 2 registers supported)\n", reg_count);
+        LG_PROTO_LOG("Unsupported register count: %d (only 1 or 2 registers supported)\n", reg_count);
         return false;
     }
 }

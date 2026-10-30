@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "cJSON.h"
+#include "lg_log_config.h"
 
 static const char *TAG = "scpi_dynamic";
 
@@ -697,10 +698,14 @@ esp_err_t scpi_dynamic_parse_response(const scpi_cmd_item_t *cmd,
 void scpi_dynamic_dump(const scpi_protocol_t *protocol)
 {
     if (!protocol) {
-        ESP_LOGI(TAG, "protocol is NULL");
+        ESP_LOGW(TAG, "protocol is NULL");
         return;
     }
 
+#if !LG_LOG_PROTO_DUMP
+    /* 纯打印诊断函数：宏关闭时整体裁剪，避免逐 item 刷屏。 */
+    (void)protocol;
+#else
     ESP_LOGI(TAG, "========== SCPI PROTOCOL ==========");
     ESP_LOGI(TAG, "name: %s", protocol->name ? protocol->name : "");
     ESP_LOGI(TAG, "type: %s", protocol->protocol_type_str ? protocol->protocol_type_str : "");
@@ -729,4 +734,5 @@ void scpi_dynamic_dump(const scpi_protocol_t *protocol)
     }
 
     ESP_LOGI(TAG, "===================================");
+#endif /* LG_LOG_PROTO_DUMP */
 }

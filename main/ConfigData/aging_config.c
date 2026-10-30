@@ -12,6 +12,7 @@
 #include "app_mem.h"
 #include "ConfigData.h"
 #include "appTask.h"
+#include "lg_log_config.h"
 
 static char *aging_strdup(const char *s)
 {
@@ -854,66 +855,70 @@ void aging_config_print(const AgingConfig *cfg)
         return;
     }
 
-    printf("Seq: %d\r\n", cfg->seq);
+#if !LG_LOG_PROTO_DUMP
+    (void)cfg;
+#else
+    LG_PROTO_LOG("Seq: %d\r\n", cfg->seq);
 
-    printf("Devices: %u\r\n", (unsigned)cfg->device_count);
+    LG_PROTO_LOG("Devices: %u\r\n", (unsigned)cfg->device_count);
 
     for (size_t i = 0; i < cfg->device_count; i++)
     {
         const AgingDevice *d = &cfg->devices[i];
 
-        printf("  [%u] Type=%s, Communication=%s, ProtoID=%lld\r\n",
+        LG_PROTO_LOG("  [%u] Type=%s, Communication=%s, ProtoID=%lld\r\n",
                (unsigned)i,
                d->Type ? d->Type : "",
                d->Communication ? d->Communication : "",
                d->ProtoID);
     }
 
-    printf("Aging Steps: %u\r\n", (unsigned)cfg->step_count);
+    LG_PROTO_LOG("Aging Steps: %u\r\n", (unsigned)cfg->step_count);
 
     for (size_t i = 0; i < cfg->step_count; i++)
     {
         const AgingStep *s = &cfg->steps[i];
 
-        printf("  [%u] Method=%s\r\n",
+        LG_PROTO_LOG("  [%u] Method=%s\r\n",
                (unsigned)i,
                s->method ? s->method : "");
 
-        printf("      JudgingCondition count=%u\r\n", (unsigned)s->judging_condition_count);
+        LG_PROTO_LOG("      JudgingCondition count=%u\r\n", (unsigned)s->judging_condition_count);
         for (size_t j = 0; j < s->judging_condition_count; j++)
         {
             const AgingJudgingCondition *cond = &s->judging_conditions[j];
-            printf("        [%u] Name=%s, Value=%s, value_num=%.2f\r\n",
+            LG_PROTO_LOG("        [%u] Name=%s, Value=%s, value_num=%.2f\r\n",
                    (unsigned)j,
                    cond->Name ? cond->Name : "",
                    cond->Value ? cond->Value : "",
                    cond->value_num);
         }
 
-        printf("      SampleData count=%u\r\n", (unsigned)s->sample_data_count);
+        LG_PROTO_LOG("      SampleData count=%u\r\n", (unsigned)s->sample_data_count);
         for (size_t j = 0; j < s->sample_data_count; j++)
         {
-            printf("        [%u] Value=%s\r\n",
+            LG_PROTO_LOG("        [%u] Value=%s\r\n",
                    (unsigned)j,
                    s->sample_data[j].Value ? s->sample_data[j].Value : "");
         }
 
-        printf("      PreAction count=%u\r\n", (unsigned)s->pre_action_count);
+        LG_PROTO_LOG("      PreAction count=%u\r\n", (unsigned)s->pre_action_count);
         for (size_t j = 0; j < s->pre_action_count; j++)
         {
-            printf("        [%u] ParaID=%s, ParaValue=%s\r\n",
+            LG_PROTO_LOG("        [%u] ParaID=%s, ParaValue=%s\r\n",
                    (unsigned)j,
                    s->pre_actions[j].ParaID ? s->pre_actions[j].ParaID : "",
                    s->pre_actions[j].ParaValue ? s->pre_actions[j].ParaValue : "");
         }
 
-        printf("      AfterAction count=%u\r\n", (unsigned)s->after_action_count);
+        LG_PROTO_LOG("      AfterAction count=%u\r\n", (unsigned)s->after_action_count);
         for (size_t j = 0; j < s->after_action_count; j++)
         {
-            printf("        [%u] ParaID=%s, ParaValue=%s\r\n",
+            LG_PROTO_LOG("        [%u] ParaID=%s, ParaValue=%s\r\n",
                    (unsigned)j,
                    s->after_actions[j].ParaID ? s->after_actions[j].ParaID : "",
                    s->after_actions[j].ParaValue ? s->after_actions[j].ParaValue : "");
         }
     }
+#endif /* LG_LOG_PROTO_DUMP */
 }

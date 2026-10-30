@@ -12,6 +12,7 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_random.h"
+#include "lg_log_config.h"
 
 #define TAG "App_Enc"
 
@@ -47,8 +48,16 @@ void iot_aes_cbc_encrypt_data(const uint8_t *scr, uint16_t slen, uint8_t *dst, u
 void iot_aes_cbc_decrypt_data(const uint8_t *src, uint16_t slen, uint8_t *dst, uint16_t *olen, uint8_t *key, uint8_t *iv, uint8_t key_type);
 void server_calculate_secret(uint8_t *public_key, uint8_t *share_key);
 
+/*
+ * 报文十六进制 dump。
+ *
+ * 关闭时必须在函数入口短路：原实现会先在栈上分配 VLA 再逐字节 sprintf，
+ * 即使日志被 esp_log_level_set() 抑制，这部分开销（含 2*len 字节栈）
+ * 仍会在每个蓝牙报文上发生。
+ */
 void printData(const uint8_t *text, size_t text_len, const char *tip)
 {
+#if LG_LOG_PROTO_DUMP
     char hex_str[2 * text_len + 1]; // 为每个字节分配两位表示，加上结束符'\0'
     for (size_t i = 0; i < text_len; i++)
     {
@@ -56,8 +65,12 @@ void printData(const uint8_t *text, size_t text_len, const char *tip)
     }
     hex_str[text_len * 2] = '\0'; // 添加结束符
 
-    // 使用ESP_LOGE输出resend数组的十六进制表示
     ESP_LOGI(TAG, "%s: %s", tip, hex_str);
+#else
+    (void)text;
+    (void)text_len;
+    (void)tip;
+#endif
 }
 
 // 计算MD5秘钥
@@ -118,7 +131,7 @@ esp_err_t app_enc_process_data4(uint8_t *buf2, size_t len, uint8_t *resend)
 
     if (len < 10 || buf2[0] != 0 || buf2[1] != 0x86)
     {
-        ESP_LOGI(TAG, "Invalid input data");
+        ESP_LOGE(TAG, "Invalid input data");
         return ESP_ERR_INVALID_ARG;
     }
     // 假设buf2从某个位置开始存储的是已加密的payload，需要解密部分的长度为plen
@@ -163,7 +176,7 @@ esp_err_t app_enc_process_data4(uint8_t *buf2, size_t len, uint8_t *resend)
 
     if (ecdsa_verify(content, sizeof(content), signature, publicKey) != 1)
     {
-        ESP_LOGI(TAG, "Data signature fial--------------------------------");
+        ESP_LOGE(TAG, "Data signature fial--------------------------------");
         return ESP_FAIL;
     }
 
@@ -198,7 +211,7 @@ esp_err_t app_enc_process_data4(uint8_t *buf2, size_t len, uint8_t *resend)
     // 加密
     iot_aes_cbc_encrypt_data(sendData, 134, resend + 2, &outlen, key, iv, 1);
 
-    ESP_LOGI(TAG, "iot_aes_cbc_encrypt_data  deat  len:%d", outlen);
+    ESP_LOGD(TAG, "iot_aes_cbc_encrypt_data  deat  len:%d", outlen);
 
     resend[0] = 0x00;
     resend[1] = 0x86;
@@ -233,7 +246,7 @@ esp_err_t app_enc_process_data6(uint8_t *buf2, size_t len, uint8_t *resend)
     printData(plaintext, plen, "Data6 Des data");
     if (plaintext[0] != '*' || plaintext[1] != '*' || plaintext[4] != 0)
     {
-        ESP_LOGI(TAG, "Invalid input data");
+        ESP_LOGE(TAG, "Invalid input data");
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -252,19 +265,6 @@ esp_err_t app_enc_process_Decrypt(const uint8_t *buf2, size_t in_data_len, uint8
     uint16_t len = 0;
     len = in_data_len - 6;
     // len = ((uint16_t)buf2[0] << 8) + buf2[1]; // 获取明文长度 这里有问题应该取到后6的数组长度
-    printData(buf2, sizeof(*buf2) / sizeof(buf2[0]), "buf2data");
-    printData(buf2, strlen((char *)buf2) / 2, "data");
-    // len = sizeof(*buf2) / sizeof(buf2[0]) - 6; // 得到明文长度
-    // len = strlen((char *)buf2) / 2 - 6;
-    ESP_LOGI(TAG, "%d", in_data_len);
-    ESP_LOGI(TAG, "%d", len);
-    ESP_LOGI(TAG, "Len_before:%d", len);
-    ESP_LOGI(TAG, "buf[0]:%d", buf2[0]);
-    ESP_LOGI(TAG, "buf[0]:%d", buf2[1]);
-    ESP_LOGI(TAG, "buf[0]:%d", buf2[2]);
-    ESP_LOGI(TAG, "buf[0]:%d", buf2[3]);
-    ESP_LOGI(TAG, "buf[0]:%d", buf2[4]);
-    ESP_LOGI(TAG, "buf[0]:%d", buf2[5]);
     if (len > (in_data_len - 6)) // 检查明文长度标识和整体长度关系，非法则过滤处理
     {
         ESP_LOGE(TAG, "invalid aec-cbc len");
@@ -413,7 +413,7 @@ int ecdsa_verify(uint8_t *data, uint16_t len, uint8_t *sign_data, uint8_t *publi
     }
     else
     {
-        ESP_LOGI(TAG, "ecdsa verify signature ... fail\n\n");
+        ESP_LOGE(TAG, "ecdsa verify signature ... fail\n\n");
     }
 
     mbedtls_mpi_free(&r);
@@ -619,7 +619,7 @@ void iot_aes_cbc_decrypt_data(const uint8_t *src, uint16_t slen, uint8_t *dst, u
     mbedtls_aes_context aes_ctx;
     uint8_t iv_buf[16];
     size_t aes_decrypt_len = 0;
-    ESP_LOGI(TAG, "len_slen:%d", slen);
+    ESP_LOGD(TAG, "len_slen:%d", slen);
     uint16_t count = slen / 16;
 
     memcpy(iv_buf, iv, sizeof(iv_buf)); // 复制第一次初始化IV向量
@@ -635,18 +635,14 @@ void iot_aes_cbc_decrypt_data(const uint8_t *src, uint16_t slen, uint8_t *dst, u
         // ESP_LOGI(TAG, "aes128");
         mbedtls_aes_setkey_dec(&aes_ctx, key, 128); // 设置AES-CBC解密密钥128
     }
-    ESP_LOGI(TAG, "count:%d", count);
+    ESP_LOGD(TAG, "count:%d", count);
     for (uint16_t i = 0; i < count; i++)
     {
-        ESP_LOGI(TAG, "ENTER");
         // 每一次解密16字节
         mbedtls_aes_crypt_cbc(&aes_ctx, MBEDTLS_AES_DECRYPT, 16, iv_buf, src + aes_decrypt_len, dst + aes_decrypt_len);
         memcpy(iv_buf, src + aes_decrypt_len, sizeof(iv_buf)); // 本次源密文作为下一次AES-CBC解密的初始IV向量
         aes_decrypt_len += 16;
-        printData(dst, 16, "every dec");
     }
-    ESP_LOGE(TAG, "dst:%d", *dst);
-    //*dst=dst;
     *olen = aes_decrypt_len;
     mbedtls_aes_free(&aes_ctx); // 释放并清除指定的 AES 上下文
 }

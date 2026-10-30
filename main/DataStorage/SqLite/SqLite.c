@@ -1713,7 +1713,7 @@ int InsertStructuredRecord(int seq_no,
         return -1;
     }
 
-    ESP_LOGI(TAG,
+    ESP_LOGD(TAG,
              "structured record committed: seq_no=%d, PN=%s, RecordId=%s, step=%d, timestamp=%d, pushed=%d, value_len=%u",
              seq_no,
              pn,
@@ -1855,7 +1855,7 @@ int UpdateRecordPushStateByPNAndID(const char *pn, const char *record_id, int se
         return -1;
     }
 
-    ESP_LOGI(TAG, "Push-state updated: PN=%s seq_no=%d state=%d", pn, seq_no, state);
+    ESP_LOGD(TAG, "Push-state updated: PN=%s seq_no=%d state=%d", pn, seq_no, state);
     sqlite_unlock();
     return 0;
 }
@@ -2541,6 +2541,4 @@ void SqLite_Init(void)
                  "SQLite initialization failed: rc=%d. No database file was automatically deleted.",
                  rc);
     }
-
-    esp_log_level_set(TAG, ESP_LOG_INFO);
 }

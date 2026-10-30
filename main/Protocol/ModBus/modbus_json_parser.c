@@ -2,6 +2,7 @@
 #include "cJSON.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "lg_log_config.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -101,7 +102,7 @@ bool ModbusJson_Parse(const char *json_text, ProtocolInfo *out_info)
     cJSON *root = cJSON_Parse(json_text);
     if (!root)
     {
-        printf("JSON parse failed: %s\n", cJSON_GetErrorPtr());
+        ESP_LOGE(TAG, "JSON parse failed: %s", cJSON_GetErrorPtr());
         return false;
     }
 
@@ -116,7 +117,7 @@ bool ModbusJson_Parse(const char *json_text, ProtocolInfo *out_info)
     cJSON *contents = cJSON_GetObjectItemCaseSensitive(root, "contents");
     if (!cJSON_IsArray(contents))
     {
-        printf("JSON field 'contents' is not array\n");
+        ESP_LOGE(TAG, "JSON field 'contents' is not array");
         cJSON_Delete(root);
         return false;
     }
@@ -193,27 +194,32 @@ void ModbusJson_Print(const ProtocolInfo *info)
     if (!info)
         return;
 
-    printf("Protocol Name: %s\n", info->name);
-    printf("Protocol Type: %d, %s\n", info->protocol_type, info->protocol_type_str);
-    printf("Description  : %s\n", info->description);
-    printf("Item Count   : %u\n", (unsigned int)info->item_count);
+#if !LG_LOG_PROTO_DUMP
+    /* 纯打印诊断函数：宏关闭时整体裁剪。 */
+    return;
+#else
+    LG_PROTO_LOG("Protocol Name: %s\n", info->name);
+    LG_PROTO_LOG("Protocol Type: %d, %s\n", info->protocol_type, info->protocol_type_str);
+    LG_PROTO_LOG("Description  : %s\n", info->description);
+    LG_PROTO_LOG("Item Count   : %u\n", (unsigned int)info->item_count);
 
     for (size_t i = 0; i < info->item_count; i++)
     {
         const ProtocolItem *item = &info->items[i];
 
-        printf("[%u] name=%s, rw=%s, unit=%s, addr=%u, len=%u, type=%s, precision=%.6f, unsigned=%u, compensation=%.6f\n",
-               (unsigned int)i,
-               item->name,
-               item->rw_str,
-               item->unit,
-               item->reg_addr,
-               item->reg_len,
-               item->data_type,
-               item->precision,
-               item->is_unsigned,
-               item->compensation);
+        LG_PROTO_LOG("[%u] name=%s, rw=%s, unit=%s, addr=%u, len=%u, type=%s, precision=%.6f, unsigned=%u, compensation=%.6f\n",
+                     (unsigned int)i,
+                     item->name,
+                     item->rw_str,
+                     item->unit,
+                     item->reg_addr,
+                     item->reg_len,
+                     item->data_type,
+                     item->precision,
+                     item->is_unsigned,
+                     item->compensation);
     }
+#endif /* LG_LOG_PROTO_DUMP */
 }
 
 const ProtocolItem *ModbusJson_FindItemByName(const ProtocolInfo *info, const char *name)

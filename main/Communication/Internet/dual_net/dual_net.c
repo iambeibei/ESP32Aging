@@ -253,7 +253,7 @@ cleanup:
     {
         ESP_LOGW(TAG, "关闭 MQTT 探测 socket 失败：errno=%d", errno);
     }
-    ESP_LOGI(TAG, "探测 %s(%s) -> MQTT %s:%d（源 IP=" IPSTR "）结果：%s，阶段=%s errno=%d",
+    ESP_LOGD(TAG, "探测 %s(%s) -> MQTT %s:%d（源 IP=" IPSTR "）结果：%s，阶段=%s errno=%d",
              esp_netif_get_ifkey(netif), iface.ifr_name, SERVER_IP, SERVER_UDP_Port,
              IP2STR(&ip_info.ip), reachable ? "通" : "不通", stage, probe_errno);
     return reachable;
