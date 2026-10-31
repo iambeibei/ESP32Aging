@@ -66,16 +66,7 @@
  */
 #define LG_AGING_START_STAGGER_BASE_SEC 2
 
-/*
- * AgingDeviceCheck 状态（老化设备连接/通信检查）最大尝试次数。
- * 每轮 = 一轮完整 BLE 扫描（10s）+ 连接 + GATT 设置 + 通信检查，
- * 任一环节失败计一次；达本次数仍失败 → agingError + 终止老化任务。
- * 2026-10-20 由 6 次（FailCount > 5）上调为 15 次（用户决策）：
- * 现场 DUT 上电晚/被占用时连接建立失败需多轮重试，且每轮失败后有
- * 3s 退避（appTask.c AgingDeviceCheck 蓝牙分支）。
- * 2026-10-26 由 15 上调为 25：现场 BLE 设备密集，目标设备广播被碰撞
- * 淹没（实测 15 轮中 13 轮扫不到），单轮约 13s，25 轮约 5.4 分钟窗口。
- */
+/* 非 BLE 老化设备的通信检查次数上限；BLE 准备与恢复统一采用 10 分钟期限。 */
 #define AGING_DEVICE_CHECK_MAX_ATTEMPTS 25
 
 /*
@@ -86,6 +77,10 @@
  */
 #define LG_REJECT_REPORT_MIN_INTERVAL_MS 10000
 #define LG_GETPROTO_TIMEOUT_MS 10000
+#define AGING_WAIT_SLICE_MS 100u
+#define AGING_HANDOVER_POLL_MS 20u
+#define BLE_IO_LOCK_WAIT_MS 1200u
+#define BLE_INIT_GRACE_MS 20000u
 
 #define NVS_KEY_CURRENT_PN "bt_name"
 #define NVS_KEY_READY_PN "bt_name_Ready"
@@ -145,14 +140,14 @@ typedef struct
 } AgingUploadPacket;
 
 long Programld = 0;      // 老化任务ID
-uint8_t Cannextstep = 0; // 默认为0，群控模式下，收到下一步操作指令后，设置为1，表示可以执行下一步老化操作
+static atomic_uchar Cannextstep; // MQTT命令任务置位，老化控制任务消费。
 uint8_t AgingCMode = 0;
 uint8_t CycleIndex = 0;
 AgingConfig agingcfg = {0}; // 定义全局老化配置结构体
 // 老化设备的当前老化步骤
-uint8_t CurrentAgingStep = 0;
+static atomic_uchar CurrentAgingStep;
 
-AgingProcessState agingState = AgingIdle; // 定义全局老化状态变量
+static _Atomic(AgingProcessState) agingState = AgingIdle;
 
 // 当前正在执行老化任务所使用的PN；一旦进入RUNNING，本轮结束前禁止修改。
 char PN_Code[64] = {0};
@@ -183,7 +178,7 @@ typedef enum
     AGING_CMD_RUNNING
 } AgingCommandState;
 
-static AgingCommandState s_aging_cmd_state = AGING_CMD_IDLE;
+static _Atomic(AgingCommandState) s_aging_cmd_state = AGING_CMD_IDLE;
 static int s_pending_start_seq = 0;
 
 /*
@@ -194,13 +189,13 @@ static int s_pending_start_seq = 0;
 
 int8_t Mqtt_Log_Mode = -1; // MQTT日志上报模式，-1表示不启动，0为启动运行日志，1为启动错误日志
 
-AgingDataAcquisitionMode agingDataAMode = IdleState;
+static _Atomic(AgingDataAcquisitionMode) agingDataAMode = IdleState;
 
-TaskHandle_t BleData_task_handle = NULL; // 蓝牙任务句柄，用于删除任务使用
+TaskHandle_t BleData_task_handle = NULL; // 常驻蓝牙鉴权/透传任务
 
-TaskHandle_t Aging_test_task_handle = NULL; // 老化工艺执行任务句柄，用于删除任务使用
+TaskHandle_t Aging_test_task_handle = NULL; // 老化控制任务，自行退出后清空
 
-TaskHandle_t AgingData_task_handle = NULL; // 老化数据获取处理任务句柄，用于删除任务使用
+TaskHandle_t AgingData_task_handle = NULL; // 采样任务，自行退出后清空
 
 /* 长期任务保存句柄，防止按键调试或网络重连时重复创建同一任务。 */
 static TaskHandle_t s_uart_json_task_handle = NULL;
@@ -212,13 +207,21 @@ static TaskHandle_t s_aging_upload_task_handle = NULL;
 static TaskHandle_t s_button_task_handle = NULL;
 
 static atomic_bool s_sample_reading; /* 正常结束等待本次采样退出后才释放设备对象。 */
+/* 老化控制/采样任务协作退出，禁止删除持有通信或存储锁的任务。 */
+static atomic_bool s_aging_cancel;
+static atomic_bool s_aging_ctrl_exited = true;
+static atomic_bool s_aging_sample_exited = true;
+static atomic_bool s_ble_recovering;
+static atomic_bool s_ble_auth_owner = true;
+static atomic_uint s_ble_ready_session;
+static StaticSemaphore_t s_ble_io_storage;
+static SemaphoreHandle_t s_ble_io_mutex;
 static QueueHandle_t Upload_data_queue = NULL; // 上传数据队列
 
 AgingResumeState agingResumeState = {0}; // 定义全局老化恢复状态变量
 
-/* 蓝牙断开标志位，为1是主动去断开蓝牙触发的，为0是被动断开蓝牙触发的。
- * Bluedroid 任务写、CPU1 业务任务读，加 volatile 保证跨任务可见性。 */
-volatile uint8_t BTDisConnect = 0;
+/* 主动断开标志由业务任务设置、Bluedroid回调消费，使用原子访问。 */
+static atomic_uint BTDisConnect;
 
 void Aging_Test_Task(void *arg);
 void app_AgingData_Get_handle(void *arg);
@@ -228,6 +231,11 @@ static bool Data_Get_Method(Externaldevice *device, const char *id, uint8_t slav
 static void Device_Init(Externaldevice **device1, int devicecount);
 static void AgingDevice_RuntimeFree(void);
 static bool ExDevice_Check(void);
+static bool Data_Set_Method(Externaldevice *device, const char *idorname, const char *param, uint8_t slave_addr, uint8_t is_name);
+static bool aging_cancel_tasks(void);
+static bool aging_ble_ensure_ready(void);
+static bool aging_task_wait_ms(uint32_t wait_ms);
+static uint32_t aging_ble_remaining_ms(void);
 const char *AgingDataName(const char *id);
 
 /*
@@ -242,7 +250,11 @@ static BaseType_t create_cpu1_task(TaskFunction_t task_fn, const char *task_name
         return pdPASS;
     }
 
+    atomic_bool *exited = task_fn == Aging_Test_Task ? &s_aging_ctrl_exited :
+                          task_fn == app_AgingData_Get_handle ? &s_aging_sample_exited : NULL;
+    if (exited != NULL) atomic_store(exited, false);
     BaseType_t ret = xTaskCreatePinnedToCore(task_fn, task_name, stack_size, NULL, priority, task_handle, LG_APP_CPU_CORE);
+    if (ret != pdPASS && exited != NULL) atomic_store(exited, true);
     if (ret == pdPASS)
     {
         ESP_LOGI(TAG, "Task %s created on CPU%d, stack=%u, priority=%u", task_name, LG_APP_CPU_CORE, (unsigned)stack_size, (unsigned)priority);
@@ -306,18 +318,27 @@ static void print_application_task_stacks(void)
  * 日志会话从收到 start_aging 指令开始，直到老化完成、停止或启动失败。
  * 所有错误均写入本地；只有日志会话激活后才通过 MQTT 上报运行日志和错误日志。
  */
-static volatile bool AgingLogActive = false;
+static atomic_bool AgingLogActive;
 
-/*
- * BLE 异常断开事件：ble_disconnect_cb() 只负责置位（回调上下文不碰存储/MQTT/任务），
- * 由 Aging_Test_Task 主循环与 AgingAction 各长循环内的检查点消费并决定
- * 「蓝牙老化会话优雅中止」还是「忽略」。
- * 严禁在此路径整机重启：根节点掉线期间 mesh 重扫会击穿 BLE 链路，
- * 重启会杀死本可继续的老化会话（见 CHILD_NODE_ROOT_LOSS_DESIGN.md 第 7.1 节）。
- * 生产者/消费者跨任务（Bluedroid GATTC 任务 vs CPU1 老化任务），用 atomic_exchange
- * 消费，避免「检测与清除」窗口吞掉第二次事件（CERT C CON32-C）。
- */
+/* BLE 回调只发布断开原因、失效连接代次和发生时刻。
+ * CPU1 老化任务在原工步调用栈内执行有界恢复，恢复前不关闭会话、不释放配置。
+ * 回调与业务任务用原子标志交付事件；是否可通信始终再次核验当前连接代次。 */
 static atomic_bool s_ble_abnormal_disconnect;
+static atomic_uint s_ble_disconnect_reason;
+static atomic_uint s_ble_disconnect_session;
+static atomic_uint s_ble_disconnect_tick;
+
+#define BLE_AGING_RECOVERY_TIMEOUT_MS (10u * 60u * 1000u)
+#define BLE_AGING_RETRY_DELAY_MS 3000u
+/* BLE 事务锁最多等 1200ms，应答最多等 1000ms，给提交和调度留出余量。 */
+#define BLE_RECOVERY_TRANSACTION_BUDGET_MS 2500u
+#define AGING_CANCEL_WAIT_MS 10000u
+/* 以下恢复游标只由老化控制任务访问；重连不重新进入工步循环。 */
+static AgingStep *s_ble_resume_step;
+static bool s_ble_replay_pre;
+static bool s_ble_recovery_active;
+static TickType_t s_ble_recovery_start_tick;
+static unsigned s_ble_recovery_attempt;
 
 /*
  * 蓝牙老化设备发现节奏（2026-10-26）：
@@ -1715,14 +1736,14 @@ static int make_can_write_transfer_by_nameorid(Externaldevice *device,
 #pragma endregion
 
 #pragma region BLE连接与接收任务
-/* 用于判断是否扫描完成：Bluedroid 扫描回调写、CPU1 老化任务读，需 volatile 保证可见性 */
-static volatile bool ScanComplete = false;
+/* Bluedroid 回调发布、CPU1控制任务读取，使用原子标志交付结果。 */
+static atomic_bool ScanComplete;
 /*
  * BLE 连接结果：Bluedroid GATTC 回调（ble_connect_cb）写、CPU1 老化任务读。
  * Complete=结果已交付；Success=建立成功（false 表示建立失败，需重试）。
  */
-static volatile bool BleConnectComplete = false;
-static volatile bool BleConnectSuccess = false;
+static atomic_bool BleConnectComplete;
+static atomic_bool BleConnectSuccess;
 // BLE扫描完成回调
 void ble_scan_complete_cb(ble_device_info_t *devices, int device_count)
 {
@@ -1768,7 +1789,7 @@ void ble_connect_cb(bool success, const char *device_name)
     }
 }
 // BLE断开连接回调
-void ble_disconnect_cb(void)
+void ble_disconnect_cb(uint8_t reason, uint32_t session_id)
 {
     if (BTDisConnect == 0) // 异常断开
     {
@@ -1777,8 +1798,12 @@ void ble_disconnect_cb(void)
          * 且根掉线期间 mesh 重扫即可击穿 BLE 链路，见 CHILD_NODE_ROOT_LOSS_DESIGN.md）。
          * 回调只置事件标志，具体处置由 Aging_Test_Task 检查点完成。
          */
+        atomic_store(&s_ble_disconnect_reason, reason);
+        atomic_store(&s_ble_disconnect_session, session_id);
+        atomic_store(&s_ble_disconnect_tick, xTaskGetTickCount());
         atomic_store(&s_ble_abnormal_disconnect, true);
-        ESP_LOGW(TAG, "BLE disconnected abnormally; deferred to aging task, no restart");
+        if (session_id == atomic_load(&s_ble_ready_session))
+            atomic_store(&s_ble_recovering, true);
     }
     else if (BTDisConnect == 1) // 主动断开
     {
@@ -1893,11 +1918,24 @@ void app_ble_data_handle(void *arg)
     uint8_t BleRecBuf[1024] = {0};
     while (1)
     {
+        if (!atomic_load(&s_ble_auth_owner) ||
+            xSemaphoreTake(s_ble_io_mutex, pdMS_TO_TICKS(AGING_WAIT_SLICE_MS)) != pdTRUE) {
+            vTaskDelay(pdMS_TO_TICKS(AGING_HANDOVER_POLL_MS));
+            continue;
+        }
+        if (!atomic_load(&s_ble_auth_owner)) {
+            if (xSemaphoreGive(s_ble_io_mutex) != pdTRUE) ESP_LOGE(TAG, "释放蓝牙接收锁失败");
+            continue;
+        }
         uint32_t session_id;
-        int len = app_ble_recv_data_for_session(BleRecBuf, sizeof(BleRecBuf), portMAX_DELAY, &session_id);
+        int len = app_ble_recv_data_for_session(BleRecBuf, sizeof(BleRecBuf), pdMS_TO_TICKS(AGING_WAIT_SLICE_MS), &session_id);
+        /* 鉴权处理期间保持接收所有权；业务收发必须等其完全退出。 */
+        if (len > 0 && app_ble_process_auth(BleRecBuf, len, session_id)) {
+            if (xSemaphoreGive(s_ble_io_mutex) != pdTRUE) ESP_LOGE(TAG, "释放蓝牙接收锁失败");
+            continue;
+        }
         if (len > 0)
         {
-            if (app_ble_process_auth(BleRecBuf, len, session_id)) continue;
             // 会话解密
             if (ble_session_is_encrypted())
             {
@@ -1906,6 +1944,7 @@ void app_ble_data_handle(void *arg)
                 if (app_enc_process_Decrypt(BleRecBuf, len, data, &outLen) != ESP_OK ||
                     outLen > sizeof(BleRecBuf)) {
                     ESP_LOGE(TAG, "蓝牙业务报文解密失败");
+                    if (xSemaphoreGive(s_ble_io_mutex) != pdTRUE) ESP_LOGE(TAG, "释放蓝牙接收锁失败");
                     continue;
                 }
                 memcpy(BleRecBuf, data, outLen);
@@ -1920,6 +1959,7 @@ void app_ble_data_handle(void *arg)
                 }
             }
         }
+        if (xSemaphoreGive(s_ble_io_mutex) != pdTRUE) ESP_LOGE(TAG, "释放蓝牙接收锁失败");
     }
 }
 
@@ -3111,24 +3151,13 @@ void parse_jsonCommand_MQTT(const char *packet, int len)
                 aging_runtime_log("Stop aging command received, command_state=%s",
                                   aging_cmd_state_name(s_aging_cmd_state));
 
-                if (ble_control_pause() != ESP_OK) {
-                    device_response_publish_point(Seq->valueint, 0, "蓝牙控制尚未退出，请重试停止");
+                if (!aging_cancel_tasks()) {
+                    device_response_publish_point(Seq->valueint, 0, "老化任务正在退出，请重试停止");
                     goto cleanup;
                 }
 
                 app_mqtt_event_cancel_taskcp();
                 aging_gap_session_close();
-                if (Aging_test_task_handle != NULL)
-                {
-                    vTaskDelete(Aging_test_task_handle);
-                    Aging_test_task_handle = NULL;
-                }
-                if (AgingData_task_handle != NULL)
-                {
-                    vTaskDelete(AgingData_task_handle);
-                    AgingData_task_handle = NULL;
-                    atomic_store(&s_sample_reading, false);
-                }
                 if (ble_is_connected())
                 {
                     BTDisConnect = 1;
@@ -3918,7 +3947,7 @@ static void Device_Init(Externaldevice **device1, int devicecount)
     }
 }
 
-static bool Data_Set_Method(Externaldevice *device, const char *idorname, const char *param, uint8_t slave_addr, uint8_t is_name)
+static bool Data_Set_Impl(Externaldevice *device, const char *idorname, const char *param, uint8_t slave_addr, uint8_t is_name)
 {
     bool SetFlag = false;
     uint8_t RecBuf[256] = {0};
@@ -4124,7 +4153,7 @@ static bool Data_Set_Method(Externaldevice *device, const char *idorname, const 
 }
 
 // 外接设备使用name，老化设备使用id，is_name=1表示使用name，is_name=0表示使用id
-static bool Data_Get_Method(Externaldevice *device, const char *idorname, uint8_t slave_addr, double *value, uint8_t is_name)
+static bool Data_Get_Impl(Externaldevice *device, const char *idorname, uint8_t slave_addr, double *value, uint8_t is_name)
 {
     bool GetFlag = false;
     uint8_t RecBuf[1024] = {0};
@@ -4286,9 +4315,85 @@ static bool Data_Get_Method(Externaldevice *device, const char *idorname, uint8_
     return GetFlag;
 }
 
+/* BLE 一次请求及应答属于同一事务；共享接收队列不能被采样、条件读取和鉴权争抢。
+ * 仅任务上下文调用，不在 ISR/回调使用。调用期间借用设备和缓冲，不转移所有权。 */
+static bool aging_device_uses_ble(const Externaldevice *device)
+{
+    return device != NULL && strncmp(device->CommunicationMode, "Bluetooth", 9) == 0;
+}
+
+static bool Data_Set_Method(Externaldevice *device, const char *idorname, const char *param, uint8_t slave_addr, uint8_t is_name)
+{
+    if (!aging_device_uses_ble(device))
+        return Data_Set_Impl(device, idorname, param, slave_addr, is_name);
+    if (xSemaphoreTake(s_ble_io_mutex, pdMS_TO_TICKS(BLE_IO_LOCK_WAIT_MS)) != pdTRUE) return false;
+    uint32_t session = ble_session_id();
+    bool ok = !atomic_load(&s_ble_auth_owner) && !atomic_load(&s_aging_cancel) &&
+              ble_session_is_current(session) &&
+              Data_Set_Impl(device, idorname, param, slave_addr, is_name) &&
+              ble_session_is_current(session);
+    if (xSemaphoreGive(s_ble_io_mutex) != pdTRUE) ESP_LOGE(TAG, "释放蓝牙事务锁失败");
+    return ok;
+}
+
+static bool Data_Get_Method(Externaldevice *device, const char *idorname, uint8_t slave_addr, double *value, uint8_t is_name)
+{
+    if (!aging_device_uses_ble(device))
+        return Data_Get_Impl(device, idorname, slave_addr, value, is_name);
+    if (xSemaphoreTake(s_ble_io_mutex, pdMS_TO_TICKS(BLE_IO_LOCK_WAIT_MS)) != pdTRUE) return false;
+    uint32_t session = ble_session_id();
+    bool ok = !atomic_load(&s_ble_auth_owner) && !atomic_load(&s_aging_cancel) &&
+              ble_session_is_current(session) &&
+              Data_Get_Impl(device, idorname, slave_addr, value, is_name) &&
+              ble_session_is_current(session);
+    if (!ok && value != NULL) *value = -1;
+    if (xSemaphoreGive(s_ble_io_mutex) != pdTRUE) ESP_LOGE(TAG, "释放蓝牙事务锁失败");
+    return ok;
+}
+
 #pragma endregion
 
 #pragma region 老化指令与工艺执行
+
+/* 所有长等待均可由人工停止打断；不持锁调用。 */
+static bool aging_task_wait_ms(uint32_t wait_ms)
+{
+    TickType_t start = xTaskGetTickCount();
+    TickType_t duration = pdMS_TO_TICKS(wait_ms);
+    for (;;) {
+        if (atomic_load(&s_aging_cancel)) return false;
+        TickType_t elapsed = xTaskGetTickCount() - start;
+        if (elapsed >= duration) break;
+        TickType_t remaining = duration - elapsed;
+        vTaskDelay(remaining < pdMS_TO_TICKS(AGING_WAIT_SLICE_MS) ? remaining : pdMS_TO_TICKS(AGING_WAIT_SLICE_MS));
+    }
+    return !atomic_load(&s_aging_cancel);
+}
+
+/* 命令任务调用；超时保持取消意图和运行上下文，允许后续 stop 重试，绝不强删任务。 */
+static bool aging_cancel_tasks(void)
+{
+    atomic_store(&s_aging_cancel, true);
+    atomic_store(&s_ble_recovering, true);
+    if (ble_control_pause() != ESP_OK) return false;
+    TickType_t start = xTaskGetTickCount();
+    while (!atomic_load(&s_aging_ctrl_exited) || !atomic_load(&s_aging_sample_exited)) {
+        if (xTaskGetTickCount() - start >= pdMS_TO_TICKS(AGING_CANCEL_WAIT_MS)) return false;
+        vTaskDelay(pdMS_TO_TICKS(AGING_HANDOVER_POLL_MS));
+    }
+    atomic_store(&s_ble_auth_owner, true);
+    atomic_store(&s_ble_ready_session, 0);
+    return true;
+}
+
+/* 控制任务关闭采样任务后再释放配置；采样任务自行释放本次报文和事务锁。 */
+static void aging_finish_sampling(void)
+{
+    atomic_store(&s_aging_cancel, true);
+    while (!atomic_load(&s_aging_sample_exited)) vTaskDelay(pdMS_TO_TICKS(AGING_HANDOVER_POLL_MS));
+    atomic_store(&s_ble_auth_owner, true);
+    atomic_store(&s_ble_ready_session, 0);
+}
 
 // 最后验证时使用
 
@@ -4363,7 +4468,7 @@ static bool aging_command_json_parse(const char *packet_copy)
         return false;
     }
 
-    if (ble_control_pause() != ESP_OK) {
+    if (!aging_cancel_tasks()) {
         aging_error_log("旧蓝牙控制操作尚未退出，拒绝创建新老化任务");
         return false;
     }
@@ -4372,17 +4477,11 @@ static bool aging_command_json_parse(const char *packet_copy)
     agingState = AgingIdle;
     agingDataAMode = IdleState;
 
-    if (Aging_test_task_handle != NULL)
-    {
-        vTaskDelete(Aging_test_task_handle);
-        Aging_test_task_handle = NULL;
-    }
-    if (AgingData_task_handle != NULL)
-    {
-        vTaskDelete(AgingData_task_handle);
-        AgingData_task_handle = NULL;
-        atomic_store(&s_sample_reading, false);
-    }
+    atomic_store(&s_aging_cancel, false);
+    atomic_store(&s_ble_recovering, false);
+    s_ble_resume_step = NULL;
+    s_ble_replay_pre = false;
+    s_ble_recovery_active = false;
     if (!aging_gap_session_begin(PN_Code, RecordId, agingResumeState.aging_valid == 1)) {
         aging_error_log("老化采样会话初始化失败");
         return false;
@@ -4567,6 +4666,8 @@ static bool Aging_Execute_ActionList(AgingActionItem *actions, size_t action_cou
 
     for (size_t j = 0; j < action_count; j++)
     {
+        if (atomic_load(&s_aging_cancel)) return false;
+        if (s_ble_recovery_active && aging_ble_remaining_ms() < BLE_RECOVERY_TRANSACTION_BUDGET_MS) return false;
         AgingActionItem *act = &actions[j];
 
         const char *parameter = (is_name == 1) ? act->ParaName : act->ParaID;
@@ -4579,7 +4680,7 @@ static bool Aging_Execute_ActionList(AgingActionItem *actions, size_t action_cou
                             device_name,
                             (unsigned)(j + 1));
             all_success = false;
-            continue;
+            break;
         }
 
         ESP_LOGD(TAG, "Action: Para=%s Value=%s", parameter, act->ParaValue);
@@ -4593,6 +4694,7 @@ static bool Aging_Execute_ActionList(AgingActionItem *actions, size_t action_cou
                             parameter,
                             act->ParaValue);
             all_success = false;
+            break;
         }
     }
 
@@ -4670,29 +4772,221 @@ static bool ExDevice_Check(void)
 
 // static double aging_get_condition_value(const AgingStep *step, const char *expect_name, double default_value)
 
-/*
- * 消费 BLE 异常断开事件并判定是否需要中止当前老化会话。
- * 返回 true：当前正是蓝牙老化会话，调用方必须执行优雅中止并退出任务；
- * 返回 false：无需中止（无事件，或当前不是蓝牙老化会话——后者记一次警告）。
- * 用于 Aging_Test_Task 主循环及 AgingAction 各长循环内部：Standing/Discharge/
- * Recharge 等阶段可能持续数小时且不返回外层循环，只在循环顶部检查会导致
- * 掉线后迟迟不被处理（设计文档 7.1 节）。
- */
-static bool aging_ble_link_lost_pending(void)
+/* 恢复期限只由控制任务维护；失败尝试和重新鉴权不能延长同一故障窗口。 */
+static uint32_t aging_ble_remaining_ms(void)
 {
-    if (!atomic_exchange(&s_ble_abnormal_disconnect, false))
-    {
-        return false;
-    }
+    TickType_t elapsed = xTaskGetTickCount() - s_ble_recovery_start_tick;
+    TickType_t limit = pdMS_TO_TICKS(BLE_AGING_RECOVERY_TIMEOUT_MS);
+    return elapsed >= limit ? 0 : (uint32_t)((limit - elapsed) * portTICK_PERIOD_MS);
+}
 
-    if (agingState != AgingIdle && Aging_device != NULL &&
-        strncmp(Aging_device[0].CommunicationMode, "Bluetooth", 9) == 0)
-    {
-        return true;
-    }
+static bool aging_ble_wait_ms(uint32_t wait_ms)
+{
+    uint32_t remaining = aging_ble_remaining_ms();
+    if (remaining == 0 || atomic_load(&s_aging_cancel)) return false;
+    if (wait_ms > remaining) wait_ms = remaining;
+    return aging_task_wait_ms(wait_ms) && aging_ble_remaining_ms() != 0;
+}
 
-    ESP_LOGW(TAG, "BLE abnormal disconnect ignored: no active Bluetooth aging session");
+/* 收发消费者交接必须等待上一次接收/解密退出。 */
+static bool aging_ble_set_auth_owner(bool auth_owner)
+{
+    /* 先关闭新接收，再等旧消费者释放锁，避免同优先级消费者反复抢占交接。 */
+    if (!auth_owner) atomic_store(&s_ble_auth_owner, false);
+    while (!atomic_load(&s_aging_cancel) && aging_ble_remaining_ms() != 0) {
+        uint32_t remaining_ms = aging_ble_remaining_ms();
+        TickType_t wait_ticks = pdMS_TO_TICKS(remaining_ms < AGING_HANDOVER_POLL_MS ? remaining_ms : AGING_HANDOVER_POLL_MS);
+        if (xSemaphoreTake(s_ble_io_mutex, wait_ticks) == pdTRUE) {
+            atomic_store(&s_ble_auth_owner, auth_owner);
+            if (xSemaphoreGive(s_ble_io_mutex) != pdTRUE) ESP_LOGE(TAG, "释放蓝牙事务锁失败");
+            return true;
+        }
+    }
     return false;
+}
+
+/* 整组前置动作重复执行是本功能明确选择的恢复语义；不重发后置动作及完成通知。 */
+static bool aging_step_pre_actions(AgingStep *step)
+{
+    if (step == NULL || atomic_load(&s_aging_cancel)) return false;
+    if (!Aging_Execute_ActionList(step->pre_actions, step->pre_action_count, 1,
+                                 &Aging_device[0], step->method, "pre_action", 0)) return false;
+    for (int j = 0; j < read_device_count; ++j) {
+        int k = -1;
+        for (size_t n = 0; n < read_devices[j].step_count; ++n) {
+            if (read_devices[j].steps[n].method != NULL && step->method != NULL &&
+                strcmp(read_devices[j].steps[n].method, step->method) == 0) {
+                k = (int)n;
+                break;
+            }
+        }
+        if (k >= 0 && !Aging_Execute_ActionList(read_devices[j].steps[k].pre_actions,
+                read_devices[j].steps[k].pre_action_count, 1, &read_devices[j],
+                step->method, "pre_action", 1)) return false;
+    }
+    return !atomic_load(&s_aging_cancel);
+}
+
+static const char *aging_ble_check_parameter(void)
+{
+    if (Aging_device == NULL || Aging_device[0].steps == NULL) return NULL;
+    for (size_t i = 0; i < Aging_device[0].step_count; ++i) {
+        AgingStep *step = &Aging_device[0].steps[i];
+        if (step->sample_data != NULL && step->sample_data_count != 0)
+            return step->sample_data[0].Value;
+    }
+    return NULL;
+}
+
+/* 每次尝试均先扫描冻结目标；原 SDK 请求未退出时下层拒绝新请求，禁止并发建链。 */
+static bool aging_ble_connect_attempt(void)
+{
+    if (BleData_task_handle == NULL &&
+        create_cpu1_task(app_ble_data_handle, "ble_data", LG_STACK_BLE_DATA,
+                        LG_PRIO_BLE_DATA, &BleData_task_handle) != pdPASS) return false;
+    if (ble_is_connected()) {
+        BTDisConnect = 1;
+        ble_disconnect();
+        while (ble_is_connected()) if (!aging_ble_wait_ms(AGING_WAIT_SLICE_MS)) return false;
+    }
+    if (!aging_ble_set_auth_owner(true)) return false;
+    ScanComplete = false;
+    ble_control_set_budget_ms(aging_ble_remaining_ms());
+    if (ble_start_target_scan(&s_ble_target_current, BLE_AGING_SCAN_SECONDS) != ESP_OK) return false;
+    TickType_t start = xTaskGetTickCount();
+    bool found = false;
+    while (!ScanComplete) {
+        found = s_ble_target_current.use_mac ?
+            ble_scanned_has_address(s_ble_target_current.bda, s_ble_target_current.addr_type) :
+            ble_scanned_has_name(PN_Code);
+        if (found || xTaskGetTickCount() - start >= pdMS_TO_TICKS(BLE_SCAN_WAIT_TIMEOUT_MS)) break;
+        if (!aging_ble_wait_ms(BLE_TARGET_POLL_INTERVAL_MS)) return false;
+    }
+    if (!found) found = s_ble_target_current.use_mac ?
+        ble_scanned_has_address(s_ble_target_current.bda, s_ble_target_current.addr_type) :
+        ble_scanned_has_name(PN_Code);
+    if (ble_stop_scan_wait() != ESP_OK || !found || aging_ble_remaining_ms() == 0) return false;
+    BleConnectComplete = false;
+    BleConnectSuccess = false;
+    bool submitted = s_ble_target_current.use_mac ?
+        ble_connect_by_address(s_ble_target_current.bda, s_ble_target_current.addr_type) :
+        ble_connect_by_name(PN_Code);
+    if (!submitted) return false;
+    start = xTaskGetTickCount();
+    while (!BleConnectComplete) {
+        if (xTaskGetTickCount() - start >= pdMS_TO_TICKS(BLE_CONNECT_WAIT_TIMEOUT_MS)) return false;
+        if (!aging_ble_wait_ms(AGING_WAIT_SLICE_MS)) return false;
+    }
+    if (!BleConnectSuccess || !ble_is_connected()) return false;
+    uint32_t session = ble_session_id();
+    start = xTaskGetTickCount();
+    while (!ble_gatt_setup_done()) {
+        if (!ble_session_is_current(session) ||
+            xTaskGetTickCount() - start >= pdMS_TO_TICKS(BLE_GATT_SETUP_TIMEOUT_MS)) return false;
+        if (!aging_ble_wait_ms(AGING_WAIT_SLICE_MS)) return false;
+    }
+    /* 明文设备无鉴权完成包，保留原有 20s 初始化窗口；加密设备鉴权成功即可交接。 */
+    start = xTaskGetTickCount();
+    while (!ble_session_is_encrypted() && xTaskGetTickCount() - start < pdMS_TO_TICKS(BLE_INIT_GRACE_MS)) {
+        if (!ble_session_is_current(session) || !aging_ble_wait_ms(AGING_WAIT_SLICE_MS)) return false;
+    }
+    if (!aging_ble_set_auth_owner(false) || !ble_session_is_current(session)) return false;
+    if (aging_ble_remaining_ms() < BLE_RECOVERY_TRANSACTION_BUDGET_MS) return false;
+    const char *parameter = aging_ble_check_parameter();
+    double value = 0;
+    if (parameter == NULL || !Data_Get_Method(&Aging_device[0], parameter, 1, &value, 0)) return false;
+    if (s_ble_replay_pre && !aging_step_pre_actions(s_ble_resume_step)) return false;
+    /* 前置动作也属于恢复准备，执行期间再次断线不能重置期限或开放采样。 */
+    atomic_store(&s_ble_ready_session, session);
+    return ble_session_is_current(session) && aging_ble_remaining_ms() != 0;
+}
+
+/* 控制任务调用，保留调用栈上的循环/工步/截止时间；回调不执行任何重连工作。 */
+static bool aging_ble_ensure_ready(void)
+{
+    if (atomic_load(&s_aging_cancel)) return false;
+    if (!aging_device_uses_ble(Aging_device) ||
+        (agingState != AgingDeviceCheck && agingState != AgingAction)) return true;
+    uint32_t ready = atomic_load(&s_ble_ready_session);
+    bool lost = atomic_exchange(&s_ble_abnormal_disconnect, false);
+    if (ready != 0 && ble_session_is_current(ready) &&
+        (!lost || atomic_load(&s_ble_disconnect_session) != ready)) return true;
+
+    if (!s_ble_recovery_active) {
+        s_ble_recovery_active = true;
+        s_ble_recovery_start_tick = lost ? atomic_load(&s_ble_disconnect_tick) : xTaskGetTickCount();
+        s_ble_recovery_attempt = 0;
+        aging_runtime_log("蓝牙进入自动恢复，保留工步=%u，原因=0x%02x，连接代次=%lu，限时=600秒",
+                          (unsigned)CurrentAgingStep + 1,
+                          lost ? (unsigned)atomic_load(&s_ble_disconnect_reason) : 0u,
+                          (unsigned long)(lost ? atomic_load(&s_ble_disconnect_session) : ready));
+    }
+    atomic_store(&s_ble_recovering, true);
+    atomic_store(&s_ble_ready_session, 0);
+    while (atomic_load(&s_sample_reading)) if (!aging_ble_wait_ms(AGING_HANDOVER_POLL_MS)) return false;
+    while (!atomic_load(&s_aging_cancel) && aging_ble_remaining_ms() != 0) {
+        ++s_ble_recovery_attempt;
+        aging_runtime_log("蓝牙恢复尝试=%u，剩余=%lu毫秒", s_ble_recovery_attempt,
+                          (unsigned long)aging_ble_remaining_ms());
+        if (aging_ble_connect_attempt() && ble_session_is_current(atomic_load(&s_ble_ready_session))) {
+            s_ble_recovery_active = false;
+            atomic_store(&s_ble_recovering, false);
+            ble_control_set_budget_ms(0);
+            aging_runtime_log("蓝牙通信恢复，继续原工步=%u，连接代次=%lu",
+                              (unsigned)CurrentAgingStep + 1, (unsigned long)ble_session_id());
+            return true;
+        }
+        if (!aging_ble_wait_ms(BLE_AGING_RETRY_DELAY_MS)) break;
+    }
+    ble_control_set_budget_ms(0);
+    return false;
+}
+
+/* 后置动作断线时恢复通信并重试被打断的单项，不重新开启已经完成的充放电工况。 */
+static bool aging_execute_actions(AgingActionItem *actions, size_t count, Externaldevice *device,
+                                 const char *method, uint8_t is_name)
+{
+    for (size_t j = 0; j < count; ++j) {
+        bool retrying = false;
+        TickType_t failure_tick = 0;
+        for (;;) {
+            if (!aging_ble_ensure_ready()) return false;
+            if (Aging_Execute_ActionList(&actions[j], 1, 1, device, method, "after_action", is_name)) break;
+            if (atomic_load(&s_aging_cancel) || !aging_device_uses_ble(device)) return false;
+            if (!retrying) {
+                retrying = true;
+                failure_tick = xTaskGetTickCount();
+                s_ble_recovery_attempt = 0;
+            }
+            /* 通信探测成功但该写入仍失败时，同一动作的恢复窗口不能被重置。 */
+            s_ble_recovery_active = true;
+            s_ble_recovery_start_tick = failure_tick;
+            atomic_store(&s_ble_ready_session, 0);
+            if (!aging_ble_wait_ms(BLE_AGING_RETRY_DELAY_MS)) return false;
+        }
+    }
+    return true;
+}
+
+static bool aging_begin_step(AgingStep *step)
+{
+    agingDataAMode = IdleState;
+    while (atomic_load(&s_sample_reading)) {
+        if (!aging_task_wait_ms(AGING_HANDOVER_POLL_MS)) return false;
+    }
+    s_ble_resume_step = step;
+    s_ble_replay_pre = true;
+    uint32_t previous_session = atomic_load(&s_ble_ready_session);
+    if (!aging_ble_ensure_ready()) return false;
+    /* 此入口若刚执行过恢复，整组前置动作已在恢复流程完成，无需立即再执行一次。 */
+    if (aging_device_uses_ble(Aging_device) &&
+        previous_session != atomic_load(&s_ble_ready_session)) return true;
+    if (!aging_step_pre_actions(step)) {
+        if (!aging_device_uses_ble(Aging_device)) return false;
+        atomic_store(&s_ble_ready_session, 0);
+        if (!aging_ble_ensure_ready()) return false;
+    }
+    return !atomic_load(&s_aging_cancel);
 }
 
 static void Aging_Task_Abort_Cleanup(void)
@@ -4705,12 +4999,7 @@ static void Aging_Task_Abort_Cleanup(void)
     /* 老化中止：结束任何遗留的扫描/建链蓝牙优先，避免长期压缩 Wi-Fi 上行。 */
     ble_restore_coex_balance();
 
-    if (AgingData_task_handle != NULL)
-    {
-        vTaskDelete(AgingData_task_handle);
-        AgingData_task_handle = NULL;
-        atomic_store(&s_sample_reading, false);
-    }
+    aging_finish_sampling();
 
     if (ble_is_connected())
     {
@@ -4748,6 +5037,12 @@ static void Aging_Task_Abort_Cleanup(void)
 
 static void Aging_Task_Abort_And_Delete(void)
 {
+    if (atomic_load(&s_aging_cancel)) {
+        Aging_test_task_handle = NULL;
+        atomic_store(&s_aging_ctrl_exited, true);
+        vTaskDelete(NULL);
+        return;
+    }
     Aging_Task_Abort_Cleanup();
 
     /* 所有老化会话异常终止（agingError）都收口到本函数：两灯一起熄灭。 */
@@ -4759,6 +5054,7 @@ static void Aging_Task_Abort_And_Delete(void)
     s_consecutive_data_upload_failures = 0;
     s_last_data_upload_error_report_tick = 0;
     Aging_test_task_handle = NULL;
+    atomic_store(&s_aging_ctrl_exited, true);
     vTaskDelete(NULL); // 删除当前任务
 }
 
@@ -4772,15 +5068,13 @@ void Aging_Test_Task(void *arg)
 
     while (1)
     {
-        /*
-         * BLE 异常断开的统一处置（根掉线期间 mesh 重扫可击穿 BLE 链路）：
-         * 当前正是蓝牙老化会话 → 按老化错误优雅中止，整机不重启；
-         * 其余情况 → aging_ble_link_lost_pending() 内记录一次警告。
-         */
-        if (aging_ble_link_lost_pending())
+        /* BLE 准备或运行期间先恢复通信；仅持续故障超时才结束本轮。 */
+        if (!aging_ble_ensure_ready())
         {
-            aging_error_log("Bluetooth aging link lost abnormally; abort aging session without restart");
-            aging_state_publish("agingError");
+            if (!atomic_load(&s_aging_cancel)) {
+                aging_error_log("蓝牙连续故障600秒仍未恢复，结束本轮老化");
+                aging_state_publish("agingError");
+            }
             Aging_Task_Abort_And_Delete();
             return;
         }
@@ -4843,8 +5137,7 @@ void Aging_Test_Task(void *arg)
             }
 
             /*
-             * 老化设备连接/通信检查尝试上限（BLE 路径含每轮扫描+连接+GATT+通信
-             * 检查）。FailCount 每轮 ++，故 >= MAX 即"已尝试满 MAX 次仍失败"。
+             * 非 BLE 设备沿用次数上限；BLE 已在统一入口按 10 分钟窗口完成准备。
              */
             if (FailCount >= AGING_DEVICE_CHECK_MAX_ATTEMPTS)
             {
@@ -4858,219 +5151,11 @@ void Aging_Test_Task(void *arg)
 
             FailCount++;
 
-            if (strncmp(Aging_device[0].CommunicationMode, "Bluetooth", 9) == 0)
+            if (aging_device_uses_ble(Aging_device))
             {
-                if (!ble_is_connected())
-                {
-                    aging_runtime_log("Connecting Bluetooth aging device, attempt=%u", (unsigned)FailCount);
-                    /* 复位上一轮可能残留的扫描完成标志：提前停扫后 GAP 完成事件
-                     * 仍可能迟到置位，不清零会让下一轮误判"扫描已完成"而空跑。 */
-                    ScanComplete = false;
-                    if (ble_start_target_scan(&s_ble_target_current, BLE_AGING_SCAN_SECONDS) != ESP_OK)
-                    {
-                        /*
-                         * 上一轮扫描未结束或仍处于连接态时 ble_start_scan 返回 false 且不会启动扫描，
-                         * 必须立即按本次尝试失败处理，否则后续超时等待必然空转满整个超时。
-                         */
-                        aging_error_log("Bluetooth scan not started, attempt=%u", (unsigned)FailCount);
-                        break;
-                    }
-
-                    /*
-                     * 扫描完成回调丢失时不得永久自旋（旧行为为无超时等待，
-                     * 会饿死同级任务）：超过 BLE_SCAN_WAIT_TIMEOUT_MS 未完成，
-                     * 停止扫描并按本次尝试失败处理，交由 FailCount 路径重试或 agingError 中止。
-                     * 扫描期间每 BLE_TARGET_POLL_INTERVAL_MS 检查目标名：命中即停扫，
-                     * 不再等满一个扫描周期（密集现场目标可连窗口稍纵即逝）。
-                     */
-                    TickType_t scan_start_tick = xTaskGetTickCount();
-                    bool target_found_early = false;
-                    while (!ScanComplete)
-                    {
-                        if (s_ble_target_current.use_mac ?
-                            ble_scanned_has_address(s_ble_target_current.bda, s_ble_target_current.addr_type) :
-                            ble_scanned_has_name(PN_Code))
-                        {
-                            target_found_early = true;
-                            break;
-                        }
-                        if ((xTaskGetTickCount() - scan_start_tick) >= pdMS_TO_TICKS(BLE_SCAN_WAIT_TIMEOUT_MS))
-                        {
-                            break;
-                        }
-                        vTaskDelay(pdMS_TO_TICKS(BLE_TARGET_POLL_INTERVAL_MS));
-                    }
-
-                    if (target_found_early)
-                    {
-                        aging_runtime_log("Bluetooth target seen during scan, stop scanning early, attempt=%u",
-                                          (unsigned)FailCount);
-                        if (ble_stop_scan_wait() != ESP_OK) {
-                            aging_error_log("目标已发现但停扫未确认，本轮不建立连接");
-                            break;
-                        }
-                    }
-
-                    bool scan_completed = ScanComplete || target_found_early;
-                    ScanComplete = false;
-
-                    if (!scan_completed)
-                    {
-                        /* 回调丢失时底层扫描可能仍在继续，先停止再进入下一次重试。 */
-                        ble_stop_scan();
-                        aging_error_log("Bluetooth scan did not complete within %u ms, attempt=%u",
-                                        (unsigned)BLE_SCAN_WAIT_TIMEOUT_MS, (unsigned)FailCount);
-                        break;
-                    }
-
-                    if (s_ble_target_current.use_mac &&
-                        !ble_scanned_has_address(s_ble_target_current.bda, s_ble_target_current.addr_type)) {
-                        aging_error_log("本轮白名单扫描未发现目标 MAC，等待下轮重试");
-                        break;
-                    }
-
-                    /*
-                     * ble_connect_by_name() 返回 true 仅代表 enh_open 被受理，
-                     * 连接尚未建立：结果由 CONNECT_EVT（成功）/ OPEN_EVT 133 或
-                     * 建链中断（失败，如 HCI rsn 0x3E）经 ble_connect_cb 置位
-                     * BleConnectComplete/BleConnectSuccess 交付。
-                     * 先复位上一轮遗留结果再发起，避免快速失败事件被旧值吞掉。
-                     */
-                    BleConnectComplete = false;
-                    BleConnectSuccess = false;
-
-                    if (s_ble_target_current.use_mac ?
-                        ble_connect_by_address(s_ble_target_current.bda, s_ble_target_current.addr_type) :
-                        ble_connect_by_name(PN_Code))
-                    {
-                        aging_runtime_log("Bluetooth connect request accepted, awaiting establishment result, attempt=%u",
-                                          (unsigned)FailCount);
-
-                        /*
-                         * 等待连接建立结果（参照 ScanComplete 轮询模式）：
-                         * 超过 BLE_CONNECT_WAIT_TIMEOUT_MS 未交付按本次尝试失败处理。
-                         */
-                        TickType_t connect_start_tick = xTaskGetTickCount();
-                        while (!BleConnectComplete)
-                        {
-                            if ((xTaskGetTickCount() - connect_start_tick) >= pdMS_TO_TICKS(BLE_CONNECT_WAIT_TIMEOUT_MS))
-                            {
-                                break;
-                            }
-                            vTaskDelay(pdMS_TO_TICKS(500));
-                        }
-
-                        bool connect_established = false;
-                        if (BleConnectComplete && BleConnectSuccess)
-                        {
-                            connect_established = true;
-                        }
-                        else if (!BleConnectComplete && ble_is_connected())
-                        {
-                            /* 回调与轮询竞态：CONNECT_EVT 已处理但标志尚未被读到 */
-                            connect_established = true;
-                        }
-
-                        if (!connect_established)
-                        {
-                            /*
-                             * 建立失败（或结果等待超时）：按本次尝试失败走 FailCount
-                             * 路径重试，不再误判为「异常断开」一次失败即中止老化。
-                             */
-                            BleConnectComplete = false;
-                            aging_error_log("Bluetooth connection establishment failed (link setup or open error), attempt=%u",
-                                            (unsigned)FailCount);
-                            /* 防御：失败后底层若仍在扫描，先停止再进入下一轮重试。 */
-                            ble_stop_scan();
-                            vTaskDelay(pdMS_TO_TICKS(3000)); // 退避，避开 DUT 刚上电/被占用窗口
-                            break;
-                        }
-
-                        /*
-                         * 等待 GATT 设置阶段结论（服务发现/notify 注册/CCCD 写确认）：
-                         * 呆滞 DUT 建链后停止响应时，在此带超时快速失败并重试，
-                         * 不再傻等 20s 后才在通信检查中暴露（2026-10-16 实机日志：
-                         * CCCD 写 7.3s 无响应，最终 rsn 0x08 掉线）。
-                         */
-                        TickType_t setup_start_tick = xTaskGetTickCount();
-                        while (!ble_gatt_setup_done())
-                        {
-                            if ((xTaskGetTickCount() - setup_start_tick) >= pdMS_TO_TICKS(BLE_GATT_SETUP_TIMEOUT_MS))
-                            {
-                                break;
-                            }
-                            vTaskDelay(pdMS_TO_TICKS(500));
-                        }
-
-                        if (!ble_gatt_setup_done())
-                        {
-                            aging_error_log("Bluetooth GATT setup not confirmed (service discovery/notify/CCCD) within %u ms, attempt=%u",
-                                            (unsigned)BLE_GATT_SETUP_TIMEOUT_MS, (unsigned)FailCount);
-                            /*
-                             * 主动断开（BTDisConnect=1 主动语义，避免被误判为异常
-                             * 断开而直接中止整台老化）：本次尝试失败，走 FailCount
-                             * 路径重试（下一轮重新扫描+连接）。
-                             */
-                            BTDisConnect = 1;
-                            ble_disconnect();
-                            vTaskDelay(pdMS_TO_TICKS(1000)); // 等断开事件落定，避免下一轮扫描被拒
-                            break;
-                        }
-
-                        aging_runtime_log("Bluetooth aging device connected");
-
-                        vTaskDelay(pdMS_TO_TICKS(20000)); // 等待设备初始化完成，避免刚连接就读数据失败
-
-                        if (BleData_task_handle != NULL)
-                        {
-                            vTaskDelete(BleData_task_handle);
-                            BleData_task_handle = NULL;
-                        }
-                    }
-                    else
-                    {
-                        aging_error_log("Bluetooth aging-device connection failed, attempt=%u",
-                                        (unsigned)FailCount);
-                        break;
-                    }
-                }
-
-                if (Aging_device[0].modbusprotocol.item_count == 0)
-                {
-                    aging_error_log("Bluetooth aging device has no loaded Modbus protocol items");
-                    break;
-                }
-
-                if (Aging_device[0].steps == NULL ||
-                    Aging_device[0].step_count == 0)
-                {
-                    aging_error_log("Bluetooth aging device has no sample item for communication check");
-                    break;
-                }
-
-                int itest = 0;
-                for (; itest < Aging_device[0].step_count; itest++)
-                {
-                    if (Aging_device[0].steps[itest].sample_data_count != 0)
-                    {
-                        break;
-                    }
-                }
-                double data = 0;
-                const char *parameter = Aging_device[0].steps[itest].sample_data[0].Value;
-                if (Data_Get_Method(&Aging_device[0], parameter, 1, &data, 0))
-                {
-                    aging_runtime_log("Bluetooth aging-device communication check passed, parameter=%s",
-                                      parameter != NULL ? parameter : "unknown");
-                    FailCount = 0;
-                    agingState = AgingAction;
-                }
-                else
-                {
-                    aging_error_log("Bluetooth aging-device communication check failed, parameter=%s, attempt=%u",
-                                    parameter != NULL ? parameter : "unknown",
-                                    (unsigned)FailCount);
-                }
+                /* 主循环的统一入口已经完成扫描、鉴权与通信验证。 */
+                FailCount = 0;
+                agingState = AgingAction;
             }
             else if (strncmp(Aging_device[0].CommunicationMode, "CAN", 3) == 0)
             {
@@ -5196,26 +5281,17 @@ void Aging_Test_Task(void *arg)
                     s_last_data_read_error_report_tick = 0;
                     aging_runtime_log("Step started, index=%u/%u, method=%s, target=%.3f", (unsigned)(i + 1), (unsigned)agingcfg.step_count, method, target_value);
 
+                    agingDataAMode = IdleState;
+                    while (atomic_load(&s_sample_reading) && !atomic_load(&s_aging_cancel))
+                        (void)aging_task_wait_ms(AGING_HANDOVER_POLL_MS);
                     CurrentAgingStep = i;
-
-                    Aging_Execute_ActionList(current_step->pre_actions, current_step->pre_action_count, 1, &Aging_device[0], method, "pre_action", 0);
-
-                    for (int j = 0; j < read_device_count; j++)
-                    {
-                        for (int k = 0; k < read_devices[j].step_count; k++)
-                        {
-                            if (read_devices[j].steps[k].method != NULL &&
-                                strcmp(read_devices[j].steps[k].method, method) == 0)
-                            {
-                                Aging_Execute_ActionList(read_devices[j].steps[k].pre_actions,
-                                                         read_devices[j].steps[k].pre_action_count,
-                                                         1,
-                                                         &read_devices[j],
-                                                         read_devices[j].steps[k].method,
-                                                         "pre_action", 1);
-                                break;
-                            }
+                    if (!aging_begin_step(current_step)) {
+                        if (!atomic_load(&s_aging_cancel)) {
+                            aging_error_log("工步前置动作或蓝牙恢复失败，结束本轮老化");
+                            aging_state_publish("agingError");
                         }
+                        Aging_Task_Abort_And_Delete();
+                        return;
                     }
 
                     if (strncmp(method, "Standing", 8) == 0)
@@ -5244,18 +5320,21 @@ void Aging_Test_Task(void *arg)
                             }
                         }
 
-                        while (now < deadline)
+                        for (;;)
                         {
-                            /* Standing 可持续数小时：循环内必须检查 BLE 断开，否则掉线迟迟不被处理。 */
-                            if (aging_ble_link_lost_pending())
+                            /* 静置到期前也必须先恢复链路；恢复耗时计入原截止时间。 */
+                            if (!aging_ble_ensure_ready())
                             {
-                                aging_error_log("Bluetooth aging link lost abnormally during standing; abort aging session without restart");
-                                aging_state_publish("agingError");
+                                if (!atomic_load(&s_aging_cancel)) {
+                                    aging_error_log("蓝牙连续故障600秒仍未恢复，结束本轮老化");
+                                    aging_state_publish("agingError");
+                                }
                                 Aging_Task_Abort_And_Delete();
                                 return;
                             }
-                            vTaskDelay(pdMS_TO_TICKS(10000));
                             now = time(NULL);
+                            if ((uint64_t)now >= deadline) break;
+                            (void)aging_task_wait_ms(1000);
                         }
 
                         aging_runtime_log("Standing condition reached, step=%u, target_minutes=%.3f",
@@ -5273,26 +5352,38 @@ void Aging_Test_Task(void *arg)
                         uint8_t conditionflag = 1;
                         while (conditionflag)
                         {
-                            /* Discharge 条件轮询可能长期自旋：循环内检查 BLE 断开。 */
-                            if (aging_ble_link_lost_pending())
+                            /* 保留当前放电工步，恢复后重新读取条件，失败读数不推进。 */
+                            if (!aging_ble_ensure_ready())
                             {
-                                aging_error_log("Bluetooth aging link lost abnormally during discharge; abort aging session without restart");
-                                aging_state_publish("agingError");
+                                if (!atomic_load(&s_aging_cancel)) {
+                                    aging_error_log("蓝牙连续故障600秒仍未恢复，结束本轮老化");
+                                    aging_state_publish("agingError");
+                                }
                                 Aging_Task_Abort_And_Delete();
                                 return;
                             }
                             for (int i = 0; i < current_step->judging_condition_count; i++)
                             {
                                 double value = -1.0;
+                                uint32_t read_session = ble_session_id();
                                 bool read_ok = Data_Get_Method(&Aging_device[0], current_step->judging_conditions[i].Name, 1, &value, 1);
-                                if (value <= current_step->judging_conditions[i].value_num)
+                                if (!aging_ble_ensure_ready()) {
+                                    if (!atomic_load(&s_aging_cancel)) {
+                                        aging_error_log("蓝牙连续故障600秒仍未恢复，结束本轮老化");
+                                        aging_state_publish("agingError");
+                                    }
+                                    Aging_Task_Abort_And_Delete();
+                                    return;
+                                }
+                                if (aging_device_uses_ble(Aging_device) && !ble_session_is_current(read_session)) read_ok = false;
+                                if (read_ok && value <= current_step->judging_conditions[i].value_num)
                                 {
                                     conditionflag = 0;
                                     break;
                                 }
-                                vTaskDelay(pdMS_TO_TICKS(1000));
+                                (void)aging_task_wait_ms(1000);
                             }
-                            vTaskDelay(pdMS_TO_TICKS(2000));
+                            (void)aging_task_wait_ms(2000);
                         }
                     }
                     else if (strncmp(method, "Recharge", 8) == 0)
@@ -5305,26 +5396,38 @@ void Aging_Test_Task(void *arg)
                         uint8_t conditionflag = 1;
                         while (conditionflag)
                         {
-                            /* Recharge 条件轮询可能长期自旋：循环内检查 BLE 断开。 */
-                            if (aging_ble_link_lost_pending())
+                            /* 保留当前充电工步，恢复后重新读取条件。 */
+                            if (!aging_ble_ensure_ready())
                             {
-                                aging_error_log("Bluetooth aging link lost abnormally during recharge; abort aging session without restart");
-                                aging_state_publish("agingError");
+                                if (!atomic_load(&s_aging_cancel)) {
+                                    aging_error_log("蓝牙连续故障600秒仍未恢复，结束本轮老化");
+                                    aging_state_publish("agingError");
+                                }
                                 Aging_Task_Abort_And_Delete();
                                 return;
                             }
                             for (int i = 0; i < current_step->judging_condition_count; i++)
                             {
                                 double value = -1.0;
+                                uint32_t read_session = ble_session_id();
                                 bool read_ok = Data_Get_Method(&Aging_device[0], current_step->judging_conditions[i].Name, 1, &value, 1);
-                                if (value >= current_step->judging_conditions[i].value_num)
+                                if (!aging_ble_ensure_ready()) {
+                                    if (!atomic_load(&s_aging_cancel)) {
+                                        aging_error_log("蓝牙连续故障600秒仍未恢复，结束本轮老化");
+                                        aging_state_publish("agingError");
+                                    }
+                                    Aging_Task_Abort_And_Delete();
+                                    return;
+                                }
+                                if (aging_device_uses_ble(Aging_device) && !ble_session_is_current(read_session)) read_ok = false;
+                                if (read_ok && value >= current_step->judging_conditions[i].value_num)
                                 {
                                     conditionflag = 0;
                                     break;
                                 }
-                                vTaskDelay(pdMS_TO_TICKS(1000));
+                                (void)aging_task_wait_ms(1000);
                             }
-                            vTaskDelay(pdMS_TO_TICKS(2000));
+                            (void)aging_task_wait_ms(2000);
                         }
                     }
                     else
@@ -5335,29 +5438,41 @@ void Aging_Test_Task(void *arg)
                                         method);
                     }
 
-                    Aging_Execute_ActionList(current_step->after_actions,
-                                             current_step->after_action_count,
-                                             1,
-                                             &Aging_device[0],
-                                             method,
-                                             "after_action", 0);
-
-                    for (int j = 0; j < read_device_count; j++)
-                    {
-                        for (int k = 0; k < read_devices[j].step_count; k++)
-                        {
+                    /* 一旦进入收尾阶段，重连不得再重发开启当前工况的前置动作。 */
+                    s_ble_replay_pre = false;
+                    if (!aging_execute_actions(current_step->after_actions, current_step->after_action_count,
+                                               &Aging_device[0], method, 0)) {
+                        if (!atomic_load(&s_aging_cancel)) {
+                            aging_error_log("工步后置动作或蓝牙恢复失败，结束本轮老化");
+                            aging_state_publish("agingError");
+                        }
+                        Aging_Task_Abort_And_Delete();
+                        return;
+                    }
+                    for (int j = 0; j < read_device_count; j++) {
+                        for (size_t k = 0; k < read_devices[j].step_count; k++) {
                             if (read_devices[j].steps[k].method != NULL &&
-                                strcmp(read_devices[j].steps[k].method, method) == 0)
-                            {
-                                Aging_Execute_ActionList(read_devices[j].steps[k].after_actions,
-                                                         read_devices[j].steps[k].after_action_count,
-                                                         1,
-                                                         &read_devices[j],
-                                                         read_devices[j].steps[k].method,
-                                                         "after_action", 1);
+                                strcmp(read_devices[j].steps[k].method, method) == 0) {
+                                if (!aging_execute_actions(read_devices[j].steps[k].after_actions,
+                                        read_devices[j].steps[k].after_action_count, &read_devices[j], method, 1)) {
+                                    if (!atomic_load(&s_aging_cancel)) {
+                                        aging_error_log("外接设备后置动作失败，结束本轮老化");
+                                        aging_state_publish("agingError");
+                                    }
+                                    Aging_Task_Abort_And_Delete();
+                                    return;
+                                }
                                 break;
                             }
                         }
+                    }
+                    if (!aging_ble_ensure_ready()) {
+                        if (!atomic_load(&s_aging_cancel)) {
+                            aging_error_log("工步收尾期间蓝牙恢复超时");
+                            aging_state_publish("agingError");
+                        }
+                        Aging_Task_Abort_And_Delete();
+                        return;
                     }
 
                     aging_runtime_log("Step completed, index=%u/%u, method=%s", (unsigned)(i + 1), (unsigned)agingcfg.step_count, method);
@@ -5371,15 +5486,22 @@ void Aging_Test_Task(void *arg)
                         }
                         while (Cannextstep == 0)
                         {
-                            /* 群控等待上位机下一步指令可能长时间挂起：循环内检查 BLE 断开。 */
-                            if (aging_ble_link_lost_pending())
+                            /* 群控等待期间只恢复通信，不重发已完成工步的前置动作。 */
+                            if (!aging_ble_ensure_ready())
                             {
-                                aging_error_log("Bluetooth aging link lost abnormally while waiting next step; abort aging session without restart");
-                                aging_state_publish("agingError");
+                                if (!atomic_load(&s_aging_cancel)) {
+                                    aging_error_log("蓝牙连续故障600秒仍未恢复，结束本轮老化");
+                                    aging_state_publish("agingError");
+                                }
                                 Aging_Task_Abort_And_Delete();
                                 return;
                             }
-                            vTaskDelay(pdMS_TO_TICKS(10000));
+                            (void)aging_task_wait_ms(1000);
+                        }
+                        if (!aging_ble_ensure_ready()) {
+                            if (!atomic_load(&s_aging_cancel)) aging_state_publish("agingError");
+                            Aging_Task_Abort_And_Delete();
+                            return;
                         }
                         Cannextstep = 0;
                         app_mqtt_event_cancel_taskcp();
@@ -5403,6 +5525,7 @@ void Aging_Test_Task(void *arg)
         }
         case AgingComplete:
         {
+            aging_finish_sampling();
             app_mqtt_event_cancel_taskcp();
 
             agingState = AgingIdle;
@@ -5458,12 +5581,13 @@ void Aging_Test_Task(void *arg)
             clear_ready_pn_runtime();
             aging_gap_idle();
             Aging_test_task_handle = NULL;
+            atomic_store(&s_aging_ctrl_exited, true);
             vTaskDelete(NULL);
             return;
         }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        (void)aging_task_wait_ms(2000);
     }
 }
 #pragma endregion
@@ -5584,6 +5708,10 @@ static int ProcessAgingStepData(AgingUploadPacket *packet)
         aging_error_log("Invalid aging runtime state while sampling data");
         return -1;
     }
+    uint32_t ble_sample_session = aging_device_uses_ble(Aging_device) ?
+                                  atomic_load(&s_ble_ready_session) : 0;
+    if (atomic_load(&s_aging_cancel) || atomic_load(&s_ble_recovering) ||
+        (aging_device_uses_ble(Aging_device) && !ble_session_is_current(ble_sample_session))) return -1;
 
     memset(packet, 0, sizeof(*packet));
     packet->session_token = aging_gap_sample_snapshot(packet->pn, sizeof(packet->pn),
@@ -5629,6 +5757,10 @@ static int ProcessAgingStepData(AgingUploadPacket *packet)
         double value = -1.0;
         bool read_ok = Data_Get_Method(&Aging_device[0], parameter_id, 1, &value, 0);
         aging_data_read_result(read_ok, &Aging_device[0], parameter_id);
+        if (!read_ok) {
+            cJSON_Delete(value_array);
+            return -1;
+        }
 
         const char *parameter_name = AgingDataName(parameter_id);
         if (parameter_name == NULL || strcmp(parameter_name, "Unknown") == 0)
@@ -5702,6 +5834,10 @@ static int ProcessAgingStepData(AgingUploadPacket *packet)
                 double value = -1.0;
                 bool read_ok = Data_Get_Method(&read_devices[i], parameter_name, 1, &value, 1);
                 aging_data_read_result(read_ok, &read_devices[i], parameter_name);
+                if (!read_ok) {
+                    cJSON_Delete(value_array);
+                    return -1;
+                }
 
                 if (!add_aging_value_item(ext_data, parameter_name, value))
                 {
@@ -5714,6 +5850,13 @@ static int ProcessAgingStepData(AgingUploadPacket *packet)
         }
     }
 
+    if (atomic_load(&s_aging_cancel) || atomic_load(&s_ble_recovering) ||
+        packet->current_step != CurrentAgingStep ||
+        (ble_sample_session != 0 && (!ble_session_is_current(ble_sample_session) ||
+         ble_sample_session != atomic_load(&s_ble_ready_session)))) {
+        cJSON_Delete(value_array);
+        return -1;
+    }
     char *value_json = cJSON_PrintUnformatted(value_array);
     cJSON_Delete(value_array);
     if (value_json == NULL)
@@ -5738,11 +5881,17 @@ static int ProcessAgingStepData(AgingUploadPacket *packet)
 // 老化数据采集任务
 void app_AgingData_Get_handle(void *arg)
 {
-    while (1)
+    while (!atomic_load(&s_aging_cancel))
     {
-        if (agingDataAMode != IdleState)
+        if (agingDataAMode != IdleState && !atomic_load(&s_ble_recovering))
         {
             atomic_store(&s_sample_reading, true);
+            if (atomic_load(&s_aging_cancel) || atomic_load(&s_ble_recovering) || agingDataAMode == IdleState) {
+                atomic_store(&s_sample_reading, false);
+                continue;
+            }
+            uint32_t sample_session = aging_device_uses_ble(Aging_device) ?
+                                      atomic_load(&s_ble_ready_session) : 0;
             AgingUploadPacket *packet = (AgingUploadPacket *)app_calloc_prefer_psram(1, sizeof(AgingUploadPacket));
             if (packet == NULL)
             {
@@ -5751,7 +5900,9 @@ void app_AgingData_Get_handle(void *arg)
             else
             {
                 int sample_count = ProcessAgingStepData(packet);
-                if (sample_count > 0 && packet->value_json != NULL)
+                if (sample_count > 0 && packet->value_json != NULL &&
+                    !atomic_load(&s_aging_cancel) && !atomic_load(&s_ble_recovering) &&
+                    (sample_session == 0 || ble_session_is_current(sample_session)))
                 {
                     if (!aging_gap_sample_submit(packet->session_token, Upload_data_queue, &packet))
                     {
@@ -5768,8 +5919,12 @@ void app_AgingData_Get_handle(void *arg)
         }
 
         atomic_store(&s_sample_reading, false);
-        vTaskDelay(pdMS_TO_TICKS(5000));
+        (void)aging_task_wait_ms(5000);
     }
+    atomic_store(&s_sample_reading, false);
+    AgingData_task_handle = NULL;
+    atomic_store(&s_aging_sample_exited, true);
+    vTaskDelete(NULL);
 }
 
 static bool app_DataUpload_Functiong(const AgingUploadPacket *packet, int idnum)
@@ -5841,6 +5996,11 @@ static void app_log_level_init(void)
 
 void app_task_init(void)
 {
+    s_ble_io_mutex = xSemaphoreCreateMutexStatic(&s_ble_io_storage);
+    if (s_ble_io_mutex == NULL) {
+        ESP_LOGE(TAG, "创建蓝牙事务锁失败");
+        return;
+    }
     if (aging_gap_init() != ESP_OK) {
         ESP_LOGE(TAG, "采样会话与结束补查初始化失败");
         return;

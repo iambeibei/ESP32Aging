@@ -5,6 +5,10 @@
 [NETWORK_RESTART_DESIGN.md](NETWORK_RESTART_DESIGN.md) 为准。当前重连参数为 10s×5/15s，
 子节点自愈重启前显式清除 Mesh RTC，不再假定普通 esp_restart 就能绕开旧父缓存；
 CanRestart 采用 30s 传播窗口后暂停连接、根先深层后重启，并抑制自愈竞争。
+2026-10-31 更新：BLE 准备和运行掉线改为保留原会话、最多 10 分钟自动恢复，
+不再立即结束老化。现行 BLE 行为以 [BLE_MAC_TARGET_DESIGN.md](BLE_MAC_TARGET_DESIGN.md)
+的「断线保留老化与自动恢复」节及下方 7.1 为准；其余旧验收中的「已连接掉线一次即中止」
+属于历史策略。Mesh 自愈和计划重启仍按 NETWORK_RESTART_DESIGN.md 独立执行。
 目标：明确根/子节点依赖关系与保活、故障转移、重启恢复流程，定位并消除
 「根节点挂掉 → 子节点异常重启」的根因，使子节点在根掉线期间保持存活并继续老化。
 
@@ -170,17 +174,20 @@ appTask.c:4982），根恢复后经 SDK 重连 + 补发路径收回。
 
 ## 7. 处理逻辑（修复设计）
 
-### 7.1 BLE 断开去重启化（appTask.c）
+### 7.1 BLE 断开保留老化并恢复（appTask.c，2026-10-31）
 
-- `ble_disconnect_cb()` 不再调用 `esp_restart()`：仅置
-  `volatile bool s_ble_abnormal_disconnect` 并打 `ESP_LOGW`。
-  回调上下文不碰存储/MQTT/任务删除（符合 .ai/coding-standard.md ISR/回调约束）。
-- `Aging_Test_Task` 主循环每轮检查该标志：
-  - 当前老化设备 `CommunicationMode` 为 `"Bluetooth"` → 视为老化链路故障，
-    走既有 `aging_state_publish("agingError")` + `Aging_Task_Abort_And_Delete()`
-    优雅中止（清理、回 IDLE、恢复 ble_data 任务），**整机不重启**；
-  - 非 BLE 老化设备或空闲期 → 记录一次警告后忽略。
-- 效果：BLE 掉线从「整机重启」降级为「单台老化任务中止」，根掉线期间子节点存活。
+- `ble_disconnect_cb(reason, session_id)` 仅发布原子事件和发生 tick，不访问存储、MQTT
+  或删除任务。底层忽略 conn_id/地址不匹配的陈旧断开事件。
+- CPU1 老化控制任务在原工步调用栈恢复：暂停采样，按冻结目标扫描、连接、GATT 设置、
+  鉴权和协议探测；仍在执行工步时重发被测件及外接设备前置动作，再读取实时条件。
+  后置收尾或群控等待不重新开启前置动作，也不重复发送工步完成事件。
+- 连续故障总窗口 10 分钟，各失败尝试退避 3 秒，中途建链/鉴权/恢复动作失败不重置期限。
+  静置截止时间不延后，恢复成功后才可判定到期。仅超过期限才发布 agingError、清理并回 IDLE。
+- `ble_data` 常驻，鉴权与业务接收通过所有权标志和事务 mutex 交接；采样、条件判断及写入
+  不争抢 BLE 应答。失败/跨连接样本整包丢弃，失败读数不能作为放电完成条件。
+- stop 和任务替换采用取消及退出确认，超时不强删、不释放仍被使用的配置；可重试停止。
+  恢复期间 PN、RecordId、进度、Aging.json、NVS、会话编号与灯态保持。
+- BLE 事件仍不触发整机重启；Mesh 无父自愈预算和计划重启的既有语义不变。
 
 ### 7.2 子节点 mesh 健康监视（mesh.c，新增任务）
 
@@ -284,9 +291,9 @@ BLE 老化掉线、MQTT 断连不改变 `Network_Flag`，不会触发本 watchdo
      （约 12/24/36 分钟三次带日志重启后进入 L3 放弃态，每 60s 一条
      `heal restart budget exhausted`）；老化状态机经断点恢复继续推进；
      采样数据以 `pushed=0` 入库；上传失败计数增长但无崩溃。
-   - BLE 老化期间人为拉远电池包造成 BLE 断开：出现 agingError 与优雅中止，
-     **整机不重启**，`ble_data` 任务恢复，可重新 start_aging
-     （watchdog 只看父链路，本场景不触发）。
+   - BLE 老化期间人为拉远电池包造成断开：10 分钟内恢复目标后继续原轮，
+     PN/RecordId/工步不变；持续故障超时才 agingError 并清理，**整机不因 BLE 重启**。
+     `ble_data` 常驻，watchdog 只看父链路。
    - 恢复根节点：15s 内子节点重挂（mesh_health 心跳恢复），MQTT 自动重连，
      缓存数据补发，服务器侧无重复/丢号。
 3. 回归：根节点拔主路由器（主备切换）、插拔网线，确认根行为与 0.0.1.12 一致。
@@ -363,19 +370,15 @@ SoftAP 站点观测，范围 `mesh.c` / `sdkconfig.defaults` / build sdkconfig�
 
 ## 10. 已知限制（审查确认，本次不修）
 
-1. **外部 `vTaskDelete` 删除老化任务的 mutex 悬空风险（既有，非本次引入）**：
-   `stop_aging`（appTask.c）与 `aging_command_json_parse` 失败清理从 MQTT 任务上下文
-   直接删除老化任务；若删除恰好落在该任务持有 `s_log_mutex`（log.c）或
-   `s_sqlite_mutex`（SqLite.c）期间，mutex 将永久无人释放。本次新增的 BLE 中止走
-   任务自删除（`vTaskDelete(NULL)`），无此窗口，是正确的范式。建议后续以
-   「取消标志 + 任务自行退出」替代跨任务强删。
-2. **外部强删路径的 `s_aging_lost_data_list` 残留泄漏**：同上，任务被外部删除时
-   来不及释放 1KB 列表；自删除路径（正常完成/各类内部中止）已无泄漏。
+1. **协作退出（2026-10-31 已修复旧强删风险）**：stop 和任务替换不再跨任务
+   vTaskDelete 老化控制/采样任务；等待事务及任务退出确认后才释放配置。
+2. **退出确认的限制**：既有外接 CAN 驱动仍可能永久阻塞。确认超时保留取消意图及上下文，
+   允许后续 stop 重试，不能为了完成清理而释放仍被使用的资源。
 3. **RecordId NVS 写入失败仅记日志仍继续启动**：与 `start_aging_with_ready_pn` 内
    current PN 写入失败的处理保持一致（既有风格）；NVS 写失败场景罕见，
    如后续出现补发查询异常可按此排查。
-4. **`stop_aging` 后不恢复 `ble_data` 任务**（既有不对称）：`Aging_Task_Abort_Cleanup`
-   会恢复，`stop_aging` 路径不会；无新 start_aging 时 BLE 数据任务保持缺失。
+4. **`ble_data` 生命周期（2026-10-31 已调整）**：常驻任务通过接收所有权交接，
+   正式老化不再删除它，停止后也无需重新创建。
 5. **mesh-lite 重扫闭源路径的历史崩溃只能降暴露，不能根除**；若 6.4 诊断命中 R7，
    需升级 espressif/mesh_lite 组件版本后复测。
 6. 根消失超过 NVS 老化断点有效期以外的场景仍以既有掉电恢复语义为准。

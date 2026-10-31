@@ -49,7 +49,8 @@ typedef void (*ble_scan_cb_t)(ble_device_info_t *device, int device_count);  // 
  * 区别于已建立连接后的断开（走 disconnect_cb）。调用方据此重试而非中止业务。 */
 typedef void (*ble_connect_cb_t)(bool success, const char *device_name);     // 连接回调
 typedef void (*ble_data_cb_t)(uint8_t *data, uint16_t len);                  // 数据接收回调
-typedef void (*ble_disconnect_cb_t)(void);                                   // 断开连接回调
+/* Bluedroid 任务上下文；仅投递事件，不等待控制锁。session_id 为失效前的连接代次。 */
+typedef void (*ble_disconnect_cb_t)(uint8_t reason, uint32_t session_id);
 
 /**
  * @brief 初始化BLE控制模块
@@ -93,6 +94,10 @@ esp_err_t ble_stop_scan_wait(void);
  * 任务上下文可用，不可在 ISR 或蓝牙回调调用。 */
 esp_err_t ble_control_pause(void);
 esp_err_t ble_control_resume(void);
+
+/* 老化控制任务设置后续扫描控制的总预算（毫秒）；0 恢复默认的逐步 5s 上限。
+ * 非 ISR/回调调用，须与扫描/连接操作由同一任务串行执行。 */
+void ble_control_set_budget_ms(uint32_t timeout_ms);
 
 /**
  * @brief 停止扫描

@@ -43,7 +43,7 @@ static void log_info(const char *tag, const char *fmt, ...) {
 #define ESP_LOGI log_info
 #define ESP_LOGW(...) ((void)0)
 #define ESP_LOGE(...) ((void)0)
-#define ESP_LOGD(...) ((void)0)
+#define ESP_LOGD log_info
 #define ESP_LOG_BUFFER_HEX_LEVEL(tag,data,len,level) do {(void)(tag);(void)(data);assert((len)<=32);(void)(level);} while(0)
 static const char *TAG="test";
 #define pdTRUE 1
@@ -53,10 +53,17 @@ static const char *TAG="test";
 #define PROFILE_A_APP_ID 0
 #define INVALID_HANDLE 0
 #define BUFFER_MAX 1200
+#define AGING_WAIT_SLICE_MS 100u
+#define AGING_HANDOVER_POLL_MS 20u
 #define BLE_PREF_CONN_INTERVAL 12
 #define BLE_PREF_SUPERVISION_TIMEOUT 2000
 typedef void *SemaphoreHandle_t;
 static SemaphoreHandle_t s_device_list_mutex;
+static SemaphoreHandle_t s_ble_io_mutex;
+static atomic_bool s_ble_auth_owner = true;
+static atomic_bool s_control_paused;
+static void vTaskDelay(unsigned ticks) {(void)ticks;}
+static unsigned xTaskGetTickCount(void) {return 123;}
 static int xSemaphoreTake(SemaphoreHandle_t h,unsigned wait) {(void)h;(void)wait;return 1;}
 static int xSemaphoreGive(SemaphoreHandle_t h) {(void)h;return 1;}
 typedef struct {uint8_t *data;uint16_t data_len;uint32_t wait_time,session_id;} ble_mtu_data_t;
@@ -83,7 +90,7 @@ static struct {uint16_t gattc_if,conn_id,mtu,notify_char_handle,write_char_handl
 static struct {uint8_t bda[6];bool is_connected;} s_scanned_devices[1];
 static int s_scanned_count;
 static bool s_gatt_setup_done,s_connect_attempting;
-static void(*s_disconnect_cb)(void);
+static void(*s_disconnect_cb)(uint8_t,uint32_t);
 static void ble_coex_prefer_bt(bool bt) {(void)bt;}
 static void notify_connect_result(bool success) {(void)success;s_connect_attempting=false;}
 static const char *esp_err_to_name(int e) {(void)e;return "mock";}
@@ -95,7 +102,7 @@ typedef union {
  struct {uint16_t conn_id;uint8_t remote_bda[6];} connect;
  struct {int status;uint16_t conn_id,mtu;} cfg_mtu;
  struct {uint16_t conn_id,handle,value_len;uint8_t remote_bda[6];uint8_t *value;} notify;
- struct {int reason;} disconnect;
+ struct {int reason;uint16_t conn_id;uint8_t remote_bda[6];} disconnect;
 } esp_ble_gattc_cb_param_t;
 static void gattc_profile_event_handler(esp_gattc_cb_event_t,int,esp_ble_gattc_cb_param_t*);
 uint32_t ble_session_id(void);
@@ -143,7 +150,8 @@ static uint32_t connect_device(unsigned addr) {
  assert(!ble_session_is_encrypted());return ble_session_id();
 }
 static void dropped_link(void) {
- esp_ble_gattc_cb_param_t p={0};p.disconnect.reason=8;
+ esp_ble_gattc_cb_param_t p={0};p.disconnect.reason=8;p.disconnect.conn_id=s_gattc_profile.conn_id;
+ memcpy(p.disconnect.remote_bda,s_gattc_profile.remote_bda,6);
  gattc_profile_event_handler(ESP_GATTC_DISCONNECT_EVT,3,&p);assert(!ble_session_is_encrypted());
 }
 static void replace_link(void) {dropped_link();connect_device(2);}
@@ -194,6 +202,13 @@ int main(void) {
  assert(app_ble_process_auth(auth6,sizeof(auth6),plain_sid) && !ble_session_is_encrypted());
  assert(ble_send_data(raw,8,0)==1 && sent_len==8 && !memcmp(sent,raw,8));
  assert(logged_plain==8 && logged_wire==8 && logged_encrypted==0);
+ esp_ble_gattc_cb_param_t stale={0};stale.disconnect.conn_id=s_gattc_profile.conn_id+1;
+ memcpy(stale.disconnect.remote_bda,s_gattc_profile.remote_bda,6);
+ gattc_profile_event_handler(ESP_GATTC_DISCONNECT_EVT,3,&stale);
+ assert(ble_session_is_current(plain_sid));
+ stale.disconnect.conn_id=s_gattc_profile.conn_id;stale.disconnect.remote_bda[0]=99;
+ gattc_profile_event_handler(ESP_GATTC_DISCONNECT_EVT,3,&stale);
+ assert(ble_session_is_current(plain_sid));
  puts("PASS encrypted device -> disconnect -> plaintext device sends original 8 bytes; stale/orphan auth rejected");
 
  for(int failure=1;failure<=4;failure++) {
@@ -243,6 +258,10 @@ int main(void) {
  assert(ble_session_set_encrypted(ble_session_id(),true));enqueue_output(ble_session_id(),raw,8);
  assert(app_ble_recv_data_Ack(out,sizeof(out),0)==8 && decrypt_calls==decrypts+1);
  puts("PASS final auth consumed exactly once; plaintext forward and aging receive bypass decryption");
+ dropped_link();s_control_paused=true;unsigned closes_before=close_calls;
+ connect_device(9);assert(close_calls==closes_before+1 && !ble_session_is_current(ble_session_id()));
+ s_control_paused=false;dropped_link();
+ puts("PASS stale peer/conn_id disconnects cannot invalidate the current link; late CONNECT after stop closes immediately");
  return 0;
 }
 '''

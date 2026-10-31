@@ -92,6 +92,7 @@ typedef void *esp_event_handler_instance_t;
 #define IP2STR(ip) ((ip)->addr & 255), (((ip)->addr >> 8) & 255), (((ip)->addr >> 16) & 255), (((ip)->addr >> 24) & 255)
 static void mock_log(const char *tag, const char *fmt, ...) { (void)tag; (void)fmt; assert(!lock_depth); }
 #define ESP_LOGI mock_log
+#define ESP_LOGD mock_log
 #define ESP_LOGW mock_log
 #define ESP_LOGE mock_log
 static const char *esp_err_to_name(esp_err_t err) { (void)err; return "mock"; }

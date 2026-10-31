@@ -66,6 +66,8 @@ static atomic_bool s_is_connected = false;
 /* 高 31 位为连接代次，最低位为加密状态；CAS 防止旧鉴权迟到启用新连接加密。 */
 static atomic_uint s_session_state;
 static atomic_bool s_session_closing = true;
+static atomic_uint s_last_tx_tick;
+static atomic_uint s_last_rx_tick;
 
 static void ble_session_reset(void)
 {
@@ -119,7 +121,7 @@ static ble_disconnect_cb_t s_disconnect_cb = NULL;
  *                              （间隔约 20ms），用本标志保证只上报一次。
  * 目的：把「连接建立失败」与「已建立连接后掉线」分流——
  *   建立失败 → s_connect_cb(false)（老化任务据此重试）；
- *   已建立连接掉线 → s_disconnect_cb()（老化任务据此优雅中止，行为不变）。
+ *   已建立连接掉线 → s_disconnect_cb(reason, session)（老化任务保留原工步并恢复）。
  */
 static atomic_bool s_connect_attempting = false;
 static atomic_bool s_connect_result_pending = false;
@@ -136,6 +138,26 @@ typedef enum {
     BLE_SCAN_OP_ADD, BLE_SCAN_OP_PARAMS, BLE_SCAN_OP_START
 } BleScanOp;
 #define BLE_SCAN_STEP_TIMEOUT_MS 5000
+static atomic_uint s_control_budget_start;
+static atomic_uint s_control_budget_ticks;
+
+void ble_control_set_budget_ms(uint32_t timeout_ms)
+{
+    s_control_budget_start = xTaskGetTickCount();
+    s_control_budget_ticks = pdMS_TO_TICKS(timeout_ms);
+}
+
+static TickType_t ble_control_wait_ticks(void)
+{
+    TickType_t limit = pdMS_TO_TICKS(BLE_SCAN_STEP_TIMEOUT_MS);
+    if (s_control_budget_ticks != 0) {
+        TickType_t elapsed = xTaskGetTickCount() - s_control_budget_start;
+        if (elapsed >= s_control_budget_ticks) return 0;
+        TickType_t remaining = s_control_budget_ticks - elapsed;
+        if (remaining < limit) limit = remaining;
+    }
+    return limit;
+}
 static atomic_int s_scan_op = BLE_SCAN_OP_NONE;
 static atomic_int s_scan_op_result = ESP_OK;
 
@@ -150,12 +172,15 @@ static void ble_scan_op_complete(BleScanOp op, bool success)
 static esp_err_t ble_scan_op_wait(void)
 {
     TickType_t start = xTaskGetTickCount();
+    TickType_t limit = ble_control_wait_ticks();
     if (s_control_paused) return ESP_ERR_INVALID_STATE;
     while (atomic_load(&s_scan_op) != BLE_SCAN_OP_NONE) {
         if (s_control_paused) return ESP_ERR_INVALID_STATE;
-        if (xTaskGetTickCount() - start >= pdMS_TO_TICKS(BLE_SCAN_STEP_TIMEOUT_MS))
+        TickType_t elapsed = xTaskGetTickCount() - start;
+        if (elapsed >= limit)
             return ESP_ERR_TIMEOUT;
-        vTaskDelay(pdMS_TO_TICKS(10));
+        TickType_t remaining = limit - elapsed;
+        vTaskDelay(remaining < pdMS_TO_TICKS(10) ? remaining : pdMS_TO_TICKS(10));
     }
     return atomic_load(&s_scan_op_result);
 }
@@ -187,7 +212,7 @@ static esp_err_t ble_stop_scan_locked(void)
  * Bluedroid 回调写、CPU1 老化任务经 ble_gatt_setup_done() 轮询读，
  * 用于在建链后对端停止响应时快速失败重试，避免傻等固定延时。
  */
-static volatile bool s_gatt_setup_done = false;
+static atomic_bool s_gatt_setup_done;
 
 /*
  * Wi-Fi/BLE 射频共存偏好（2026-10-26）：
@@ -563,7 +588,7 @@ esp_err_t ble_start_target_scan(const BleTarget *target, uint8_t scan_time)
 {
     if (target == NULL || target->addr_type > 1) return ESP_ERR_INVALID_ARG;
     if (!IsInited || s_scan_control_mutex == NULL) return ESP_ERR_INVALID_STATE;
-    if (xSemaphoreTake(s_scan_control_mutex, pdMS_TO_TICKS(BLE_SCAN_STEP_TIMEOUT_MS)) != pdTRUE)
+    if (xSemaphoreTake(s_scan_control_mutex, ble_control_wait_ticks()) != pdTRUE)
         return ESP_ERR_TIMEOUT;
     esp_err_t ret = ESP_ERR_INVALID_STATE;
     /* GATT 注册异步完成，初始化返回不代表接口已就绪。 */
@@ -590,7 +615,7 @@ esp_err_t ble_start_target_scan(const BleTarget *target, uint8_t scan_time)
     atomic_store(&s_scan_op, BLE_SCAN_OP_PARAMS);
     ret = ble_scan_op_finish(esp_ble_gap_set_scan_params(&s_ble_scan_params));
     if (ret != ESP_OK) goto done;
-    if (xSemaphoreTake(s_device_list_mutex, pdMS_TO_TICKS(BLE_SCAN_STEP_TIMEOUT_MS)) != pdTRUE) {
+    if (xSemaphoreTake(s_device_list_mutex, ble_control_wait_ticks()) != pdTRUE) {
         ret = ESP_ERR_TIMEOUT;
         goto done;
     }
@@ -619,7 +644,7 @@ done:
 esp_err_t ble_stop_scan_wait(void)
 {
     if (!IsInited || s_scan_control_mutex == NULL) return ESP_ERR_INVALID_STATE;
-    if (xSemaphoreTake(s_scan_control_mutex, pdMS_TO_TICKS(BLE_SCAN_STEP_TIMEOUT_MS)) != pdTRUE)
+    if (xSemaphoreTake(s_scan_control_mutex, ble_control_wait_ticks()) != pdTRUE)
         return ESP_ERR_TIMEOUT;
     esp_err_t ret = ble_stop_scan_locked();
     ble_coex_prefer_bt(false);
@@ -631,7 +656,7 @@ esp_err_t ble_control_pause(void)
 {
     s_control_paused = true;
     if (s_scan_control_mutex == NULL) return ESP_OK;
-    if (xSemaphoreTake(s_scan_control_mutex, pdMS_TO_TICKS(BLE_SCAN_STEP_TIMEOUT_MS)) != pdTRUE)
+    if (xSemaphoreTake(s_scan_control_mutex, ble_control_wait_ticks()) != pdTRUE)
         return ESP_ERR_TIMEOUT;
     /* 若无在途操作，可以非阻塞提交停扫；后续会话仍须等待实际回调。 */
     if (s_is_scanning && atomic_load(&s_scan_op) == BLE_SCAN_OP_NONE) {
@@ -733,7 +758,7 @@ bool ble_scanned_has_name(const char *name)
 bool ble_scanned_has_address(const uint8_t *bda, uint8_t addr_type)
 {
     if (bda == NULL || s_device_list_mutex == NULL) return false;
-    if (xSemaphoreTake(s_device_list_mutex, pdMS_TO_TICKS(BLE_SCAN_STEP_TIMEOUT_MS)) != pdTRUE)
+    if (xSemaphoreTake(s_device_list_mutex, ble_control_wait_ticks()) != pdTRUE)
         return false;
     bool found = false;
     for (int i = 0; i < s_scanned_count; ++i) {
@@ -1005,7 +1030,7 @@ static bool ble_connect_by_address_locked(uint8_t *bda, uint8_t addr_type)
 static bool ble_connect_control_enter(void)
 {
     if (!IsInited || s_scan_control_mutex == NULL ||
-        xSemaphoreTake(s_scan_control_mutex, pdMS_TO_TICKS(BLE_SCAN_STEP_TIMEOUT_MS)) != pdTRUE)
+        xSemaphoreTake(s_scan_control_mutex, ble_control_wait_ticks()) != pdTRUE)
         return false;
     if (s_control_paused || s_is_scanning || s_connect_attempting || s_is_connected ||
         atomic_load(&s_scan_op) != BLE_SCAN_OP_NONE) {
@@ -1135,6 +1160,7 @@ static int ble_send_for_session(uint32_t session_id, const uint8_t *data, int le
     {
         ESP_LOGD(TAG, "蓝牙发送已受理: session=%lu, encrypted=%u, plain_bytes=%d, wire_bytes=%u",
                  (unsigned long)session_id, (unsigned)encrypt, len, (unsigned)nlen);
+        atomic_store(&s_last_tx_tick, xTaskGetTickCount());
         return 1;
     }
     else
@@ -1213,7 +1239,8 @@ static void ble_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
         break;
 
     case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT: // 连接参数更新事件
-        ESP_LOGD(TAG, "Connection params updated: int %d, latency %d, timeout %d",
+        ESP_LOGI(TAG, "蓝牙实际连接参数: session=%lu, status=%d, interval_units_1_25ms=%d, latency=%d, timeout_units_10ms=%d",
+                 (unsigned long)ble_session_id(), param->update_conn_params.status,
                  param->update_conn_params.conn_int,
                  param->update_conn_params.latency,
                  param->update_conn_params.timeout);
@@ -1281,6 +1308,14 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         ble_session_reset();
         atomic_store(&s_session_closing, false);
         s_is_connected = true;
+        atomic_store(&s_last_tx_tick, 0);
+        atomic_store(&s_last_rx_tick, 0);
+        if (s_control_paused) {
+            /* stop 后迟到的 CONNECT 不得重新开放已经取消的业务连接。 */
+            notify_connect_result(false);
+            ble_disconnect();
+            break;
+        }
         ESP_LOGD(TAG, "蓝牙新连接默认明文: session=%lu", (unsigned long)ble_session_id());
 
         // 更新扫描列表中的连接状态
@@ -1524,6 +1559,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         }
         ESP_LOGD(TAG, "蓝牙原始接收: session=%lu, handle=0x%04x, bytes=%u",
                  (unsigned long)ble_session_id(), param->notify.handle, param->notify.value_len);
+        atomic_store(&s_last_rx_tick, xTaskGetTickCount());
 
         ble_mtu_data_t recv = {0};
         recv.session_id = ble_session_id();
@@ -1571,7 +1607,17 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
 
     case ESP_GATTC_DISCONNECT_EVT:
     {
+        if (s_is_connected &&
+            (param->disconnect.conn_id != s_gattc_profile.conn_id ||
+             memcmp(param->disconnect.remote_bda, s_gattc_profile.remote_bda, ESP_BD_ADDR_LEN) != 0)) {
+            ESP_LOGW(TAG, "忽略非当前连接的断开事件");
+            break;
+        }
+        uint32_t lost_session = ble_session_id();
         ESP_LOGI(TAG, "Disconnected, reason: 0x%02x", param->disconnect.reason);
+        ESP_LOGI(TAG, "蓝牙断开诊断: session=%lu, last_tx_tick=%lu, last_rx_tick=%lu, now_tick=%lu",
+                 (unsigned long)lost_session, (unsigned long)atomic_load(&s_last_tx_tick),
+                 (unsigned long)atomic_load(&s_last_rx_tick), (unsigned long)xTaskGetTickCount());
         /* 建链中断或已建立连接掉线：恢复 Wi-Fi/BLE 平衡（幂等）。 */
         ble_coex_prefer_bt(false);
         /* 断开前的连接态判定：区分「建立失败」与「已建立连接后掉线」 */
@@ -1612,10 +1658,10 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         }
         else if (was_established)
         {
-            // 已建立连接后掉线：调用断开连接回调（老化任务据此优雅中止，行为不变）
+            // 已建立连接后掉线：交付失效前的连接代次，由老化任务恢复
             if (s_disconnect_cb != NULL)
             {
-                s_disconnect_cb();
+                s_disconnect_cb((uint8_t)param->disconnect.reason, lost_session);
             }
         }
         else

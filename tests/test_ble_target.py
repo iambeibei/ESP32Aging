@@ -75,7 +75,7 @@ typedef struct {
  struct {int status;} scan_param_cmpl, scan_start_cmpl, scan_stop_cmpl;
  struct {int wl_operation,status;} update_whitelist_cmpl;
  struct {int search_evt;uint8_t bda[6],ble_addr_type,ble_adv[64];uint8_t adv_data_len,scan_rsp_len;int rssi;} scan_rst;
- struct {int min_int,max_int,latency,timeout;} update_conn_params;
+ struct {int status,conn_int,min_int,max_int,latency,timeout;} update_conn_params;
 } esp_ble_gap_cb_param_t;
 static void ble_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
 static esp_err_t esp_ble_gap_stop_scanning(void);
@@ -252,6 +252,10 @@ int main(void) {
  reset_scan();s_scan_op=BLE_SCAN_OP_START;cancel_on_delay=true;
  assert(ble_start_target_scan(&target,20)==ESP_ERR_INVALID_STATE && s_scan_op==BLE_SCAN_OP_START && !trace[0]);
  puts("PASS submit/callback failures, timeouts, late completion, in-flight connection and pause");
+ reset_scan();ble_control_set_budget_ms(45);drop_op='P';TickType_t begin=now_ticks;
+ assert(ble_start_target_scan(&target,20)==ESP_ERR_TIMEOUT && now_ticks-begin==45);
+ assert(s_scan_op==BLE_SCAN_OP_PARAMS);ble_control_set_budget_ms(0);
+ puts("PASS total control budget bounds all async scan stages without losing the pending operation");
  return 0;
 }
 '''
